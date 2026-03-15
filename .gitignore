@@ -1,0 +1,11 @@
+.venv/
+.vscode/
+.pytest_cache/
+__pycache__/
+.continue/
+.DS_Store
+test-old/
+mkdocs.yml
+Makefile
+chat_history/
+uv.lock

@@ -1,0 +1,8 @@
+services:
+  agent:
+    image: python:3.12-slim
+    container_name: local-agent-dev
+    volumes:
+      - ~/codespace/localAgent:/home/localAgent
+    command: tail -f /dev/null
+    working_dir: /home/localAgent
