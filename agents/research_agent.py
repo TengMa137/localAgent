@@ -6,33 +6,49 @@ ORCHESTRATOR  — long-lived REPL loop, persistent message_history,
                 Plans tasks, spawns workers, reflects on results,
                 re-plans if needed.
 
+                File-awareness: before spawning workers, the orchestrator
+                calls fs_list_tool to discover local files, then injects
+                relevant filenames into each worker's objective so workers
+                never need filesystem access themselves.
+
 WORKER        — stateless, single agent.run() per task.
                 Internally pydantic-ai drives a multi-turn tool loop.
                 The worker's only output to the orchestrator is:
-                  summary      — what was found, in plain language
+                  summary        — what was found, in plain language
                   cited_node_ids — doc_ids from rag_search_tool responses
                 result.all_messages() is discarded after the run; the
                 worker is stateless and carries no history between tasks.
+
+                Source priority (in order):
+                  1. Local files injected by orchestrator → rag_search_tool
+                  2. Known URL → crawl_url → rag_search_tool with that URL
+                  3. Unknown sources → web_search → crawl_url → rag_search_tool
+
+                RAG auto-ingestion: rag_search_tool ingests local files on
+                first access; crawl_url ingests web pages immediately after
+                crawling. Workers never need to list the document store —
+                they either search a known ref or search broadly across all
+                ingested content.
 
 Pipeline
 ------------
 ORCHESTRATOR
    ↓
-spawn workers
+fs_list_tool  (discover local files, once per planning turn)
+   ↓
+spawn workers (objective + relevant filenames injected)
    ↓
 WORKER
    ↓
+rag_search_tool          ← local files (auto-ingested on first access)
+   ↓  (if insufficient)
 web_search
    ↓
 LLM chooses URLs
    ↓
-crawl_url
+crawl_url                ← page auto-ingested into RAG store
    ↓
-INTERCEPTOR
-   ↓
-RAG store
-   ↓
-rag_search_tool
+rag_search_tool          ← use crawled URL as doc ref
    ↓
 WorkerOutput(summary + citations)
 """
@@ -53,6 +69,7 @@ from .utils import (
     load_skill,
     rag_toolset,
     web_toolset,
+    fs_toolset,
     task_log_store,
     TaskLog,
     rag_service
@@ -70,9 +87,9 @@ Your job is to investigate a single objective and return a structured result.
 
 Principles:
 
-• Prefer retrieved information over assumptions
-• Never fabricate citations or sources
-• Stop searching when enough evidence is gathered
+- Prefer retrieved information over assumptions
+- Never fabricate citations or sources
+- Stop searching when enough evidence is gathered
 
 Tool reflection rule:
 
@@ -88,32 +105,52 @@ e.g. including 'today', 'last week' etc
 """
 
 
-def build_worker_prompt(task_id: str) -> str:
+def build_worker_prompt(task_id: str, relevant_files: Optional[List[str]] = None) -> str:
+    files_section = ""
+    if relevant_files:
+        file_list = "\n".join(f"  • {f}" for f in relevant_files)
+        files_section = f"""
+Local files for this task (provided by orchestrator):
+{file_list}
+
+"""
+
     return f"""
 Worker task id: {task_id}.
 
-Research workflow:
+{files_section}Research workflow:
 
-1. If relevant knowledge may already exist, call rag_search_tool.
-2. If sources are unknown, call web_search.
-3. If a URL is known, call crawl_url or crawl_urls.
-4. Pages are automatically ingested into RAG.
-5. Use rag_search_tool again to retrieve extracted knowledge.
+1. If local files are listed above, call rag_search_tool with those filenames
+   first — they are auto-ingested on first access.
+
+2. If no local files are relevant or results are insufficient, call web_search
+   to find sources.
+
+3. If a URL is known, call crawl_url. The page is auto-ingested into RAG
+   immediately after crawling.
+
+4. After crawl_url, call rag_search_tool using the URL you just crawled as
+   the doc reference — it is already in the store.
+
+5. For broad retrieval across everything ingested, call rag_search_tool
+   without a doc filter.
 
 Stop searching when:
-• the objective can be answered
-• results become repetitive
+- the objective can be answered
+- results become repetitive
 
 Tool discipline:
 
-• Do not repeat the same query
-• Prefer different tools before retrying a query
-• Most tasks require no more than 3-5 tool calls
+- Do not repeat the same query
+- Prefer different tools before retrying a query
+- Do not call fs_list or attempt to discover additional files —
+  the orchestrator has already injected everything relevant
+- Most tasks require no more than 3–5 tool calls
 
 Citation rules:
 
-• cited_node_ids must come from rag_search_tool results
-• never fabricate URLs or authors
+- cited_node_ids must come from rag_search_tool results
+- Never fabricate URLs or authors
 """
 
 
@@ -129,8 +166,7 @@ class WorkerOutput(BaseModel):
     cited_node_ids: List[str]
 
 
-
-async def run_worker(objective: str) -> Dict[str, Any]:
+async def run_worker(objective: str, relevant_files: Optional[List[str]] = None) -> Dict[str, Any]:
 
     task_id = str(uuid.uuid4())
 
@@ -144,14 +180,14 @@ async def run_worker(objective: str) -> Dict[str, Any]:
     worker = Agent(
         model=model,
         system_prompt=WORKER_SYSTEM_PROMPT,
-        instructions=build_worker_prompt(objective, task_id[:8]),
+        instructions=build_worker_prompt(task_id[:8], relevant_files),
         output_type=WorkerOutput,
         tools=[load_skill],
         toolsets=[web_toolset, rag_toolset],
+        # no fs_toolset — workers never need filesystem access directly
     )
 
     try:
-
         result = await worker.run(objective, usage_limits=UsageLimits(tool_calls_limit=5))
         messages = result.all_messages()
 
@@ -167,22 +203,19 @@ async def run_worker(objective: str) -> Dict[str, Any]:
             log.error = f"tool loop detected ({tool_calls} calls)"
             log.trace = messages
             return log.to_dict()
-        
+
         output = result.output
 
         log.status = "done"
         log.summary = output.summary
         log.cited_node_ids = output.cited_node_ids
-
         log.trace = result.all_messages()
 
     except Exception as exc:
-
         log.status = "failed"
         log.error = str(exc)
 
     finally:
-
         log.finished_at = datetime.now(timezone.utc).isoformat()
         task_log_store.save(log)
 
@@ -191,12 +224,17 @@ async def run_worker(objective: str) -> Dict[str, Any]:
 
 async def spawn_agents(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Each task: {"objective": str}
+    Each task: {"objective": str, "relevant_files": List[str] (optional)}
+
+    relevant_files are injected by the orchestrator during planning —
+    workers receive only the files pertinent to their specific objective.
+
     All agents share rag_service — a page crawled by agent A is immediately
     searchable by agent B via rag_search_tool with no extra wiring.
     """
     return await asyncio.gather(*[
-        run_worker(t["objective"]) for t in tasks
+        run_worker(t["objective"], t.get("relevant_files"))
+        for t in tasks
     ])
 
 
@@ -230,7 +268,7 @@ def _safe_cut(messages: List[ModelMessage], target: int) -> int:
             if "ToolReturnPart" not in part_types and "RetryPromptPart" not in part_types:
                 return i
         i -= 1
-    return 0    # fallback: compress nothing
+    return 0
 
 
 async def compress_old_messages(
@@ -255,22 +293,21 @@ async def compress_old_messages(
     verbatim_tail = messages[tail_start:]
 
     if not to_summarise:
-        return messages     # nothing safe to cut — leave as-is
+        return messages
 
     summary_result = await _summarise_agent.run(
         "Summarise this research conversation:",
         message_history=to_summarise,
     )
-    # new_messages() = only what this summarise run produced, not the full history
     return summary_result.new_messages() + verbatim_tail
 
 
 orchestrator = Agent(
     model=model,
     output_type=OrchestratorPlan,
-    history_processors=[compress_old_messages],  
+    history_processors=[compress_old_messages],
     tools=[spawn_agents],
-    toolsets=[web_toolset],
+    toolsets=[web_toolset, fs_toolset],
 )
 
 @orchestrator.system_prompt
@@ -293,8 +330,18 @@ message as a prefix: [direct], [research], or [clarify].
                tasks must be empty.
 
   [research] — the router determined this needs parallel investigation.
-               Decompose into specific, independently-answerable sub-tasks
-               and call spawn_agents([{{"objective": str}}, ...]).
+
+               Before spawning workers:
+                 1. Call fs_list_tool once to discover available local files.
+                 2. For each sub-task, decide which (if any) local files are
+                    relevant and include them as "relevant_files" in that
+                    task's dict.
+                 3. Call spawn_agents([{{"objective": str, "relevant_files": [str]}}, ...]).
+
+               Workers have no filesystem access — they rely entirely on
+               what you inject. Only include files genuinely relevant to
+               each specific sub-task, not the full list.
+
                Set objective_complete=true when evidence is sufficient.
 
 reply:
@@ -308,16 +355,12 @@ tasks: non-empty only for [research]. Empty list for direct and clarify.
 session_title: FIRST turn only — kebab-case slug max 6 words,
   e.g. "gold-price-today". Null on all subsequent turns.
 
-Use web_search to discover relevant pages and web_crawl to check details.
+If the answer requires exact numbers or facts, you MUST open the page
+with web_crawl before answering.
 
-If the answer requires exact numbers or facts,
-you MUST open the page with web_crawl before answering. 
-
-After crawling you MUST call rag_list_documents_tool() to see all crawled webpage content,
-then use rag_search_tool to retrieve content or rag_answer_tool to get result directly.
-
+After crawling you MUST call rag_search_tool to retrieve content,
+or rag_answer_tool to get a result directly.
 """
-
 
 
 _synthesis_agent = Agent(
@@ -348,4 +391,58 @@ async def synthesise(
         f"Worker summaries:\n{chr(10).join(worker_summaries) or 'none'}\n\n"
         f"RAG documents ingested:\n{doc_lines or 'none'}"
     )
+    return result.output
+
+
+class RouterDecision(BaseModel):
+    mode: str      # "direct" | "research" | "clarify" | "blocked"
+    reason: str    # one sentence — logged, never shown to user
+
+
+router = Agent(
+    model=model,
+    output_type=RouterDecision
+)
+
+@router.system_prompt
+def _router_system_prompt() -> str:
+    return f"""
+You are a request router and safety filter.
+
+Today is {_now()}.
+
+Classify the user message into exactly one mode:
+
+  direct    — a single question or task the assistant can handle by itself,
+              with or without a web search.
+              Use for: greetings, factual lookups, current prices, weather,
+              news, sports scores, coding, writing, math, opinions.
+              Also use for SHORT FOLLOW-UP MESSAGES (under ~15 words, or
+              messages that are clearly continuing a prior topic such as
+              "what about last Tuesday?", "and in Europe?", "thanks").
+              When in doubt between direct and research, choose direct.
+
+  research  — requires parallel investigation and synthesis across multiple
+              independent sources: comparisons, reports, literature reviews,
+              "investigate X", "summarise sources on Y".
+              Only use this when a single web search clearly would not suffice.
+
+  clarify   — the request is genuinely ambiguous in a way that would produce
+              a wrong research plan if assumed. Do not clarify simple,
+              short, or obvious requests.
+
+  blocked   — harmful, illegal, or dangerous content. Refuse with a brief
+              safe reason in the reason field.
+
+Return only the JSON object matching the schema. No other text.
+"""
+
+
+async def route(user_message: str) -> RouterDecision:
+    """
+    Classify a single user message. Stateless — no history passed.
+    Short follow-ups always resolve to direct so the orchestrator's
+    full history handles the context.
+    """
+    result = await router.run(user_message)
     return result.output

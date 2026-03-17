@@ -45,6 +45,9 @@ def make_rag_toolset(
     @toolset.tool(
         description=(
             "Search the RAG knowledge base and return evidence sections. "
+            "Pass document name list such as ['file1.md', 'webpage or url you have crawled before'] to docs, "
+            "if you want to check specific docs, if docs is not provided, search the whole document store. "
+            "Check the document in store using rag_list_documents_tool if you are not sure about the webpage crawled before. "
             "Each result contains node_id which can be used with rag_expand_node_tool "
             "to explore deeper sections of the document."
         )
@@ -53,7 +56,6 @@ def make_rag_toolset(
         ctx: RunContext,
         question: str,
         docs: Optional[List[str]] = None,
-        external_documents: Optional[Tuple[List[Document], List[str]]] = None,
     ) -> list[dict]:
         """
         Search knowledge using the RAG system.
@@ -64,16 +66,14 @@ def make_rag_toolset(
             Query to search.
 
         docs:
-            Optional local file paths. Files will be ingested if not indexed.
+            Optional local files. Files will be ingested if not indexed.
 
-        external_documents:
             Preloaded documents from external systems (crawler, API, etc).
         """
 
         results = await rag_service.search(
             question=question,
             docs=docs,
-            external_documents=external_documents,
             filesystem_validator=filesystem_validator,
             load_cfg=load_cfg
         )
@@ -83,6 +83,9 @@ def make_rag_toolset(
     @toolset.tool(
         description=(
             "Answer a question using the RAG knowledge base. "
+            "Pass document name list such as ['file1.md', 'webpage or url you have crawled before'] to docs, "
+            "if you want to check specific docs, if docs is not provided, search the whole document store. "
+            "Check the document in store using rag_list_documents_tool if you are not sure about the webpage crawled before. "
             "Performs retrieval and synthesis automatically."
         )
     )
@@ -90,13 +93,11 @@ def make_rag_toolset(
         ctx: RunContext,
         question: str,
         docs: Optional[List[str]] = None,
-        external_documents: Optional[Tuple[List[Document], List[str]]] = None,
     ) -> str:
 
         answer = await rag_service.answer(
             question=question,
             docs=docs,
-            external_documents=external_documents,
             filesystem_validator=filesystem_validator,
             load_cfg=load_cfg
         )

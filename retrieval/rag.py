@@ -18,7 +18,7 @@ class RagService:
     """
     Unified RAG service supporting:
     - local file ingestion
-    - external document ingestion
+    - search over local files and web crawled content
     - lazy indexing
     """
 
@@ -92,6 +92,7 @@ class RagService:
         )
 
         self._index_documents(docs, notes)
+        return [doc.doc_id for doc in docs]
 
 
     def _node_depth(idx, node):
@@ -106,30 +107,44 @@ class RagService:
     async def search(
         self,
         question: str,
-        docs=None,
-        external_documents=None,
+        docs:List[str] | None = None,
         *,
         filesystem_validator=None,
         load_cfg=None,
     ):
 
         self._init_llm()
-
+        doc_ids = []
         async with self._lock:
 
             if docs:
-                self.ingest_local(
-                    docs,
-                    filesystem_validator=filesystem_validator,
-                    load_cfg=load_cfg,
-                )
+                doc_list = self.store.list_indexes()
+                matches, missing = [], []
 
-            if external_documents:
-                ext_docs, notes = external_documents
-                self.ingest_documents(ext_docs, notes)
+                for d in docs:
+                    match = next(
+                        (idx.doc.doc_id for idx in doc_list if d in idx.doc.title),
+                        None,
+                    )
+                    if match:
+                        matches.append(match)
+                    else:
+                        missing.append(d)
+
+                doc_ids.extend(matches)
+
+                if missing:
+                    doc_ids.extend(
+                        self.ingest_local(
+                            missing,
+                            filesystem_validator=filesystem_validator,
+                            load_cfg=load_cfg,
+                        )
+                    )
 
             res = await zoom_retrieve_async(
                 store=self.store,
+                doc_ids=doc_ids,
                 question=question,
                 llm=self.llm,
                 budget_chars=self.cfg.budget_chars,
@@ -170,7 +185,6 @@ class RagService:
         self,
         question: str,
         docs=None,
-        external_documents=None,
         *,
         filesystem_validator=None,
         load_cfg=None,
@@ -182,7 +196,6 @@ class RagService:
         pieces = await self.search(
             question=question,
             docs=docs,
-            external_documents=external_documents,
             filesystem_validator=filesystem_validator,
             load_cfg=load_cfg,
         )

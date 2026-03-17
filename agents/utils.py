@@ -9,7 +9,7 @@ from pydantic_ai import ModelMessage
 from retrieval.rag import rag_service
 from retrieval.local.loader import LocalLoadConfig
 from tools.rag import make_rag_toolset, make_web_toolset
-from tools.filesystem import FilesystemValidator, FilesystemValidatorConfig, Mount
+from tools.filesystem import FilesystemValidator, FilesystemValidatorConfig, Mount, make_filesystem_toolset
 from tools.skills import build_index, make_skills
 
 
@@ -24,6 +24,9 @@ config = FilesystemValidatorConfig(
     mounts=[Mount(host_path="/home/localAgent/", mount_point="/", mode="ro")]
 )
 validator = FilesystemValidator(config)
+
+fs_toolset = make_filesystem_toolset(filesystem_validator=validator)
+
 index = build_index(validator=validator, skills_root="/skills")
 skills_prompt, load_skill = make_skills(index, validator=validator, skills_root="/skills")
 

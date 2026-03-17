@@ -348,9 +348,20 @@ def zoom_retrieve(
     out = _assemble_evidence_pieces(store, prepared)
     return EvidenceResult(pieces=out.pieces, notes=notes + out.notes)
 
+
+
+def _filtered_store(store: DocumentStore, doc_ids: list[str]) -> DocumentStore:
+    filtered = DocumentStore()
+    for doc_id in doc_ids:
+        idx = store.get_index(doc_id)
+        if idx is not None:
+            filtered.add_index(idx)
+    return filtered
+
 async def zoom_retrieve_async(
     *,
     store: DocumentStore,
+    doc_ids: list[str] | None = None,
     question: str,
     llm: LLM,
     budget_chars: int,
@@ -375,7 +386,8 @@ async def zoom_retrieve_async(
     notes: list[str] = []
     if not question.strip():
         return EvidenceResult(pieces=[], notes=["Empty question."])
-
+    if doc_ids is not None:
+        store = _filtered_store(store, doc_ids)
     # Step 1: lexical candidates (title*2 + preview + optional micro used later)
     ranked = rank_nodes(store, question, include_micro_summary=False, top_k=preset.topk_lexical)
 

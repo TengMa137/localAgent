@@ -15,7 +15,7 @@ arxiv follows the same pattern:
   2. arxiv_fetch()       -> LLM picks arxiv_ids, this fetches + ingests abstracts
                            (PDF crawl goes through crawl_and_ingest)
 
-Adding a new source: implement a converter in _CRAWL_CONVERTERS and
+Adding a new source: implement a converter and
 call _ingest() from a new tool function. Nothing else changes.
 """
 
@@ -28,8 +28,6 @@ from typing import Any, Callable, Dict, List, Optional
 import fastmcp
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
-from pydantic_ai.toolsets.fastmcp import FastMCPToolset
-from pydantic_ai.toolsets.abstract import ToolsetTool
 
 
 from retrieval.types_doc import Document
@@ -104,7 +102,6 @@ def _crawl_to_doc(content: dict) -> Optional[Document]:
 def make_web_toolset(
     mcp_url: str,
     rag_service: RagService,
-    extra_converters: Optional[Dict[str, Callable[[Any], List[Document]]]] = None,
 ) -> FunctionToolset:
     """
     Returns a FunctionToolset with:
@@ -118,11 +115,11 @@ def make_web_toolset(
     """
     toolset = FunctionToolset()
 
-    @toolset.tool(name="web_search",
+    @toolset.tool(name="web_search_tool",
         description=(
         "Search the web and return a list of results (title, url, snippet, position). "
         "Review the snippets and select the most relevant URLs, "
-        "then call web_crawl tool with those URLs to store the full content."
+        "then call web_crawl_tool() with those URLs to store the full content."
     ))
     async def web_search(
         ctx: RunContext,
@@ -135,7 +132,7 @@ def make_web_toolset(
         return data.get("results", [])
 
 
-    @toolset.tool(name="web_crawl", description=(
+    @toolset.tool(name="web_crawl_tool", description=(
         "Crawl one or more URLs and store the full content in the knowledge base. "
         "Only call this for URLs you selected from web_search results as relevant "
         "to the objective — do not crawl every result. "
@@ -169,7 +166,7 @@ def make_web_toolset(
         return _ingest(rag_service, docs)
 
 
-    @toolset.tool(name="arxiv_search", description=(
+    @toolset.tool(name="arxiv_search_tool", description=(
         "Search arXiv and return a list of papers (title, arxiv_id, summary, authors). "
         "Review the abstracts and select relevant arxiv_ids, "
         "then call arxiv_fetch() to store those papers in the knowledge base."
@@ -190,10 +187,10 @@ def make_web_toolset(
         data = _result_to_dict(result)
         return data.get("results", [])
 
-    @toolset.tool(name="arxiv_fetch", description=(
+    @toolset.tool(name="arxiv_fetch_tool", description=(
         "Fetch specific arXiv papers by ID and store their abstracts in the knowledge base. "
         "Only fetch papers you selected from arxiv_search as relevant to the objective. "
-        "To also ingest the full PDF text, pass the pdf_url to crawl_and_ingest()."
+        "To also ingest the full PDF text, pass the pdf_url to web_crawl_tool()."
     ))
     async def arxiv_fetch(
         ctx: RunContext,
