@@ -67,6 +67,7 @@ from pydantic_ai.usage import UsageLimits
 from .utils import (
     model,
     load_skill,
+    skills_prompt,
     rag_toolset,
     web_toolset,
     fs_toolset,
@@ -105,7 +106,7 @@ e.g. including 'today', 'last week' etc
 """
 
 
-def build_worker_prompt(task_id: str, relevant_files: Optional[List[str]] = None) -> str:
+def build_worker_prompt(task_id: str, relevant_files: Optional[List[str]] = None, relevant_skills: Optional[List[str]] = None) -> str:
     files_section = ""
     if relevant_files:
         file_list = "\n".join(f"  • {f}" for f in relevant_files)
@@ -114,11 +115,21 @@ Local files for this task (provided by orchestrator):
 {file_list}
 
 """
+    skills_section = ""
+    if relevant_skills:
+        skills_available = "\n".join(f"  • {s}" for s in relevant_skills)
+        skills_section = f"""
+Relevant skills for this task (provided by orchestrator):
+{skills_available}
+
+"""
 
     return f"""
 Worker task id: {task_id}.
 
-{files_section}Research workflow:
+{files_section}{skills_section}Research workflow:
+0. If skills are specified above, call load_skill tool with skill file path
+   first — they have further detailed instuctions on the task.
 
 1. If local files are listed above, call rag_search_tool with those filenames
    first — they are auto-ingested on first access.
@@ -145,7 +156,7 @@ Tool discipline:
 - Prefer different tools before retrying a query
 - Do not call fs_list or attempt to discover additional files —
   the orchestrator has already injected everything relevant
-- Most tasks require no more than 3–5 tool calls
+- Most tasks require no more than 3-5 tool calls
 
 Citation rules:
 
@@ -166,7 +177,11 @@ class WorkerOutput(BaseModel):
     cited_node_ids: List[str]
 
 
-async def run_worker(objective: str, relevant_files: Optional[List[str]] = None) -> Dict[str, Any]:
+async def run_worker(
+    objective: str, 
+    relevant_files: Optional[List[str]] = None, 
+    relevant_skills: Optional[List[str]] = None
+) -> Dict[str, Any]:
 
     task_id = str(uuid.uuid4())
 
@@ -180,11 +195,10 @@ async def run_worker(objective: str, relevant_files: Optional[List[str]] = None)
     worker = Agent(
         model=model,
         system_prompt=WORKER_SYSTEM_PROMPT,
-        instructions=build_worker_prompt(task_id[:8], relevant_files),
+        instructions=build_worker_prompt(task_id[:8], relevant_files, relevant_skills),
         output_type=WorkerOutput,
         tools=[load_skill],
         toolsets=[web_toolset, rag_toolset],
-        # no fs_toolset — workers never need filesystem access directly
     )
 
     try:
@@ -224,16 +238,19 @@ async def run_worker(objective: str, relevant_files: Optional[List[str]] = None)
 
 async def spawn_agents(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Each task: {"objective": str, "relevant_files": List[str] (optional)}
+    Each task: {"objective": str, "relevant_files": List[str] (optional), "relevant_skills": List[str] (optional)}
+
+    relevant_skills are injected by the orchestrator during planning - 
+    only skills relevant to the task assigned to the worker, otherwise leave it empty.
 
     relevant_files are injected by the orchestrator during planning —
     workers receive only the files pertinent to their specific objective.
 
     All agents share rag_service — a page crawled by agent A is immediately
-    searchable by agent B via rag_search_tool with no extra wiring.
+    searchable by agent B via rag_search_tool with no extra wiring. 
     """
     return await asyncio.gather(*[
-        run_worker(t["objective"], t.get("relevant_files"))
+        run_worker(t["objective"], t.get("relevant_files"), t.get("relevant_skills"))
         for t in tasks
     ])
 
@@ -306,7 +323,7 @@ orchestrator = Agent(
     model=model,
     output_type=OrchestratorPlan,
     history_processors=[compress_old_messages],
-    tools=[spawn_agents],
+    tools=[spawn_agents, load_skill],
     toolsets=[web_toolset, fs_toolset],
 )
 
@@ -320,7 +337,10 @@ Today is {_now()}.
 You will receive a pre-classified request. The mode is included in the
 message as a prefix: [direct], [research], or [clarify].
 
-  [direct]   — answer immediately. You have web_search available via your
+  [direct]   — answer immediately. If user's request related to local files,
+               You must first call list_files tool to confirm the files exist.
+               If exist, spawn a worker agent with relevant_files specified.
+               You have web_search available via your
                toolset; use it when the answer requires live or recent data
                (prices, news, weather, scores, exchange rates).
                Do not spawn workers. tasks must be empty.
@@ -332,15 +352,20 @@ message as a prefix: [direct], [research], or [clarify].
   [research] — the router determined this needs parallel investigation.
 
                Before spawning workers:
-                 1. Call fs_list_tool once to discover available local files.
+                 1. Call list_files tool once to discover available local files.
                  2. For each sub-task, decide which (if any) local files are
                     relevant and include them as "relevant_files" in that
                     task's dict.
-                 3. Call spawn_agents([{{"objective": str, "relevant_files": [str]}}, ...]).
+                 3. For each sub-task, decide which (if any) skills are
+                    relevant and include skill paths as "relevant_skills" in that
+                    task's dict.
+                 3. Call spawn_agents([{{"objective": str, "relevant_files": list[str], "relevant_skills": list[str]}}, ...]).
 
                Workers have no filesystem access — they rely entirely on
                what you inject. Only include files genuinely relevant to
-               each specific sub-task, not the full list.
+               each specific sub-task, not the full list. You are a good 
+               task delegator, think carefully and providing only relevant
+               files and skills to worker agents.
 
                Set objective_complete=true when evidence is sufficient.
 
@@ -360,6 +385,11 @@ with web_crawl before answering.
 
 After crawling you MUST call rag_search_tool to retrieve content,
 or rag_answer_tool to get a result directly.
+
+You have a set of skills below, load skills as needed, 
+if in research mode, you MUST explicitly include path of related skills when spawning agents.
+{skills_prompt}
+
 """
 
 
@@ -391,58 +421,4 @@ async def synthesise(
         f"Worker summaries:\n{chr(10).join(worker_summaries) or 'none'}\n\n"
         f"RAG documents ingested:\n{doc_lines or 'none'}"
     )
-    return result.output
-
-
-class RouterDecision(BaseModel):
-    mode: str      # "direct" | "research" | "clarify" | "blocked"
-    reason: str    # one sentence — logged, never shown to user
-
-
-router = Agent(
-    model=model,
-    output_type=RouterDecision
-)
-
-@router.system_prompt
-def _router_system_prompt() -> str:
-    return f"""
-You are a request router and safety filter.
-
-Today is {_now()}.
-
-Classify the user message into exactly one mode:
-
-  direct    — a single question or task the assistant can handle by itself,
-              with or without a web search.
-              Use for: greetings, factual lookups, current prices, weather,
-              news, sports scores, coding, writing, math, opinions.
-              Also use for SHORT FOLLOW-UP MESSAGES (under ~15 words, or
-              messages that are clearly continuing a prior topic such as
-              "what about last Tuesday?", "and in Europe?", "thanks").
-              When in doubt between direct and research, choose direct.
-
-  research  — requires parallel investigation and synthesis across multiple
-              independent sources: comparisons, reports, literature reviews,
-              "investigate X", "summarise sources on Y".
-              Only use this when a single web search clearly would not suffice.
-
-  clarify   — the request is genuinely ambiguous in a way that would produce
-              a wrong research plan if assumed. Do not clarify simple,
-              short, or obvious requests.
-
-  blocked   — harmful, illegal, or dangerous content. Refuse with a brief
-              safe reason in the reason field.
-
-Return only the JSON object matching the schema. No other text.
-"""
-
-
-async def route(user_message: str) -> RouterDecision:
-    """
-    Classify a single user message. Stateless — no history passed.
-    Short follow-ups always resolve to direct so the orchestrator's
-    full history handles the context.
-    """
-    result = await router.run(user_message)
     return result.output

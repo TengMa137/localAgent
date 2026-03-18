@@ -21,8 +21,8 @@ model = OpenAIChatModel(
 )
 
 config = FilesystemValidatorConfig(
-    mounts=[Mount(host_path="/home/localAgent/", mount_point="/", mode="ro")]
-)
+    mounts=[Mount(host_path="/home/localAgent/user_docs", mount_point="/docs", mode="ro"),
+            Mount(host_path="/home/localAgent/skills", mount_point="/skills", mode="ro")])
 validator = FilesystemValidator(config)
 
 fs_toolset = make_filesystem_toolset(filesystem_validator=validator)
@@ -36,7 +36,7 @@ web_toolset = make_web_toolset(
 )
 
 load_cfg = LocalLoadConfig(
-    allow_read=["/retrieval", "/tmp"]
+    allow_read=["/docs"]
 )
 rag_toolset = make_rag_toolset(
     filesystem_validator=validator,

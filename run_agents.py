@@ -331,6 +331,23 @@ async def handle_turn(user_text: str, session: ChatSession, debug: bool = False)
     _save_history(session)
 
 
+
+# from voice_input import run_voice_input
+
+# async def run(debug: bool = False, wake_word: str = "porcupine"):
+
+#     print(BANNER)
+
+#     session = ChatSession()
+
+#     async def handle_text(text: str):
+#         try:
+#             await handle_turn(text, session, debug=debug)
+#         except Exception as exc:
+#             print(f"\n[error: {exc}]\n")
+
+#     await run_voice_input(handle_text, wake_word=wake_word)
+
 async def run(debug: bool = False) -> None:
 
     print(BANNER, "\n")
@@ -385,6 +402,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="General Agent")
 
+    # parser.add_argument(
+    #     "--wake-word",
+    #     type=str,
+    #     default="porcupine",  # must match Porcupine built-ins unless custom
+    #     help="Wake word for assistant"
+    # )
     parser.add_argument(
         "--debug",
         action="store_true",
