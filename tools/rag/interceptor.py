@@ -174,14 +174,14 @@ def make_web_toolset(
     async def arxiv_search(
         ctx: RunContext,
         query: str,
-        category: Optional[str] = None,
-        max_results: int = 10,
+        # category: Optional[str] = None,
+        max_results: int = 5,
     ) -> List[dict]:
         """Returns paper list. LLM picks which papers to fetch."""
         async with fastmcp.Client(mcp_url) as client:
             result = await client.call_tool("search_arxiv", {
                 "query": query,
-                "category": category,
+                #"category": category,
                 "max_results": max_results,
             })
         data = _result_to_dict(result)
