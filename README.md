@@ -124,7 +124,7 @@ model = OpenAIModel(
     model_name="qwen3-0.6b",          # any string — llama-server ignores it
     openai_client=AsyncOpenAI(
         base_url="http://localhost:8080/v1",
-        api_key="not-needed",          # llama-server requires a non-empty value
+        api_key="no-key",          # llama-server requires a non-empty value
     ),
 )
 ```
@@ -266,8 +266,8 @@ the host unless a worker explicitly calls a web search or crawl tool.
 
 Key constants in *_agents.py respectively (extract to `config.py` if you prefer):
 
-| Constant | Default | Effect |
-|---|---|---|
+| Constant | Effect |
+|---|---|
 | `MAX_PARALLEL_TASKS` | Worker concurrency per batch |
 | `MAX_ITERATIONS`  | Reflect → worker loop limit |
 | `MAX_TASKS_PER_PLAN`  | Tasks plan_agent can generate |
@@ -280,7 +280,7 @@ Key constants in *_agents.py respectively (extract to `config.py` if you prefer)
 
 Each session is saved to `./chat_history/chats/<session-title>.json` after every turn, where
 `session-title` is a kebab-case slug the orchestrator generates on the first turn
-(e.g. `compare-llm-pricing.json`, note: not stable for small LLM). Change it at CHAT_HISTORY_DIR in run_agents.py.
+(e.g. `compare-llm-pricing.json`, note: not stable for small LLM, better to use timestamp). Change it at CHAT_HISTORY_DIR in run_agents.py.
 
 The file stores the full `List[ModelMessage]` serialised via pydantic-ai's `TypeAdapter`,
 so it is round-trippable back into a live session.
@@ -300,4 +300,4 @@ so it is round-trippable back into a live session.
 - **Skills expansion** — add arXiv, literature review, and other interesting skills; make the agent self-improving by letting it write and evaluate new skill files.
 - **Persistent task log** — swap `TaskLogStore` (currently an in-memory dict) for
   Logfire, Langfuse, or a local SQLite store.
-- **Session resume** — reload a saved `chat_history/*.json` to continue a previous session.
+- **Session resume** — reload a saved `chat_history/chats/*.json` to continue a previous session.
