@@ -19,6 +19,7 @@ from .observability import observable_run, _rt, task_log_store, TaskLog
 
 
 MAX_PARALLEL_TASKS = 3
+MAX_TOOL_CALLS = 10
 
 class TaskSpec(BaseModel):
     objective:       str
@@ -114,7 +115,7 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
             task.objective,
             label=f"worker:{task_id[:8]}",
             indent=2,
-            usage_limits=UsageLimits(tool_calls_limit=6),
+            usage_limits=UsageLimits(tool_calls_limit=MAX_TOOL_CALLS),
         )
         messages   = result.all_messages()
         tool_calls = sum(
@@ -123,7 +124,7 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
             for p in getattr(m, "parts", [])
             if getattr(p, "part_kind", "") == "tool-call"
         )
-        if tool_calls > 5:
+        if tool_calls > MAX_TOOL_CALLS:
             _rt(f"[worker {task_id[:8]}] ✗ TOOL LOOP ({tool_calls} calls)", "red")
             log.status = "failed"
             log.error  = f"tool loop detected ({tool_calls} calls)"

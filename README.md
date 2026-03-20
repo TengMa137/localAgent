@@ -17,12 +17,15 @@ The agent handles three kinds of requests from a single conversation loop:
 
 ---
 
-## Project layout (simplified)
+## Project layout
 
 ```
 .
-├── main.py                  # Entry point — interactive terminal chat
-├── research_agent.py        # Orchestrator, workers, task log
+├── run_agents.py.py                  # Entry point — interactive terminal chat
+├── agents/
+│   ├── agent.py    # Orchestrator, plan_agent, workers, reflect, synthesis
+│   ├── observability.py     # Real-time event streaming to stderr
+│   └── utils.py             # Model setup, toolset factories, skill loader
 │
 ├── retrieval/
 │   └── rag.py               # RAG pipeline (rag_service singleton)
@@ -39,48 +42,156 @@ The agent handles three kinds of requests from a single conversation loop:
 
 ---
 
+## Quickstart
+
+### 1. Install dependencies
+
+### 2. Configure your model provider
+
+Set the model endpoint and identifier in `agents/utils.py` (or via environment variables —
+see [Model providers](#model-providers) below).
+
+### 3. Run
+
+```bash
+python python src/run_agents.py
+
+# Enable full agent traces (tool calls, model responses, worker logs)
+python python src/run_agents.py --debug
+```
+
+Type anything to begin. Enter `exit`, `quit`, or press `Ctrl-C` to quit.
+
+---
+
+## Model providers
+
+The agent uses pydantic-ai's `provider:model` identifier format, so any OpenAI-compatible
+endpoint works without code changes.
+
+### Cloud APIs
+
+```bash
+# OpenAI
+export OPENAI_API_KEY=sk-...
+# set model = "openai:gpt-4o" in utils.py
+
+# Anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+# set model = "anthropic:claude-sonnet-4-5" in utils.py
+```
+
+### Local via llama.cpp
+
+[llama.cpp](https://github.com/ggerganov/llama.cpp) exposes an OpenAI-compatible server
+that works as a drop-in local backend.
+
+**Step 1 — Build llama.cpp and download a model**
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp && cmake -B build && cmake --build build --config Release -j
+
+# Download a GGUF model — Qwen3-0.6B is a good starting point
+```
+
+**Step 2 — Start the server**
+
+```bash
+./build/bin/llama-server \
+    --model ./models/qwen3-0.6b-q8_0.gguf \
+    --port 8080 \
+    --ctx-size 32768 \
+    --n-predict 2048 \
+    --jinja \
+    --cache-ram 2048 \
+    -np 4
+    -ctk q8_0 \
+    -ctv q8_0 
+
+# adjust the parameter as needed, mind for the RAM/VRAM consumption.
+```
+
+**Step 3 — Point the agent at the local server**
+
+In `agents/utils.py`:
+
+```python
+from pydantic_ai.models.openai import OpenAIModel
+from openai import AsyncOpenAI
+
+model = OpenAIModel(
+    model_name="qwen3-0.6b",          # any string — llama-server ignores it
+    openai_client=AsyncOpenAI(
+        base_url="http://localhost:8080/v1",
+        api_key="not-needed",          # llama-server requires a non-empty value
+    ),
+)
+```
+
+No other changes needed — the rest of the agent stack is model-agnostic.
+
+---
+
+## Tested models
+
+| Model | Backend | Works for |
+|---|---|---|
+| Qwen3-0.6B | llama.cpp (local) | Q&A over local files, web search, URL crawling |
+| Qwen3-8B | llama.cpp (local) | Multi-step research, planning, reflection |
+...
+
+**Notes on small models (≤ 1B):** Qwen3-0.6B handles simple single-turn tasks well — fetching
+a web page, answering a question from a local file, a straightforward search. Multi-hop
+research with parallel workers and reflection is more reliable with 7B+ models. The agent
+is already tuned for small models: workers receive a single focused objective, tool schemas
+are minimal, and structured Pydantic output reduces reliance on free-form instruction following.
+
+---
+
 ## Architecture
 
 ### Orchestrator
 
-The orchestrator is the long-lived conversational agent. It runs inside a `while True` loop in
-`run_agents.py` and accumulates `message_history` across turns. A `history_processor` compresses old
-turns with a cheap model once the history exceeds a configurable threshold, keeping the context
-window bounded without losing important decisions.
+The orchestrator is the long-lived conversational agent. It accumulates `message_history`
+across turns and classifies each turn as `direct`, `clarify`, or `research`. A
+`history_processor` compresses old turns once history exceeds a configurable threshold,
+keeping the context window bounded without losing important decisions.
 
-Each turn the router agent decides the mode first("direct" | "research" | "clarify"), if in research mode, the orchestrator returns a typed `OrchestratorPlan`:
+For research turns it resolves any local file paths via `list_files`, then delegates all
+content retrieval to `plan_and_spawn` — it never reads file content or web pages itself.
 
-```python
-class OrchestratorPlan(BaseModel):
-    reply: str               # shown to the user immediately
-    tasks: List[str]         # sub-task objectives, research mode only
-    objective_complete: bool
-    session_title: Optional[str]  # kebab-case slug, set once on first turn
-```
+### plan_agent
+
+A one-shot agent that receives the research objective and resolved file paths. It may call
+`read_file` to preview file contents. If the preview is sufficient it returns an
+`initial_answer` directly (skipping workers). Otherwise it decomposes the objective into
+up to `MAX_TASKS_PER_PLAN` independent `TaskSpec` objects for the worker pool.
 
 ### Worker agents
 
-Workers are stateless and single-shot. Each call to `run_worker(objective)` creates a fresh agent,
-runs it once, and discards its internal message history. Pydantic-ai drives the full tool-call loop
-internally — a single `agent.run()` may call `web_search`, `rag_search_tool`, `rag_answer_tool`,
-and `finish_task` in sequence without any Python code between those steps.
+Workers are stateless and single-shot. Each executes one `TaskSpec` using RAG and web tools,
+following a strict tool priority order:
 
-The worker's only output back to the orchestrator is what it writes into `finish_task`:
+1. `relevant_files` in the task spec → `rag_search_tool`
+2. Insufficient → `web_search`
+3. URL known → `crawl_url` → `rag_search_tool` (URL as doc ref)
+4. Broad sweep → `rag_search_tool` with no filter
 
-```
-summary          plain-language answer to the sub-task objective
-cited_node_ids   doc_id values from rag_search_tool — traceable sources
-                 without the model writing raw URLs
-```
+Multiple workers run in parallel via `asyncio.gather`, bounded by `MAX_PARALLEL_TASKS`.
 
-Multiple workers run in parallel via `asyncio.gather`.
+### Reflect → Synthesise loop
+
+After each worker batch a `reflect_agent` assesses completeness and confidence. If the
+objective is not yet complete it proposes follow-up tasks for the next iteration (up to
+`MAX_ITERATIONS`). Once complete, `synthesis_agent` produces the final report.
 
 ### Shared RAG knowledge base
 
-`web_toolset` wraps the MCP server with an interceptor that automatically ingests every
-search/crawl response into `rag_service` before returning a receipt to the worker. Because
-`rag_service` is a module-level singleton, a page crawled by worker A is immediately
-searchable by worker B via `rag_search_tool` — no coordination code needed.
+`web_toolset` wraps the MCP web server with an interceptor that automatically ingests every
+search and crawl response into `rag_service` before returning a receipt to the worker.
+Because `rag_service` is a module-level singleton, a page crawled by worker A is immediately
+searchable by worker B — no coordination code needed.
 
 ```
 Worker A                         Worker B
@@ -95,10 +206,10 @@ Worker A                         Worker B
 
 ## Toolsets
 
-### Filesystem toolset (`tools/filesystem.py`)
+### Filesystem toolset
 
 All file I/O goes through `FilesystemValidator`, which enforces strict mount-based permissions
-before any path is touched. Mounts are declared at startup:
+before any path is touched:
 
 ```python
 config = FilesystemValidatorConfig(
@@ -107,86 +218,72 @@ config = FilesystemValidatorConfig(
 ```
 
 `mode` can be `"r"` (read-only), `"rw"` (read-write), or `"none"` (blocked). Paths outside
-declared mounts are rejected. This makes it safe to give agents filesystem access without
-risk of reads or writes escaping the intended scope.
+declared mounts are rejected.
 
-### Skills toolset (`tools/skills.py`)
+### Skills toolset
 
-Skills are markdown files under `./skills/` that teach the agent domain-specific workflows —
-how to search arxiv, how to structure a literature review, which RAG tools to call for a given
-question type, etc.
+Skills are markdown files under `./skills/` that teach agents domain-specific workflows —
+how to search arXiv, how to structure a literature review, which RAG tools to use for a
+given question type, and so on.
 
-`build_index(validator, skills_root)` scans the skills directory through the filesystem
-validator and builds an index. `make_skills(index)` returns:
+`build_index` scans the skills directory and builds a lightweight index. `make_skills`
+returns:
 
-- `skills_prompt` — a compact listing injected into the worker's system prompt so the model
-  knows what skills are available.
-- `load_skill` — a tool the agent calls to read a specific skill file on demand, keeping the
+- `skills_prompt` — a compact listing injected into the system prompt so the model knows
+  what skills are available without loading all of them upfront.
+- `load_skill` — a tool the agent calls to read a specific skill on demand, keeping the
   initial context small.
 
-### RAG toolset (`tools/rag.py`)
-
-Exposes three tools backed by `rag_service`:
+### RAG toolset
 
 | Tool | Purpose |
 |---|---|
-| `rag_search_tool(question)` | Retrieve the top-k most relevant chunks for a question |
-| `rag_answer_tool(question)` | Ask the RAG pipeline to synthesise an answer with citations |
-| `rag_expand_node_tool(doc_id)` | Fetch surrounding context for a specific document node |
+| `rag_search_tool(question)` | Top-k chunk retrieval for a question |
+| `rag_answer_tool(question)` | Synthesised answer with citations |
+| `rag_expand_node_tool(doc_id)` | Surrounding context for a specific node |
 
-`make_intercepting_toolset(mcp_url, rag_service)` wraps the MCP web tools so that every
-response is ingested into `rag_service` before being returned to the agent. Workers never
-receive raw HTML — they receive a receipt and then query the RAG store.
+### Web toolset
 
-### Web toolset (`tools/rag.py` + MCP server)
-
-The MCP server provides web search, URL crawling, and
-arxiv search. The intercepting wrapper means the agent's interaction with web content
-always goes through the RAG pipeline — deduplication, chunking, and retrieval are handled automatically.
+Provided by an [MCP server](https://github.com/TengMa137/mcp_web) (web search, URL crawling, arXiv lookup). The intercepting
+wrapper means workers never receive raw HTML — they receive a receipt and then query
+the RAG store. This also ensures deduplication: the same URL crawled twice is only
+ingested once.
 
 ---
 
-## RAG pipeline (`retrieval/rag.py`)
+## RAG pipeline
 
-`rag_service` is a structure-based retrieval pipeline. "Structure-based" means it preserves
-the document's own organisation (sections, headings, list items) as the chunking boundary
-rather than splitting on fixed token counts. This keeps chunks semantically coherent and
-reduces the noise that fixed-size chunking introduces when a sentence spans a boundary.
+`rag_service` uses structure-based chunking — it preserves the document's own organisation
+(sections, headings, list items) as chunking boundaries rather than splitting on fixed token
+counts. This keeps chunks semantically coherent and reduces noise at boundaries.
 
-The pipeline is local — embeddings and retrieval run on your machine. No data leaves the
-host unless a worker explicitly calls a web search tool.
+The pipeline is fully local. Embeddings and retrieval run on your machine. No data leaves
+the host unless a worker explicitly calls a web search or crawl tool.
 
 ---
 
-## Local-first and small-LLM compatibility
+## Configuration
 
-The system is designed to run entirely on local hardware:
+Key constants in *_agents.py respectively (extract to `config.py` if you prefer):
 
-**OpenAI-compatible endpoint** — the model identifier follows pydantic-ai's `provider:model`
-
-
-**Fine-tuned for small models** — Tested with qwen-0.6b locally. Key design choices that help smaller models:
-
-- Workers receive a single focused objective, not the full conversation history.
-- The tool schema is minimal, load skill tool
-  plus the RAG and web toolsets. Fewer tools means fewer opportunities for the model to
-  mis-route.
-- `OrchestratorPlan` is a typed Pydantic model — structured output reduces reliance on the
-  model following free-form JSON instructions.
-- History compression keeps prompts short, which matters more for models with smaller
-  effective context windows.
+| Constant | Default | Effect |
+|---|---|---|
+| `MAX_PARALLEL_TASKS` | Worker concurrency per batch |
+| `MAX_ITERATIONS`  | Reflect → worker loop limit |
+| `MAX_TASKS_PER_PLAN`  | Tasks plan_agent can generate |
+| `COMPRESS_AFTER`  | Message count that triggers history compression |
+| `KEEP_RECENT`  | Messages kept verbatim after compression |
 
 ---
 
 ## Chat history
 
-Each session is saved to `./chat_history/<session-title>.json` after every turn, where
-`session-title` is a kebab-case slug the orchestrator generates on the first substantive turn
-(e.g. `compare-llm-pricing.json`).
+Each session is saved to `./chat_history/chats/<session-title>.json` after every turn, where
+`session-title` is a kebab-case slug the orchestrator generates on the first turn
+(e.g. `compare-llm-pricing.json`, note: not stable for small LLM). Change it at CHAT_HISTORY_DIR in run_agents.py.
 
-The file stores the full pydantic-ai `List[ModelMessage]` serialised to JSON via
-`TypeAdapter(List[ModelMessage]).dump_python(messages, mode="json")`, so it is round-trippable
-back into a live session with `.validate_python()`.
+The file stores the full `List[ModelMessage]` serialised via pydantic-ai's `TypeAdapter`,
+so it is round-trippable back into a live session.
 
 ```json
 {
@@ -196,6 +293,11 @@ back into a live session with `.validate_python()`.
 }
 ```
 
-**Roadmap:** the `TaskLogStore` is currently a plain dict. In the future, easy to swap to logfire, Langfuse or in-house log system
 ---
 
+## Roadmap
+
+- **Skills expansion** — add arXiv, literature review, and other interesting skills; make the agent self-improving by letting it write and evaluate new skill files.
+- **Persistent task log** — swap `TaskLogStore` (currently an in-memory dict) for
+  Logfire, Langfuse, or a local SQLite store.
+- **Session resume** — reload a saved `chat_history/*.json` to continue a previous session.
