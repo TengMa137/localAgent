@@ -26,7 +26,7 @@ from pydantic import TypeAdapter
 from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.usage import UsageLimits
 
-from retrieval.rag import rag_service
+from rag import rag_service
 from agents.orchestrator_agent import OrchestratorResponse, orchestrator
 from agents.observability import observable_run, task_log_store, _c, log_event
 

@@ -16,17 +16,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tools.rag.interceptor import (
+from tools.retrieval.interceptor import (
     _crawl_to_doc,
     _ingest,
     _to_dict,
     make_web_toolset,
 )
-from tools.rag.make_doc import make_title, stable_doc_id
-from retrieval.types_doc import Document
+from tools.retrieval.make_doc import make_title, stable_doc_id
+from rag import Document
 
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 import json
 
 
@@ -41,14 +40,14 @@ def _mcp_result(data: dict):
 @pytest.fixture
 def mock_rag():
     rag = MagicMock()
-    rag.ingest_documents = MagicMock()
+    rag.ingest_documents = AsyncMock()
     rag._indexed_doc_ids = set()
     return rag
 
 
 @pytest.fixture
 def web_toolset(mock_rag):
-    with patch("tools.rag.interceptor.fastmcp") as _mock_fmcp:
+    with patch("tools.retrieval.interceptor.fastmcp") as _mock_fmcp:
         _mc = MagicMock()
         _mc.call_tool = AsyncMock(return_value=_mcp_result({}))
         _mock_fmcp.Client.return_value.__aenter__ = AsyncMock(return_value=_mc)
@@ -231,29 +230,32 @@ class TestCrawlToDoc:
 
 
 class TestIngest:
-    def test_calls_ingest_documents(self, mock_rag):
+    @pytest.mark.asyncio
+    async def test_calls_ingest_documents(self, mock_rag):
         docs = [
             Document(doc_id="abc", source="https://a.com", title="A", text="text a", mime="text/plain", meta={}),
         ]
-        _ingest(mock_rag, docs)
-        mock_rag.ingest_documents.assert_called_once_with(docs)
+        await _ingest(mock_rag, docs)
+        mock_rag.ingest_documents.assert_awaited_once_with(docs)
 
-    def test_receipt_format(self, mock_rag):
+    @pytest.mark.asyncio
+    async def test_receipt_format(self, mock_rag):
         docs = [
             Document(doc_id="id1", source="https://a.com", title="A", text="a", mime="text/plain", meta={}),
             Document(doc_id="id2", source="https://b.com", title="B", text="b", mime="text/plain", meta={}),
         ]
-        receipt = _ingest(mock_rag, docs)
+        receipt = await _ingest(mock_rag, docs)
         assert "Ingested 2 document(s)" in receipt
         assert receipt.count('"') >= 2   # titles are quoted
         assert "rag_search_tool()" in receipt
 
-    def test_multiple_docs_all_appear_in_receipt(self, mock_rag):
+    @pytest.mark.asyncio
+    async def test_multiple_docs_all_appear_in_receipt(self, mock_rag):
         docs = [
             Document(doc_id=f"id{i}", source=f"https://s{i}.com", title=f"T{i}", text="t", mime="text/plain", meta={})
             for i in range(3)
         ]
-        receipt = _ingest(mock_rag, docs)
+        receipt = await _ingest(mock_rag, docs)
         for i in range(3):
             assert f"T{i}" in receipt
 
@@ -270,7 +272,7 @@ class TestWebSearch:
             "total_results": 2,
         })
         result = await _call(web_toolset, web_tools_in_toolset,
-                             "web_search", ctx, query="hypertrophy")
+                             "web_search_tool", ctx, query="hypertrophy")
         assert len(result) == 2
         assert result[0]["url"] == "https://a.com"
         assert result[1]["url"] == "https://b.com"
@@ -278,20 +280,20 @@ class TestWebSearch:
     @pytest.mark.asyncio
     async def test_does_not_ingest(self, web_toolset, web_tools_in_toolset, ctx, mock_rag):
         web_toolset._test_mc.call_tool.return_value = _mcp_result({"results": []})
-        await _call(web_toolset, web_tools_in_toolset, "web_search", ctx, query="x")
+        await _call(web_toolset, web_tools_in_toolset, "web_search_tool", ctx, query="x")
         mock_rag.ingest_documents.assert_not_called()
  
     @pytest.mark.asyncio
     async def test_empty_results(self, web_toolset, web_tools_in_toolset, ctx):
         web_toolset._test_mc.call_tool.return_value = _mcp_result({"results": []})
         result = await _call(web_toolset, web_tools_in_toolset,
-                             "web_search", ctx, query="noresults")
+                             "web_search_tool", ctx, query="noresults")
         assert result == []
  
     @pytest.mark.asyncio
     async def test_calls_mcp_web_search(self, web_toolset, web_tools_in_toolset, ctx):
         web_toolset._test_mc.call_tool.return_value = _mcp_result({"results": []})
-        await _call(web_toolset, web_tools_in_toolset, "web_search", ctx, query="test query")
+        await _call(web_toolset, web_tools_in_toolset, "web_search_tool", ctx, query="test query")
         web_toolset._test_mc.call_tool.assert_awaited_once_with(
             "search_web", {"query": "test query"}
         )

@@ -21,18 +21,16 @@ The agent handles three kinds of requests from a single conversation loop:
 
 ```
 .
-├── run_agents.py.py                  # Entry point — interactive terminal chat
+├── run_agents.py            # Entry point — interactive terminal chat
+├── rag.py                   # Rag service entry point, import from rag_lib
 ├── agents/
-│   ├── agent.py    # Orchestrator, plan_agent, workers, reflect, synthesis
+│   ├── agent.py             # Orchestrator, plan_agent, workers, reflect, synthesis
 │   ├── observability.py     # Real-time event streaming to stderr
 │   └── utils.py             # Model setup, toolset factories, skill loader
 │
-├── retrieval/
-│   └── rag.py               # RAG pipeline (rag_service singleton)
-│
 ├── tools/
 │   ├── filesystem.py        # FilesystemValidator + Mount config
-│   ├── rag.py               # make_rag_toolset, make_intercepting_toolset
+│   ├── retrieval.py         # make_rag_toolset, make_intercepting_toolset
 │   └── skills.py            # build_index, make_skills
 │
 ├── skills/                  # Skill markdown files loaded at runtime
@@ -44,7 +42,37 @@ The agent handles three kinds of requests from a single conversation loop:
 
 ## Quickstart
 
-### 1. Install dependencies
+### 1. Install dependencies (uv recommended)
+
+This project uses **[`uv`](https://github.com/astral-sh/uv)** for fast, reproducible installs.
+
+```bash
+# create virtual environment (optional but recommended)
+uv venv
+source .venv/bin/activate
+
+# install all dependencies from lockfile
+uv sync
+```
+
+
+#### Install `rag_lib`
+
+Local development (editable install), first clone the repo [rag_lib](https://github.com/TengMa137/rag_lib.git) in a separate folder, and then: 
+
+```bash
+uv sync
+```
+
+`pyproject.toml` wires `rag-lib` from `../rag_lib` as an editable uv path dependency.
+If your checkout lives elsewhere, update `[tool.uv.sources]` accordingly.
+
+Or install from Git
+
+```bash
+uv pip install "rag-lib @ git+https://github.com/TengMa137/rag_lib.git"
+```
+
 
 ### 2. Configure your model provider
 

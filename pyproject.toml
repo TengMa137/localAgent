@@ -8,7 +8,21 @@ dependencies = [
     "pydantic>=2.12.5",
     "pydantic-ai>=1.39.1",
     "pydantic-ai-slim[fastmcp,openai]>=1.39.1",
+    "rag-lib",
 ]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+rag-lib = { path = "../rag_lib", editable = true }
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
 
 [dependency-groups]
 dev = [

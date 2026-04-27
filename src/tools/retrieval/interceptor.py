@@ -23,16 +23,14 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, List, Optional
 
 import fastmcp
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-
-from retrieval.types_doc import Document
-from retrieval.rag import RagService
-from .make_doc import make_title, stable_doc_id
+from rag import RagServiceProtocol, Document
+from tools.retrieval.make_doc import make_title, stable_doc_id
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -69,9 +67,9 @@ def _result_to_dict(result: Any) -> dict:
     return _to_dict(result)
 
 
-def _ingest(rag: RagService, docs: List[Document]) -> str:
+async def _ingest(rag: RagServiceProtocol, docs: List[Document]) -> str:
     """Ingest docs and return a receipt string with titles for the LLM."""
-    rag.ingest_documents(docs)
+    await rag.ingest_documents(docs)
     listing = ", ".join(f'"{d.title}"' for d in docs)
     return (
         f"Ingested {len(docs)} document(s): {listing}. "
@@ -101,7 +99,7 @@ def _crawl_to_doc(content: dict) -> Optional[Document]:
 
 def make_web_toolset(
     mcp_url: str,
-    rag_service: RagService,
+    rag_service: RagServiceProtocol,
 ) -> FunctionToolset:
     """
     Returns a FunctionToolset with:
@@ -163,7 +161,7 @@ def make_web_toolset(
         if not docs:
             return f"No usable content retrieved from: {urls}"
 
-        return _ingest(rag_service, docs)
+        return await _ingest(rag_service, docs)
 
 
     @toolset.tool(name="arxiv_search_tool", description=(
@@ -237,6 +235,6 @@ def make_web_toolset(
         if not docs:
             return f"No papers found for ids: {arxiv_ids}"
  
-        return _ingest(rag_service, docs)
+        return await _ingest(rag_service, docs)
 
     return toolset

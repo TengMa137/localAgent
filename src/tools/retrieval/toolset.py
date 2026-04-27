@@ -1,44 +1,61 @@
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-from retrieval.rag import rag_service
-from retrieval.types_doc import Document
-from retrieval.local.loader import LocalLoadConfig
+from rag import RagServiceProtocol, rag_service as default_rag_service
 
 from tools.filesystem.validator import FilesystemValidator
+from tools.filesystem.text_ops import resolve_for_read
+
+
+def _get_resolved_paths(validator: FilesystemValidator, paths: list[str]) -> list[str]:
+    resolved_paths = []
+    for p in paths:
+        try:
+            target = resolve_for_read(validator, p)
+            resolved_paths.append(str(target.resolved))
+        except Exception:  # skip invalid path
+            continue
+    return resolved_paths
+
+
+async def _get_doc_ids(
+    rag_service: RagServiceProtocol,
+    validator: FilesystemValidator,
+    docs: list[str] | None,
+) -> list[str] | None:
+    if docs is None:
+        return None
+
+    doc_ids = []
+    matches, missing = rag_service.get_docs_to_ingest(docs)
+
+    doc_ids.extend(matches)
+    if missing:
+        resolved_paths = _get_resolved_paths(validator, missing)
+        if resolved_paths:
+            doc_ids.extend(await rag_service.ingest_local(resolved_paths))
+    return doc_ids
+
 
 def make_rag_toolset(
-    filesystem_validator: FilesystemValidator,
-    load_cfg: LocalLoadConfig,
-    id: Optional[str] = None,
+    doc_validator: FilesystemValidator,
+    id: str | None = None,
+    rag_service: RagServiceProtocol = default_rag_service,
 ) -> FunctionToolset:
-    """Create a retrieval augmeneted generation (RAG) toolset with file I/O tools.
+    """Create a retrieval augmented generation (RAG) toolset.
 
-    RAG tools implemented as a FunctionToolset.
+    RAG tools are implemented as a FunctionToolset.
     The FilesystemValidator is the sole authority for validation.
 
     Args:
-        filesystem_validator: Validator for permission checking and path resolution
+        doc_validator: Validator for permission checking and path resolution
         id: Optional toolset ID for durable execution
+        rag_service: RAG service implementation to use
 
     Returns:
-        FunctionToolset with file operation tools
-
-    Example:
-        config = FilesystemValidatorConfig(mounts=[
-            Mount(host_path="./", mount_point="/", mode="rw"),
-        ])
-        validator = FilesystemValidator(config)
-        load_cfg = LocalLoadConfig(
-            allow_read=["/retrieval", "/tmp"]
-        )
-        toolset = make_rag_toolset(
-            filesystem_validator=validator,
-            load_cfg=load_cfg
-        )
+        FunctionToolset with RAG tools
     """
     toolset = FunctionToolset(id=id)
 
@@ -55,7 +72,7 @@ def make_rag_toolset(
     async def rag_search_tool(
         ctx: RunContext,
         question: str,
-        docs: Optional[List[str]] = None,
+        docs: list[str] | None = None,
     ) -> list[dict]:
         """
         Search knowledge using the RAG system.
@@ -70,12 +87,10 @@ def make_rag_toolset(
 
             Preloaded documents from external systems (crawler, API, etc).
         """
-
+        doc_ids = await _get_doc_ids(rag_service, doc_validator, docs)
         results = await rag_service.search(
             question=question,
-            docs=docs,
-            filesystem_validator=filesystem_validator,
-            load_cfg=load_cfg
+            doc_ids=doc_ids,
         )
 
         return results
@@ -92,14 +107,12 @@ def make_rag_toolset(
     async def rag_answer_tool(
         ctx: RunContext,
         question: str,
-        docs: Optional[List[str]] = None,
+        docs: list[str] | None = None,
     ) -> str:
-
+        doc_ids = await _get_doc_ids(rag_service, doc_validator, docs)
         answer = await rag_service.answer(
             question=question,
-            docs=docs,
-            filesystem_validator=filesystem_validator,
-            load_cfg=load_cfg
+            doc_ids=doc_ids,
         )
 
         return answer
@@ -112,7 +125,7 @@ def make_rag_toolset(
     ) -> list[dict]:
 
         return rag_service.list_documents()
-    
+
 
     @toolset.tool(
         description=(
@@ -124,7 +137,6 @@ def make_rag_toolset(
         ctx: RunContext,
         node_id: str,
     ) -> dict:
-
         idx, node = rag_service.store.resolve_node(node_id)
 
         if not idx or not node:
