@@ -42,50 +42,67 @@ The agent handles three kinds of requests from a single conversation loop:
 
 ## Quickstart
 
-### 1. Install dependencies (uv recommended)
+### 1. Clone the sibling repositories
+
+Recommended host layout:
+
+```text
+~/codespace/
+├── localAgent/
+├── rag_lib/
+└── mcp_server_local/
+```
+
+`localAgent` depends on `rag_lib` as an editable local package. The MCP server runs as
+a separate local service during host development.
+
+### 2. Install dependencies on the host
 
 This project uses **[`uv`](https://github.com/astral-sh/uv)** for fast, reproducible installs.
+Developing directly on the host is the default workflow; mounting this repo into a Python
+container for day-to-day work adds an extra filesystem and networking layer without much benefit.
 
 ```bash
-# create virtual environment (optional but recommended)
 uv venv
 source .venv/bin/activate
 
-# install all dependencies from lockfile
-uv sync
-```
-
-
-#### Install `rag_lib`
-
-Local development (editable install), first clone the repo [rag_lib](https://github.com/TengMa137/rag_lib.git) in a separate folder, and then: 
-
-```bash
 uv sync
 ```
 
 `pyproject.toml` wires `rag-lib` from `../rag_lib` as an editable uv path dependency.
-If your checkout lives elsewhere, update `[tool.uv.sources]` accordingly.
+If your checkout lives elsewhere, update `[tool.uv.sources]`.
 
-Or install from Git
+### 3. Start dependencies
+
+Start an OpenAI-compatible model endpoint, for example llama.cpp:
 
 ```bash
-uv pip install "rag-lib @ git+https://github.com/TengMa137/rag_lib.git"
+./build/bin/llama-server \
+    --model ./models/qwen3-0.6b-q8_0.gguf \
+    --port 8080 \
+    --ctx-size 32768 \
+    --n-predict 2048 \
+    --jinja
 ```
 
+Start the MCP server from `~/codespace/mcp_server_local` so it listens on port `8000`.
 
-### 2. Configure your model provider
+Host defaults:
 
-Set the model endpoint and identifier in `agents/utils.py` (or via environment variables —
-see [Model providers](#model-providers) below).
+```text
+LOCALAGENT_MODEL_BASE_URL=http://localhost:8080/v1
+LOCALAGENT_MCP_URL=http://localhost:8000/sse
+LOCALAGENT_DOCS_DIR=user_docs
+LOCALAGENT_SKILLS_DIR=skills
+```
 
-### 3. Run
+### 4. Run
 
 ```bash
-python python src/run_agents.py
+uv run python src/run_agents.py
 
-# Enable full agent traces (tool calls, model responses, worker logs)
-python python src/run_agents.py --debug
+# enable full agent traces
+uv run python src/run_agents.py --debug
 ```
 
 Type anything to begin. Enter `exit`, `quit`, or press `Ctrl-C` to quit.
@@ -142,19 +159,11 @@ cd llama.cpp && cmake -B build && cmake --build build --config Release -j
 
 **Step 3 — Point the agent at the local server**
 
-In `agents/utils.py`:
+The default is already:
 
-```python
-from pydantic_ai.models.openai import OpenAIModel
-from openai import AsyncOpenAI
-
-model = OpenAIModel(
-    model_name="qwen3-0.6b",          # any string — llama-server ignores it
-    openai_client=AsyncOpenAI(
-        base_url="http://localhost:8080/v1",
-        api_key="no-key",          # llama-server requires a non-empty value
-    ),
-)
+```bash
+export LOCALAGENT_MODEL_BASE_URL=http://localhost:8080/v1
+export LOCALAGENT_MODEL_API_KEY=no-key
 ```
 
 No other changes needed — the rest of the agent stack is model-agnostic.
@@ -202,8 +211,8 @@ Workers are stateless and single-shot. Each executes one `TaskSpec` using RAG an
 following a strict tool priority order:
 
 1. `relevant_files` in the task spec → `rag_search_tool`
-2. Insufficient → `web_search`
-3. URL known → `crawl_url` → `rag_search_tool` (URL as doc ref)
+2. Insufficient → `web_search_tool`
+3. URL known → `web_crawl_tool` → `rag_search_tool` (URL as doc ref)
 4. Broad sweep → `rag_search_tool` with no filter
 
 Multiple workers run in parallel via `asyncio.gather`, bounded by `MAX_PARALLEL_TASKS`.
@@ -223,7 +232,7 @@ searchable by worker B — no coordination code needed.
 
 ```
 Worker A                         Worker B
-  web_search("topic X")           rag_search_tool("topic X")
+  web_search_tool("topic X")      rag_search_tool("topic X")
        │                                │
        ▼                                ▼
   interceptor → rag_service ←──────────┘
@@ -268,7 +277,8 @@ returns:
 |---|---|
 | `rag_search_tool(question)` | Top-k chunk retrieval for a question |
 | `rag_answer_tool(question)` | Synthesised answer with citations |
-| `rag_expand_node_tool(doc_id)` | Surrounding context for a specific node |
+| `rag_list_documents_tool()` | Documents currently indexed in the RAG store |
+| `rag_expand_node_tool(node_id)` | Full text and children for a retrieved node |
 
 ### Web toolset
 
@@ -292,7 +302,17 @@ the host unless a worker explicitly calls a web search or crawl tool.
 
 ## Configuration
 
-Key constants in *_agents.py respectively (extract to `config.py` if you prefer):
+Runtime environment variables:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOCALAGENT_MODEL_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible model endpoint used by pydantic-ai and `rag_lib` |
+| `LOCALAGENT_MODEL_API_KEY` | `no-key` | API key sent to the model endpoint |
+| `LOCALAGENT_MCP_URL` | `http://localhost:8000/sse` | MCP web server SSE endpoint |
+| `LOCALAGENT_DOCS_DIR` | `user_docs` | Host directory mounted into the agent as `/docs` |
+| `LOCALAGENT_SKILLS_DIR` | `skills` | Host directory mounted into the agent as `/skills` |
+
+Key constants in *_agents.py respectively:
 
 | Constant | Effect |
 |---|---|
@@ -301,6 +321,29 @@ Key constants in *_agents.py respectively (extract to `config.py` if you prefer)
 | `MAX_TASKS_PER_PLAN`  | Tasks plan_agent can generate |
 | `COMPRESS_AFTER`  | Message count that triggers history compression |
 | `KEEP_RECENT`  | Messages kept verbatim after compression |
+
+---
+
+## Docker Direction
+
+For now, host development with `uv` is the clean path. Later, it makes sense to run the full
+runtime stack with Docker Compose:
+
+- one application container containing both `localAgent` and `rag_lib`
+- the MCP server container from `~/codespace/mcp_server_local`
+- Redis
+- a SQL database container
+- optionally a model server, if the model is not running directly on the host
+
+In that Compose network, service DNS names should replace host-only URLs. For example:
+
+```text
+LOCALAGENT_MODEL_BASE_URL=http://model:8080/v1
+LOCALAGENT_MCP_URL=http://mcp-server:8000/sse
+```
+
+Use `host.docker.internal` only when code running inside a container must reach a service
+running directly on the host. It should not be the default for host development.
 
 ---
 

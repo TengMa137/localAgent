@@ -7,13 +7,13 @@ a short receipt.
 
 
 Two-step retrieval pattern:
-  1. web_search()        -> returns raw results to LLM (no ingestion)
-  2. crawl_and_ingest()  -> LLM picks URLs, this crawls + ingests into rag_service
+  1. web_search_tool()   -> returns raw results to LLM (no ingestion)
+  2. web_crawl_tool()    -> LLM picks URLs, this crawls + ingests into rag_service
 
 arxiv follows the same pattern:
-  1. arxiv_search()      -> returns paper list to LLM
-  2. arxiv_fetch()       -> LLM picks arxiv_ids, this fetches + ingests abstracts
-                           (PDF crawl goes through crawl_and_ingest)
+  1. arxiv_search_tool() -> returns paper list to LLM
+  2. arxiv_fetch_tool()  -> LLM picks arxiv_ids, this fetches + ingests abstracts
+                           (PDF crawl goes through web_crawl_tool)
 
 Adding a new source: implement a converter and
 call _ingest() from a new tool function. Nothing else changes.
@@ -103,10 +103,10 @@ def make_web_toolset(
 ) -> FunctionToolset:
     """
     Returns a FunctionToolset with:
-      - web_search()        pass-through, returns result list to LLM
-      - crawl_and_ingest()  crawls LLM-selected URLs, ingests into rag_service
-      - arxiv_search()      pass-through, returns paper list to LLM
-      - arxiv_fetch()       fetches LLM-selected papers, ingests abstracts
+      - web_search_tool()   pass-through, returns result list to LLM
+      - web_crawl_tool()    crawls LLM-selected URLs, ingests into rag_service
+      - arxiv_search_tool() pass-through, returns paper list to LLM
+      - arxiv_fetch_tool()  fetches LLM-selected papers, ingests abstracts
 
     The underlying MCP calls go through _mcp, which is a plain FastMCPToolset
     used only internally — the LLM never sees it directly.
@@ -132,7 +132,7 @@ def make_web_toolset(
 
     @toolset.tool(name="web_crawl_tool", description=(
         "Crawl one or more URLs and store the full content in the knowledge base. "
-        "Only call this for URLs you selected from web_search results as relevant "
+        "Only call this for URLs you selected from web_search_tool results as relevant "
         "to the objective — do not crawl every result. "
         "After crawling, use rag_search_tool() to retrieve specific sections."
     ))

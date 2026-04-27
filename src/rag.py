@@ -1,3 +1,4 @@
+import os
 from typing import Any, Protocol, runtime_checkable
 
 from rag_lib.rag import RagService
@@ -41,4 +42,6 @@ class RagServiceProtocol(Protocol):
     def list_documents(self) -> list[dict[str, Any]]: ...
 
 
-rag_service: RagServiceProtocol = RagService(base_url="http://host.docker.internal:8080/v1")
+rag_service: RagServiceProtocol = RagService(
+    base_url=os.getenv("LOCALAGENT_MODEL_BASE_URL", "http://localhost:8080/v1")
+)

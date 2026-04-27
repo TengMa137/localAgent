@@ -43,13 +43,13 @@ Orchestrator file resolution:
 File + RAG contract:
   Orchestrator resolves paths, plan_agent reads previews, workers do
   deep retrieval via rag_search_tool (auto-ingests on first access).
-  crawl_url also auto-ingests; workers use the URL as rag doc ref.
+  web_crawl_tool also auto-ingests; workers use the URL as rag doc ref.
   Workers never call fs_list or read_file directly.
 
 Worker tool priority:
   1. relevant_files from TaskSpec  →  rag_search_tool
-  2. insufficient                  →  web_search
-  3. URL known                     →  crawl_url → rag_search_tool (URL as ref)
+  2. insufficient                  →  web_search_tool
+  3. URL known                     →  web_crawl_tool → rag_search_tool (URL as ref)
   4. broad sweep                   →  rag_search_tool (no filter)
 
 History compression:

@@ -58,14 +58,14 @@ Principles:
 
 Tool usage order:
   1. relevant_files in your instructions → rag_search_tool (auto-ingested on first access)
-  2. Insufficient → web_search
-  3. URL known → crawl_url, then rag_search_tool with that URL as doc ref
+  2. Insufficient → web_search_tool
+  3. URL known → web_crawl_tool, then rag_search_tool with that URL as doc ref
   4. Broad sweep → rag_search_tool with no filter
 
 Tool discipline:
   - Do not repeat the same query
   - Do not call fs_list or read_file — file discovery is the planner's job
-  - After crawl_url, use the URL as the rag doc reference immediately
+  - After web_crawl_tool, use the URL as the rag doc reference immediately
 
 Citation rules:
   - cited_node_ids must come from rag_search_tool results only
@@ -157,4 +157,3 @@ async def _run_workers_limited(tasks: List[TaskSpec]) -> List[Dict[str, Any]]:
             return await _run_worker(t)
 
     return await asyncio.gather(*[_run(t) for t in tasks])
-
