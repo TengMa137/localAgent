@@ -1,5 +1,5 @@
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
@@ -34,4 +34,3 @@ class SkillsIndex:
 
     def clear(self):
         self._entries.clear()
-

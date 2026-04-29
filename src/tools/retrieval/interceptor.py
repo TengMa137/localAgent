@@ -97,6 +97,112 @@ def _crawl_to_doc(content: dict) -> Optional[Document]:
     )
 
 
+async def web_search_results(mcp_url: str, query: str) -> List[dict]:
+    async with fastmcp.Client(mcp_url) as client:
+        result = await client.call_tool("search_web", {"query": query})
+    data = _result_to_dict(result)
+    return data.get("results", [])
+
+
+def select_urls_from_search_results(results: List[dict], *, max_urls: int = 3) -> List[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for result in sorted(results, key=lambda item: item.get("position", 9999)):
+        url = result.get("url")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= max_urls:
+            break
+    return urls
+
+
+async def web_crawl_and_ingest(
+    mcp_url: str,
+    rag_service: RagServiceProtocol,
+    urls: List[str],
+) -> str:
+    async with fastmcp.Client(mcp_url) as client:
+        if len(urls) == 1:
+            result = await client.call_tool("crawl_url", {"url": urls[0]})
+            data = _result_to_dict(result)
+            content = data.get("content", data)
+            docs = [d for d in [_crawl_to_doc(content)] if d]
+        else:
+            result = await client.call_tool("crawl_urls", {"urls": urls})
+            data = _result_to_dict(result)
+            docs = [
+                d for d in [_crawl_to_doc(c) for c in data.get("results", [])]
+                if d
+            ]
+
+    if not docs:
+        return f"No usable content retrieved from: {urls}"
+
+    return await _ingest(rag_service, docs)
+
+
+async def arxiv_search_results(
+    mcp_url: str,
+    query: str,
+    *,
+    max_results: int = 5,
+) -> List[dict]:
+    async with fastmcp.Client(mcp_url) as client:
+        result = await client.call_tool("search_arxiv", {
+            "query": query,
+            "max_results": max_results,
+        })
+    data = _result_to_dict(result)
+    return data.get("results", [])
+
+
+async def arxiv_fetch_and_ingest(
+    mcp_url: str,
+    rag_service: RagServiceProtocol,
+    arxiv_ids: List[str],
+) -> str:
+    docs = []
+    async with fastmcp.Client(mcp_url) as client:
+        for arxiv_id in arxiv_ids:
+            result = await client.call_tool("fetch_arxiv", {"arxiv_id": arxiv_id})
+            data = _result_to_dict(result)
+            paper = data.get("paper")
+            if not paper or not data.get("found"):
+                continue
+            authors = [a.get("name", "") for a in paper.get("authors", [])]
+            url = str(paper.get("pdf_url") or f"https://arxiv.org/abs/{arxiv_id}")
+            docs.append(Document(
+                doc_id=stable_doc_id(arxiv_id),
+                source=url,
+                title=make_title(
+                    source=url,
+                    raw_title=paper.get("title"),
+                    arxiv_id=arxiv_id,
+                ),
+                text=(
+                    f"{paper.get('title', '')}\n\n"
+                    f"Authors: {', '.join(authors)}\n\n"
+                    f"{paper.get('summary', '')}"
+                ),
+                mime="text/plain",
+                meta={
+                    "tool": "arxiv_fetch",
+                    "arxiv_id": arxiv_id,
+                    "authors": authors,
+                    "published": paper.get("published"),
+                    "categories": paper.get("categories", []),
+                    "ingested_at": _now(),
+                },
+            ))
+
+    if not docs:
+        return f"No papers found for ids: {arxiv_ids}"
+
+    return await _ingest(rag_service, docs)
+
+
 def make_web_toolset(
     mcp_url: str,
     rag_service: RagServiceProtocol,
@@ -124,10 +230,7 @@ def make_web_toolset(
         query: str,
     ) -> List[dict]:
         """Returns raw search results. LLM picks which URLs to crawl."""
-        async with fastmcp.Client(mcp_url) as client:
-            result = await client.call_tool("search_web", {"query": query})
-        data = _result_to_dict(result)
-        return data.get("results", [])
+        return await web_search_results(mcp_url, query)
 
 
     @toolset.tool(name="web_crawl_tool", description=(
@@ -144,24 +247,7 @@ def make_web_toolset(
         Crawls each URL and ingests into rag_service.
         Returns a receipt with titles. Skips failed or empty pages.
         """
-        async with fastmcp.Client(mcp_url) as client:
-            if len(urls) == 1:
-                result = await client.call_tool("crawl_url", {"url": urls[0]})
-                data = _result_to_dict(result)
-                content = data.get("content", data)
-                docs = [d for d in [_crawl_to_doc(content)] if d]
-            else:
-                result = await client.call_tool("crawl_urls", {"urls": urls})
-                data = _result_to_dict(result)
-                docs = [
-                    d for d in [_crawl_to_doc(c) for c in data.get("results", [])]
-                    if d
-                ]
- 
-        if not docs:
-            return f"No usable content retrieved from: {urls}"
-
-        return await _ingest(rag_service, docs)
+        return await web_crawl_and_ingest(mcp_url, rag_service, urls)
 
 
     @toolset.tool(name="arxiv_search_tool", description=(
@@ -176,14 +262,7 @@ def make_web_toolset(
         max_results: int = 5,
     ) -> List[dict]:
         """Returns paper list. LLM picks which papers to fetch."""
-        async with fastmcp.Client(mcp_url) as client:
-            result = await client.call_tool("search_arxiv", {
-                "query": query,
-                #"category": category,
-                "max_results": max_results,
-            })
-        data = _result_to_dict(result)
-        return data.get("results", [])
+        return await arxiv_search_results(mcp_url, query, max_results=max_results)
 
     @toolset.tool(name="arxiv_fetch_tool", description=(
         "Fetch specific arXiv papers by ID and store their abstracts in the knowledge base. "
@@ -198,43 +277,6 @@ def make_web_toolset(
         Fetches each paper and ingests abstract + metadata into rag_service.
         Returns receipt with doc_ids.
         """
-        docs = []
-        async with fastmcp.Client(mcp_url) as client:
-            for arxiv_id in arxiv_ids:
-                result = await client.call_tool("fetch_arxiv", {"arxiv_id": arxiv_id})
-                data = _result_to_dict(result)
-                paper = data.get("paper")
-                if not paper or not data.get("found"):
-                    continue
-                authors = [a.get("name", "") for a in paper.get("authors", [])]
-                url = str(paper.get("pdf_url") or f"https://arxiv.org/abs/{arxiv_id}")
-                docs.append(Document(
-                    doc_id=stable_doc_id(arxiv_id),
-                    source=url,
-                    title=make_title(
-                        source=url,
-                        raw_title=paper.get("title"),
-                        arxiv_id=arxiv_id,
-                    ),
-                    text=(
-                        f"{paper.get('title', '')}\n\n"
-                        f"Authors: {', '.join(authors)}\n\n"
-                        f"{paper.get('summary', '')}"
-                    ),
-                    mime="text/plain",
-                    meta={
-                        "tool": "arxiv_fetch",
-                        "arxiv_id": arxiv_id,
-                        "authors": authors,
-                        "published": paper.get("published"),
-                        "categories": paper.get("categories", []),
-                        "ingested_at": _now(),
-                    },
-                ))
- 
-        if not docs:
-            return f"No papers found for ids: {arxiv_ids}"
- 
-        return await _ingest(rag_service, docs)
+        return await arxiv_fetch_and_ingest(mcp_url, rag_service, arxiv_ids)
 
     return toolset

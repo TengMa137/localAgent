@@ -12,8 +12,25 @@ The agent handles three kinds of requests from a single conversation loop:
 
 - **Direct** — answers immediately from the model's own knowledge (explanations, code, writing, maths).
 - **Clarify** — asks one focused question when a request is too ambiguous to act on safely.
-- **Research** — decomposes the request into parallel sub-tasks, dispatches worker agents to search
-  and retrieve evidence via RAG, then synthesises a cited report.
+- **Research** — decomposes the request into typed sub-tasks, executes retrieval deterministically
+  in Python, asks small worker models to extract findings from retrieved evidence, then synthesises
+  a final report.
+
+The code is intentionally biased toward small local LLMs. Python owns the multi-step workflow,
+tool routing, path validation, approval handling, URL selection, and plan repair. LLM calls are
+kept narrow: classify, plan typed tasks, review web search queries, extract evidence, reflect
+only when needed, and synthesize.
+
+Current implementation highlights:
+
+- Validator-backed filesystem tools now cover read, line reads, grep, stat, shallow/deep listing,
+  directory creation, copy/move/delete, and single-file search/replace.
+- Filesystem writes can use local CLI approval via PydanticAI deferred-tool approval.
+- Agents receive explicit tool allowlists instead of broad substring-based filters.
+- `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
+- Workers are mostly tool-free: Python retrieves evidence, workers extract findings.
+- Web search queries pass through `search_guard_agent` before hitting the MCP web server.
+- Reflection is skipped when deterministic completion criteria are already met.
 
 ---
 
@@ -24,14 +41,20 @@ The agent handles three kinds of requests from a single conversation loop:
 ├── run_agents.py            # Entry point — interactive terminal chat
 ├── rag.py                   # Rag service entry point, import from rag_lib
 ├── agents/
-│   ├── agent.py             # Orchestrator, plan_agent, workers, reflect, synthesis
+│   ├── orchestrator_agent.py # Conversation router and local file resolution
+│   ├── plan_agent.py         # Planning, plan normalization, worker loop
+│   ├── worker.py             # Deterministic retrieval + evidence extraction
+│   ├── query_policy.py       # URL/arXiv extraction and task kind helpers
+│   ├── search_guard.py       # LLM review/repair of web search queries
+│   ├── reflect_agent.py      # Optional follow-up decision
+│   ├── synthesis_agent.py    # Final report generation
 │   ├── observability.py     # Real-time event streaming to stderr
 │   └── utils.py             # Model setup, toolset factories, skill loader
 │
 ├── tools/
-│   ├── filesystem.py        # FilesystemValidator + Mount config
-│   ├── retrieval.py         # make_rag_toolset, make_intercepting_toolset
-│   └── skills.py            # build_index, make_skills
+│   ├── filesystem/          # Validator-backed read/write/list/grep/edit tools
+│   ├── retrieval/           # RAG tools and MCP web/arXiv interceptors
+│   └── skills/              # build_index, make_skills
 │
 ├── skills/                  # Skill markdown files loaded at runtime
 │
@@ -178,11 +201,10 @@ No other changes needed — the rest of the agent stack is model-agnostic.
 | Qwen3-8B | llama.cpp (local) | Multi-step research, planning, reflection |
 ...
 
-**Notes on small models (≤ 1B):** Qwen3-0.6B handles simple single-turn tasks well — fetching
-a web page, answering a question from a local file, a straightforward search. Multi-hop
-research with parallel workers and reflection is more reliable with 7B+ models. The agent
-is already tuned for small models: workers receive a single focused objective, tool schemas
-are minimal, and structured Pydantic output reduces reliance on free-form instruction following.
+**Notes on small models (≤ 1B):** Qwen3-0.6B handles simple single-turn tasks well: fetching
+a web page, answering a question from a local file, or doing a straightforward search.
+The agent now avoids asking tiny models to manage tool loops. Workers receive retrieved
+evidence and extract findings; Python performs the web/RAG/arXiv retrieval sequence.
 
 ---
 
@@ -200,42 +222,67 @@ content retrieval to `plan_and_spawn` — it never reads file content or web pag
 
 ### plan_agent
 
-A one-shot agent that receives the research objective and resolved file paths. It may call
-`read_file` to preview file contents. If the preview is sufficient it returns an
+A one-shot agent that receives the research objective, resolved file paths, and Python-built
+file previews. It has no filesystem tools. If the previews are sufficient it returns an
 `initial_answer` directly (skipping workers). Otherwise it decomposes the objective into
 up to `MAX_TASKS_PER_PLAN` independent `TaskSpec` objects for the worker pool.
 
+After the model returns, Python normalizes the plan:
+
+- clamps task count
+- resolves local file references only against actual readable paths
+- fills `query`, `as_of`, `user_prompt`, and task kind defaults
+- adds required local-file, URL-crawl, or arXiv tasks when those structural signals are present
+- preserves the planner's coarse current-info flag; search_guard owns web query freshness
+
 ### Worker agents
 
-Workers are stateless and single-shot. Each executes one `TaskSpec` using RAG and web tools,
-following a strict tool priority order:
+Workers are stateless and single-shot. Each receives one `TaskSpec`, but it no longer chooses
+retrieval tools itself for the normal paths. Python executes retrieval from `TaskSpec.kind`:
 
-1. `relevant_files` in the task spec → `rag_search_tool`
-2. Insufficient → `web_search_tool`
-3. URL known → `web_crawl_tool` → `rag_search_tool` (URL as doc ref)
-4. Broad sweep → `rag_search_tool` with no filter
+| Kind | Python retrieval path |
+|---|---|
+| `local_rag` | ingest/search the provided local files with RAG |
+| `web_search` | review/repair query, search web, pick top URLs, crawl, then RAG-search crawled pages |
+| `url_crawl` | crawl user-provided URLs, then RAG-search crawled pages |
+| `arxiv` | fetch known arXiv IDs or search arXiv, ingest abstracts, then RAG-search |
 
 Multiple workers run in parallel via `asyncio.gather`, bounded by `MAX_PARALLEL_TASKS`.
 
+The worker model only extracts structured findings from the retrieved evidence. This is more
+reliable for small local models than asking them to choose tools repeatedly.
+
+### Search guard
+
+Before a web query is sent to the MCP web server, `search_guard_agent` reviews the proposed
+query against the original user prompt and current date. It can rewrite the query and marks
+whether the query is time-sensitive. There is no hardcoded list of freshness keywords; the
+guard owns that judgment.
+
+`_now()` is intentionally kept out of planner, orchestrator, and worker prompts so small
+models are not asked to duplicate freshness policy. It is still passed to search_guard and
+stored as `as_of` metadata for synthesis.
+
 ### Reflect → Synthesise loop
 
-After each worker batch a `reflect_agent` assesses completeness and confidence. If the
-objective is not yet complete it proposes follow-up tasks for the next iteration (up to
-`MAX_ITERATIONS`). Once complete, `synthesis_agent` produces the final report.
+Reflection is now optional. After each worker batch Python first checks deterministic completion
+criteria. If there are findings and no failures, suggested follow-ups, or blocking uncertainty,
+reflection is skipped. Otherwise `reflect_agent` assesses completeness and may propose follow-up
+tasks for the next iteration (up to `MAX_ITERATIONS`). Once complete, `synthesis_agent` produces
+the final report and includes the `as_of` date when the task is marked time-sensitive.
 
 ### Shared RAG knowledge base
 
-`web_toolset` wraps the MCP web server with an interceptor that automatically ingests every
-search and crawl response into `rag_service` before returning a receipt to the worker.
-Because `rag_service` is a module-level singleton, a page crawled by worker A is immediately
-searchable by worker B — no coordination code needed.
+`web_toolset` wraps the MCP web server. Search returns raw result metadata. Crawls and arXiv
+fetches are converted into documents and ingested into `rag_service`. Because `rag_service`
+is a module-level singleton, a page crawled by worker A is immediately searchable by worker B.
 
 ```
 Worker A                         Worker B
-  web_search_tool("topic X")      rag_search_tool("topic X")
+  web_search + crawl("topic X")   rag_search_tool("topic X")
        │                                │
        ▼                                ▼
-  interceptor → rag_service ←──────────┘
+  crawl ingest → rag_service ←────────┘
   receipt: {doc_id: "abc"}
 ```
 
@@ -250,12 +297,41 @@ before any path is touched:
 
 ```python
 config = FilesystemValidatorConfig(
-    mounts=[Mount(host_path="./", mount_point="/", mode="r")]
+    mounts=[Mount(host_path="./user_docs", mount_point="/docs", mode="ro")]
 )
 ```
 
-`mode` can be `"r"` (read-only), `"rw"` (read-write), or `"none"` (blocked). Paths outside
-declared mounts are rejected.
+`mode` can be `"ro"` or `"rw"`. Paths outside declared mounts are rejected.
+
+Available filesystem tools include:
+
+| Tool | Purpose |
+|---|---|
+| `read_file` | Read a text file by character range |
+| `read_lines` | Read a numbered line range |
+| `write_file` | Write a text file and create parent directories |
+| `edit_file` | Replace one exact unique text occurrence |
+| `search_and_replace` | Replace exact or regex matches in one file |
+| `list_files` | Recursive glob listing with depth/hidden/result controls |
+| `list_directory` | Shallow directory listing |
+| `grep_files` | Regex search across readable text files |
+| `stat_path` | Inspect path type, size, mtime, and permissions |
+| `make_directory` | Create an empty directory |
+| `copy_file`, `move_file`, `delete_file` | File management operations |
+
+Writes can require human approval. `Mount.write_approval=True` is enforced through
+PydanticAI's deferred-tool approval support. In the local CLI:
+
+```bash
+# prompt interactively, default
+uv run python src/run_agents.py
+
+# auto-approve filesystem writes
+LOCALAGENT_APPROVE_TOOLS=always uv run python src/run_agents.py
+
+# auto-deny filesystem writes
+LOCALAGENT_APPROVE_TOOLS=never uv run python src/run_agents.py
+```
 
 ### Skills toolset
 
@@ -311,6 +387,7 @@ Runtime environment variables:
 | `LOCALAGENT_MCP_URL` | `http://localhost:8000/sse` | MCP web server SSE endpoint |
 | `LOCALAGENT_DOCS_DIR` | `user_docs` | Host directory mounted into the agent as `/docs` |
 | `LOCALAGENT_SKILLS_DIR` | `skills` | Host directory mounted into the agent as `/skills` |
+| `LOCALAGENT_APPROVE_TOOLS` | unset | `always` auto-approves deferred filesystem writes; `never` auto-denies |
 
 Key constants in *_agents.py respectively:
 
@@ -372,3 +449,4 @@ so it is round-trippable back into a live session.
 - **Persistent task log** — swap `TaskLogStore` (currently an in-memory dict) for
   Logfire, Langfuse, or a local SQLite store.
 - **Session resume** — reload a saved `chat_history/chats/*.json` to continue a previous session.
+- **UI approval flow** — replace local CLI approval prompts with a frontend-driven deferred-tool approval flow.

@@ -24,6 +24,10 @@ def test_resolves_virtual_path_to_host(rw_validator, tmp_path):
     resolved = rw_validator.resolve("/data/file.txt")
     assert resolved == tmp_path / "file.txt"
 
+def test_resolves_quoted_virtual_path(rw_validator, tmp_path):
+    resolved = rw_validator.resolve("''/data/file.txt''")
+    assert resolved == tmp_path / "file.txt"
+
 def test_rejects_path_escape(rw_validator):
     with pytest.raises(PathNotInValidatorError):
         rw_validator.resolve("/data/../../etc/passwd")

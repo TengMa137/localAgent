@@ -30,8 +30,6 @@ from rag import rag_service
 from agents.orchestrator_agent import OrchestratorResponse, orchestrator
 from agents.observability import observable_run, task_log_store, _c, log_event
 
-from pydantic import TypeAdapter
-
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
 
 def _deserialize_messages(raw: Any) -> List[ModelMessage]:
@@ -210,8 +208,8 @@ async def handle_turn(
             # Collect logs whose finished_at is within this turn's window
             turn_start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
             turn_logs = [
-                l for l in all_logs
-                if (l.get("finished_at") or "") >= turn_start_iso
+                item for item in all_logs
+                if (item.get("finished_at") or "") >= turn_start_iso
             ]
             for log in turn_logs:
                 tid = log["task_id"][:8]

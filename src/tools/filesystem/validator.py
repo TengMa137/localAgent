@@ -251,12 +251,21 @@ class FilesystemValidator:
     
     def _clean_path_string(self, path: str) -> str:
         """Common path cleaning logic."""
-        normalized = path.replace("\\", "/").strip()
+        normalized = self._strip_wrapping_quotes(path.replace("\\", "/").strip())
         if not normalized or normalized in (".", "/."):
             return "/"
         if not normalized.startswith("/"):
             normalized = "/" + normalized
         return re.sub(r"/{2,}", "/", normalized)
+
+    @staticmethod
+    def _strip_wrapping_quotes(value: str) -> str:
+        """Strip simple quotes/backticks wrapped around the whole path."""
+        normalized = value.strip()
+        quote_pairs = {"'": "'", '"': '"', "`": "`"}
+        while len(normalized) >= 2 and quote_pairs.get(normalized[0]) == normalized[-1]:
+            normalized = normalized[1:-1].strip()
+        return normalized
 
     def _find_mount(self, path: str) -> tuple[str, Path, Mount]:
         """Find the mount that contains this path.

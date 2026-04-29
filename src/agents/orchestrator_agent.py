@@ -11,9 +11,9 @@ Flow:
       └── research
             ├── if local files involved: list_files tool → match → clarify if ambiguous
             └── plan_and_spawn(objective, matched_files)
-                  → plan_agent (read_file for preview, decide tasks or answer directly)
-                  → workers (RAG + web, parallel)
-                  → reflect loop
+                  → Python file previews + plan_agent (decide tasks or answer directly)
+                  → workers (Python retrieval + evidence extraction, parallel)
+                  → optional reflect loop
                   → synthesis
 
 Agent roles:
@@ -22,15 +22,16 @@ Agent roles:
     Classifies intent, resolves local file paths, delegates all content
     retrieval to workers via plan_and_spawn. Never reads content directly.
 
-  plan_agent — one-shot. Receives file paths from orchestrator. Calls
-    read_file for a preview; if sufficient, returns initial_answer with
-    empty tasks to skip the research loop. Otherwise decomposes into tasks.
+  plan_agent — one-shot. Receives objective, resolved paths, and Python-built
+    previews; if sufficient, returns initial_answer with empty tasks to skip
+    the research loop. Otherwise decomposes into tasks.
 
-  Workers — stateless. Execute one TaskSpec each using RAG + web tools.
-    Share the RAG store across parallel runs.
+  Workers — stateless. Execute one TaskSpec each. Python routes retrieval
+    by task kind, then the worker model extracts findings from evidence.
+    Workers share the RAG store across parallel runs.
 
-  reflect_agent — one-shot. Assesses findings, decides if complete or
-    proposes next tasks.
+  reflect_agent — one-shot and conditional. Assesses findings only when
+    deterministic completion checks are insufficient.
 
   synthesis_agent — one-shot. Produces final report from findings.
 
@@ -41,16 +42,10 @@ Orchestrator file resolution:
   Clarifies if zero matches or multiple ambiguous ones.
 
 File + RAG contract:
-  Orchestrator resolves paths, plan_agent reads previews, workers do
-  deep retrieval via rag_search_tool (auto-ingests on first access).
-  web_crawl_tool also auto-ingests; workers use the URL as rag doc ref.
-  Workers never call fs_list or read_file directly.
-
-Worker tool priority:
-  1. relevant_files from TaskSpec  →  rag_search_tool
-  2. insufficient                  →  web_search_tool
-  3. URL known                     →  web_crawl_tool → rag_search_tool (URL as ref)
-  4. broad sweep                   →  rag_search_tool (no filter)
+  Orchestrator resolves paths, Python builds plan previews, plan normalization
+  repairs TaskSpec routing, and worker Python code performs deterministic
+  local RAG, web search/crawl, URL crawl, or arXiv retrieval.
+  Worker models do not receive filesystem or web tools in the common path.
 
 History compression:
   Orchestrator history_processor summarises old turns when message count
@@ -62,8 +57,9 @@ from typing import List, Optional
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelRequest
+from pydantic_ai.tools import DeferredToolRequests
 
-from .utils import model, fs_toolset, _now
+from .utils import model, fs_toolset
 from .plan_agent import plan_and_spawn
 from .observability import observable_run
 
@@ -72,7 +68,7 @@ KEEP_RECENT        = 5
 
 _summarise_agent = Agent(
     model=model,
-    instructions="""
+    system_prompt="""
 Summarise the research conversation below.
 Preserve: decisions made, evidence found, tasks spawned, open questions.
 Omit: small-talk, retries, raw tool output.
@@ -127,11 +123,15 @@ class OrchestratorResponse(BaseModel):
     reply:         str
     session_title: Optional[str] = None  # kebab-case slug, first turn only
 
-fs_toolset_orch = fs_toolset.filtered(lambda ctx, tool_def: 'list' in tool_def.name)
+ORCHESTRATOR_FS_TOOLS = {"list_files", "list_directory", "stat_path"}
+
+fs_toolset_orch = fs_toolset.filtered(
+    lambda ctx, tool_def: tool_def.name in ORCHESTRATOR_FS_TOOLS
+)
 
 orchestrator = Agent(
     model=model,
-    output_type=OrchestratorResponse,
+    output_type=[OrchestratorResponse, DeferredToolRequests],
     history_processors=[_compress_history],
     tools=[plan_and_spawn],
     toolsets=[fs_toolset_orch],
@@ -140,10 +140,8 @@ orchestrator = Agent(
 
 @orchestrator.system_prompt
 def _orchestrator_prompt() -> str:
-    return f"""
+    return """
 You are a general-purpose AI assistant. 
-Today is {_now()}, call tool with specific date if the request is time sensitive,
-e.g. including 'today', 'last week' etc.
 
 You can access web to get real time knowledge by calling plan_and_spawn tool. 
 Never read file content or web pages yourself. Delegate all content
@@ -196,6 +194,8 @@ Research workflow:
     IMPORTANT: list_files only gives you paths — it never gives you content.
     Any question that depends on what is *inside* a file requires
     plan_and_spawn, even for a single file.
+    For current/recent web requests, pass the user's objective as stated;
+    search_guard will review web search freshness before execution.
 
   Step 4 — Weave the report into a clear conversational reply.
 

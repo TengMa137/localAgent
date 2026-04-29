@@ -3,16 +3,17 @@ Real-time observability for pydantic_ai agents.
 Drop-in replacement for agent.run() that streams events to stderr.
 """
 
+import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Optional, TypeVar
+from typing import Any, Dict, List, Optional, TypeVar
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ToolCallPart, ToolReturnPart, TextPart, ModelResponse
 )
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
 
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Optional
 
 T = TypeVar("T")
 
@@ -55,15 +56,37 @@ async def observable_run(
     """
     _rt(f"[{label}] ▶ start", "cyan", indent)
 
-    run_kwargs = dict(message_history=message_history or [], **kwargs)
+    current_prompt: str | None = prompt
+    current_history = message_history or []
+    deferred_tool_results: DeferredToolResults | None = kwargs.pop(
+        "deferred_tool_results", None
+    )
 
-    async with agent.iter(prompt, **run_kwargs) as agent_run:
-        async for event in agent_run:
-            _handle_event(event, label=label, indent=indent)
+    while True:
+        run_kwargs = dict(
+            message_history=current_history,
+            deferred_tool_results=deferred_tool_results,
+            **kwargs,
+        )
 
-    result = agent_run.result
-    _rt(f"[{label}] ✓ done", "green", indent)
-    return result
+        async with agent.iter(current_prompt, **run_kwargs) as agent_run:
+            async for event in agent_run:
+                _handle_event(event, label=label, indent=indent)
+
+        result = agent_run.result
+        output = result.output
+        if not isinstance(output, DeferredToolRequests):
+            _rt(f"[{label}] ✓ done", "green", indent)
+            return result
+
+        _rt(
+            f"[{label}] ? approval requested for {len(output.approvals)} tool call(s)",
+            "yellow",
+            indent,
+        )
+        deferred_tool_results = _collect_local_approvals(output, label=label, indent=indent)
+        current_history = result.all_messages()
+        current_prompt = None
 
 
 def _handle_event(event: Any, label: str, indent: int) -> None:
@@ -107,6 +130,66 @@ def _preview_args(part: ToolCallPart) -> str:
         return raw[:120].replace("\n", " ")
     except Exception:
         return ""
+
+
+def _collect_local_approvals(
+    requests: DeferredToolRequests,
+    *,
+    label: str,
+    indent: int,
+) -> DeferredToolResults:
+    approvals: dict[str, bool | ToolDenied] = {}
+
+    for call in requests.approvals:
+        tool_call_id = call.tool_call_id
+        if tool_call_id is None:
+            continue
+
+        args_preview = _preview_args(call)
+        approved = _prompt_for_tool_approval(call.tool_name, args_preview)
+        approvals[tool_call_id] = (
+            True
+            if approved
+            else ToolDenied(message=f"Local CLI denied tool call: {call.tool_name}")
+        )
+        verdict = "approved" if approved else "denied"
+        _rt(
+            f"[{label}] {verdict} {_c(call.tool_name, 'yellow')}",
+            "green" if approved else "red",
+            indent + 1,
+        )
+
+    if requests.calls:
+        _rt(
+            f"[{label}] ignoring {len(requests.calls)} externally deferred call(s)",
+            "yellow",
+            indent + 1,
+        )
+
+    return DeferredToolResults(approvals=approvals)
+
+
+def _prompt_for_tool_approval(tool_name: str, args_preview: str) -> bool:
+    env = os.getenv("LOCALAGENT_APPROVE_TOOLS", "").strip().lower()
+    if env in {"1", "true", "yes", "always"}:
+        return True
+    if env in {"0", "false", "no", "never"}:
+        return False
+
+    if not sys.stdin.isatty():
+        return False
+
+    print(
+        _c("\nTool approval required", "yellow"),
+        file=sys.stderr,
+        flush=True,
+    )
+    print(f"  tool: {tool_name}", file=sys.stderr, flush=True)
+    if args_preview:
+        print(f"  args: {args_preview}", file=sys.stderr, flush=True)
+
+    reply = input("Approve this tool call? [y/N] ").strip().lower()
+    return reply in {"y", "yes"}
     
 
 
@@ -117,6 +200,7 @@ class TaskLog(BaseModel):
     summary:        Optional[str]  = None
     key_findings:   List[str]      = Field(default_factory=list)
     uncertainties:  List[str]      = Field(default_factory=list)
+    suggested_next_steps: List[str] = Field(default_factory=list)
     cited_node_ids: List[str]      = Field(default_factory=list)
     error:          Optional[str]  = None
     trace:          Optional[Any]  = None

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from .validator import FilesystemValidator, Mount
 from .errors import ValidationError, FileTooLargeError, EditError

@@ -23,9 +23,10 @@ Example:
 """
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Optional
 
 
 from pydantic_ai.tools import RunContext
@@ -46,8 +47,18 @@ from .types import (
     MoveResult,
     DeleteResult,
     ListFilesResult,
+    GrepMatch,
+    GrepResult,
+    StatResult,
+    DirectoryEntry,
+    ListDirectoryResult,
+    MakeDirectoryResult,
+    TextLine,
+    ReadLinesResult,
+    SearchReplaceResult,
     DEFAULT_MAX_READ_CHARS,
 )
+from .text_ops import read_text_with_policy, write_text_with_policy
 
 
 def _format_result_path(mount_point: str, rel: str | Path) -> str:
@@ -83,6 +94,20 @@ def _validate_glob_pattern(pattern: str) -> str:
     return normalized
 
 
+def _is_hidden_path(path: Path) -> bool:
+    return any(part.startswith(".") for part in path.parts if part not in ("", "."))
+
+
+def _path_type(path: Path) -> str:
+    if path.is_file():
+        return "file"
+    if path.is_dir():
+        return "directory"
+    if path.exists():
+        return "other"
+    return "missing"
+
+
 def _collect_matching_files(
     resolved: Path,
     pattern: str,
@@ -90,18 +115,55 @@ def _collect_matching_files(
     mount_root: Path,
     results: set[str],
     validator: FilesystemValidator,
+    *,
+    include_directories: bool = False,
+    include_hidden: bool = True,
+    max_depth: int | None = None,
+    max_results: int | None = None,
+    depth_root: Path | None = None,
 ) -> None:
-    """Collect files matching pattern into results set."""
+    """Collect paths matching pattern into results set."""
+    depth_root = depth_root or resolved
     for match in resolved.glob(pattern):
-        if not match.is_file():
+        is_file = match.is_file()
+        is_dir = match.is_dir()
+        if not is_file and not (include_directories and is_dir):
             continue
         try:
             rel = match.relative_to(mount_root)
         except ValueError:
             continue
+        if max_depth is not None and len(rel.parts) > max_depth:
+            try:
+                depth_rel = match.relative_to(depth_root)
+            except ValueError:
+                continue
+            if len(depth_rel.parts) > max_depth:
+                continue
+        if not include_hidden and _is_hidden_path(rel):
+            continue
         result_path = _format_result_path(mount_point, rel)
         if validator.can_read(result_path):
             results.add(result_path)
+            if max_results is not None and len(results) >= max_results:
+                return
+
+
+def _directory_entry(
+    path: Path,
+    *,
+    mount_point: str,
+    mount_root: Path,
+) -> DirectoryEntry:
+    rel = path.relative_to(mount_root)
+    path_type = _path_type(path)
+    stat = path.stat() if path.exists() else None
+    return DirectoryEntry(
+        name=path.name,
+        path=_format_result_path(mount_point, rel),
+        type=path_type,
+        size_bytes=stat.st_size if stat is not None and path_type == "file" else None,
+    )
 
 
 def make_filesystem_toolset(
@@ -189,6 +251,47 @@ def make_filesystem_toolset(
 
     @toolset.tool(
         description=(
+            "Read a range of lines from a text file. "
+            "Path format: '/mount/path' (e.g., '/docs/file.txt')."
+        )
+    )
+    async def read_lines(
+        ctx: RunContext,
+        path: str,
+        start_line: int = 1,
+        end_line: int | None = None,
+        max_lines: int = 200,
+    ) -> ReadLinesResult:
+        """Read numbered lines from a text file."""
+        if start_line < 1:
+            raise ValueError(f"start_line must be >= 1, got {start_line}")
+        if end_line is not None and end_line < start_line:
+            raise ValueError("end_line must be >= start_line")
+        if max_lines < 1:
+            raise ValueError(f"max_lines must be >= 1, got {max_lines}")
+
+        text, _ = read_text_with_policy(filesystem_validator, path)
+        all_lines = text.splitlines()
+        total_lines = len(all_lines)
+        requested_end = end_line if end_line is not None else total_lines
+        limited_end = min(requested_end, start_line + max_lines - 1, total_lines)
+        selected = all_lines[start_line - 1 : limited_end]
+        lines = [
+            TextLine(line=line_number, text=line)
+            for line_number, line in enumerate(selected, start=start_line)
+        ]
+
+        return ReadLinesResult(
+            path=path,
+            lines=lines,
+            start_line=start_line,
+            end_line=limited_end,
+            total_lines=total_lines,
+            truncated=limited_end < requested_end,
+        )
+
+    @toolset.tool(
+        description=(
             "Write a text file. "
             "Parent directories are created automatically. "
             "Path format: '/mount/path' (e.g., '/output/file.txt')."
@@ -219,6 +322,35 @@ def make_filesystem_toolset(
             message=f"Written {len(content)} characters to {path}",
             path=path,
             chars_written=len(content),
+        )
+
+    @toolset.tool(
+        description=(
+            "Create a directory. "
+            "Parent directories are created automatically. "
+            "Path format: '/mount/path' (e.g., '/output/new-dir')."
+        )
+    )
+    async def make_directory(
+        ctx: RunContext,
+        path: str,
+        exist_ok: bool = True,
+    ) -> MakeDirectoryResult:
+        """Create a directory within writable validator boundaries."""
+        _, resolved, _ = filesystem_validator.get_path_config(path, op="write")
+
+        existed = resolved.exists()
+        if existed and not resolved.is_dir():
+            raise FileExistsError(f"Path exists and is not a directory: {path}")
+        if existed and not exist_ok:
+            raise FileExistsError(f"Directory already exists: {path}")
+
+        resolved.mkdir(parents=True, exist_ok=exist_ok)
+
+        return MakeDirectoryResult(
+            message=f"Directory ready: {path}",
+            path=path,
+            created=not existed,
         )
 
     @toolset.tool(
@@ -283,6 +415,165 @@ def make_filesystem_toolset(
 
     @toolset.tool(
         description=(
+            "Search and replace text in one file. "
+            "Supports exact text or regex matching and can replace one or all matches. "
+            "Path format: '/mount/path' (e.g., '/output/file.txt')."
+        )
+    )
+    async def search_and_replace(
+        ctx: RunContext,
+        path: str,
+        search: str,
+        replacement: str,
+        regex: bool = False,
+        case_sensitive: bool = True,
+        replace_all: bool = True,
+        expected_replacements: int | None = None,
+        max_replacements: int | None = None,
+    ) -> SearchReplaceResult:
+        """Replace text in one file with explicit replacement count reporting."""
+        if not search:
+            raise ValueError("search must not be empty")
+        if expected_replacements is not None and expected_replacements < 0:
+            raise ValueError("expected_replacements must be >= 0")
+        if max_replacements is not None and max_replacements < 1:
+            raise ValueError("max_replacements must be >= 1")
+
+        text, target = read_text_with_policy(filesystem_validator, path)
+        filesystem_validator.get_path_config(path, op="write")
+
+        pattern = search if regex else re.escape(search)
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            compiled = re.compile(pattern, flags)
+        except re.error as e:
+            raise ValueError(f"Invalid regular expression: {e}") from e
+
+        limit = 0 if replace_all else 1
+        if max_replacements is not None:
+            limit = max_replacements if limit == 0 else min(limit, max_replacements)
+
+        replacement_value = replacement if regex else (lambda _match: replacement)
+        try:
+            new_text, replacements = compiled.subn(replacement_value, text, count=limit)
+        except re.error as e:
+            raise ValueError(f"Invalid replacement expression: {e}") from e
+        if expected_replacements is not None and replacements != expected_replacements:
+            raise ValidationError(
+                f"Cannot replace in '{path}': expected {expected_replacements} "
+                f"replacement(s), found {replacements}."
+            )
+        if replacements == 0:
+            raise EditError(path, "text not found in file", search)
+
+        write_text_with_policy(filesystem_validator, target.virtual_path, new_text)
+
+        return SearchReplaceResult(
+            message=f"Edited {path}: made {replacements} replacement(s)",
+            path=path,
+            replacements=replacements,
+        )
+
+    @toolset.tool(
+        description=(
+            "Inspect a path. "
+            "Returns existence, type, size, modified time, and validator permissions. "
+            "Path format: '/mount/path' (e.g., '/docs/file.txt')."
+        )
+    )
+    async def stat_path(
+        ctx: RunContext,
+        path: str,
+    ) -> StatResult:
+        """Inspect a path without reading file contents."""
+        _, resolved, _ = filesystem_validator.get_path_config(path, op="read")
+        exists = resolved.exists()
+        path_type = _path_type(resolved)
+        stat = resolved.stat() if exists else None
+
+        return StatResult(
+            path=path,
+            exists=exists,
+            type=path_type,
+            size_bytes=stat.st_size if stat is not None and path_type == "file" else None,
+            modified_time=stat.st_mtime if stat is not None else None,
+            readable=filesystem_validator.can_read(path),
+            writable=filesystem_validator.can_write(path),
+        )
+
+    @toolset.tool(
+        description=(
+            "List immediate children of a directory without recursion. "
+            "Path format: '/mount' or '/mount/subdir'."
+        )
+    )
+    async def list_directory(
+        ctx: RunContext,
+        path: str = "/",
+        include_hidden: bool = True,
+        max_entries: int = 200,
+    ) -> ListDirectoryResult:
+        """List a directory non-recursively."""
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be >= 1, got {max_entries}")
+
+        if path in ("/", ".", ""):
+            entries = []
+            for root_virtual in filesystem_validator.readable_roots[:max_entries]:
+                mount_point, resolved, _ = filesystem_validator.get_path_config(
+                    root_virtual, op="read"
+                )
+                entries.append(
+                    DirectoryEntry(
+                        name=mount_point.strip("/") or "/",
+                        path=mount_point,
+                        type="directory" if resolved.is_dir() else _path_type(resolved),
+                        size_bytes=None,
+                    )
+                )
+            return ListDirectoryResult(
+                path="/",
+                entries=entries,
+                count=len(entries),
+                truncated=len(filesystem_validator.readable_roots) > max_entries,
+            )
+
+        mount_point, resolved, _ = filesystem_validator.get_path_config(path, op="read")
+        if not resolved.exists():
+            raise FileNotFoundError(f"Directory not found: {path}")
+        if not resolved.is_dir():
+            raise NotADirectoryError(f"Not a directory: {path}")
+
+        mount_root = filesystem_validator.get_mount_root(mount_point)
+        entries: list[DirectoryEntry] = []
+        truncated = False
+
+        for child in sorted(resolved.iterdir(), key=lambda p: p.name):
+            try:
+                rel = child.relative_to(mount_root)
+            except ValueError:
+                continue
+            if not include_hidden and _is_hidden_path(rel):
+                continue
+            child_path = _format_result_path(mount_point, rel)
+            if not filesystem_validator.can_read(child_path):
+                continue
+            if len(entries) >= max_entries:
+                truncated = True
+                break
+            entries.append(
+                _directory_entry(child, mount_point=mount_point, mount_root=mount_root)
+            )
+
+        return ListDirectoryResult(
+            path=path,
+            entries=entries,
+            count=len(entries),
+            truncated=truncated,
+        )
+
+    @toolset.tool(
+        description=(
             "List files matching a glob pattern. "
             "Path format: '/mount' or '/mount/subdir'. "
             "Use '/' to list all mounts."
@@ -292,9 +583,18 @@ def make_filesystem_toolset(
         ctx: RunContext,
         path: str = "/",
         pattern: str = "**/*",
+        include_directories: bool = False,
+        include_hidden: bool = True,
+        max_depth: int | None = None,
+        max_results: int | None = None,
     ) -> ListFilesResult:
-        """List files matching pattern."""
+        """List files or directories matching pattern."""
         pattern = _validate_glob_pattern(pattern)
+        if max_depth is not None and max_depth < 1:
+            raise ValueError("max_depth must be >= 1")
+        if max_results is not None and max_results < 1:
+            raise ValueError("max_results must be >= 1")
+
         matching_files: set[str] = set()
 
         # If path is "/" or "." or empty, list all mounts
@@ -308,9 +608,22 @@ def make_filesystem_toolset(
                     continue
 
                 _collect_matching_files(
-                    resolved, pattern, mount_point, mount_root, matching_files, filesystem_validator
+                    resolved,
+                    pattern,
+                    mount_point,
+                    mount_root,
+                    matching_files,
+                    filesystem_validator,
+                    include_directories=include_directories,
+                    include_hidden=include_hidden,
+                    max_depth=max_depth,
+                    max_results=max_results,
                 )
+                if max_results is not None and len(matching_files) >= max_results:
+                    break
             files = sorted(matching_files)
+            if max_results is not None:
+                files = files[:max_results]
             return ListFilesResult(files=files, count=len(files))
 
         # Get the resolved path and mount point
@@ -319,9 +632,123 @@ def make_filesystem_toolset(
         # Get mount root for relative path calculation
         root = filesystem_validator.get_mount_root(mount_point)
 
-        _collect_matching_files(resolved, pattern, mount_point, root, matching_files, filesystem_validator)
+        _collect_matching_files(
+            resolved,
+            pattern,
+            mount_point,
+            root,
+            matching_files,
+            filesystem_validator,
+            include_directories=include_directories,
+            include_hidden=include_hidden,
+            max_depth=max_depth,
+            max_results=max_results,
+        )
         files = sorted(matching_files)
+        if max_results is not None:
+            files = files[:max_results]
         return ListFilesResult(files=files, count=len(files))
+
+    @toolset.tool(
+        description=(
+            "Search readable text files for a regular expression. "
+            "Path format: '/mount' or '/mount/subdir'. "
+            "Use file_pattern to limit files, e.g. '**/*.py'."
+        )
+    )
+    async def grep_files(
+        ctx: RunContext,
+        query: str,
+        path: str = "/",
+        file_pattern: str = "**/*",
+        case_sensitive: bool = True,
+        max_matches: int = 100,
+    ) -> GrepResult:
+        """Search text files for a regex pattern within validator boundaries."""
+        if not query:
+            raise ValueError("query must not be empty")
+        if max_matches < 1:
+            raise ValueError(f"max_matches must be >= 1, got {max_matches}")
+
+        try:
+            regex = re.compile(query, 0 if case_sensitive else re.IGNORECASE)
+        except re.error as e:
+            raise ValueError(f"Invalid regular expression: {e}") from e
+
+        file_pattern = _validate_glob_pattern(file_pattern)
+        candidate_files: set[str] = set()
+
+        if path in ("/", ".", ""):
+            for root_virtual in filesystem_validator.readable_roots:
+                mount_point, resolved, _ = filesystem_validator.get_path_config(
+                    root_virtual, op="read"
+                )
+                mount_root = filesystem_validator.get_mount_root(mount_point)
+                if not resolved.exists():
+                    continue
+                _collect_matching_files(
+                    resolved,
+                    file_pattern,
+                    mount_point,
+                    mount_root,
+                    candidate_files,
+                    filesystem_validator,
+                )
+        else:
+            mount_point, resolved, _ = filesystem_validator.get_path_config(path, op="read")
+            mount_root = filesystem_validator.get_mount_root(mount_point)
+            _collect_matching_files(
+                resolved,
+                file_pattern,
+                mount_point,
+                mount_root,
+                candidate_files,
+                filesystem_validator,
+            )
+
+        matches: list[GrepMatch] = []
+        files_searched = 0
+        files_skipped: list[str] = []
+
+        for virtual_path in sorted(candidate_files):
+            _, resolved, mount = filesystem_validator.get_path_config(virtual_path, op="read")
+            try:
+                filesystem_validator.check_suffix(resolved, mount, virtual_path=virtual_path)
+                filesystem_validator.check_size(resolved, mount, virtual_path=virtual_path)
+                text = resolved.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, ValidationError, OSError):
+                files_skipped.append(virtual_path)
+                continue
+
+            files_searched += 1
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                match = regex.search(line)
+                if match is None:
+                    continue
+                matches.append(
+                    GrepMatch(
+                        path=virtual_path,
+                        line=line_number,
+                        column=match.start() + 1,
+                        text=line,
+                    )
+                )
+                if len(matches) >= max_matches:
+                    return GrepResult(
+                        matches=matches,
+                        count=len(matches),
+                        truncated=True,
+                        files_searched=files_searched,
+                        files_skipped=files_skipped,
+                    )
+
+        return GrepResult(
+            matches=matches,
+            count=len(matches),
+            truncated=False,
+            files_searched=files_searched,
+            files_skipped=files_skipped,
+        )
 
     @toolset.tool(
         description=(

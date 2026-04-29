@@ -3,7 +3,7 @@ Filesystem toolset for PydanticAI agents with LLM-friendly errors.
 
 This package provides a guarded filesystem for PydanticAI agents with:
 - FilesystemValidator: Security boundary for permission checking and path resolution
-- FileSystemToolset: File I/O tools (read, write, edit, list)
+- FileSystemToolset: File I/O tools (read, write, edit, list, grep)
 - make_filesystem_toolset: Modern FunctionToolset-based implementation
 - LLM-friendly error messages that guide correction
 
@@ -39,6 +39,15 @@ from .types import (
     MoveResult,
     CopyResult,
     ListFilesResult,
+    GrepMatch,
+    GrepResult,
+    StatResult,
+    DirectoryEntry,
+    ListDirectoryResult,
+    MakeDirectoryResult,
+    TextLine,
+    ReadLinesResult,
+    SearchReplaceResult,
     DEFAULT_MAX_READ_CHARS,
 )
 
@@ -58,6 +67,15 @@ __all__ = [
     "MoveResult",
     "CopyResult",
     "ListFilesResult",
+    "GrepMatch",
+    "GrepResult",
+    "StatResult",
+    "DirectoryEntry",
+    "ListDirectoryResult",
+    "MakeDirectoryResult",
+    "TextLine",
+    "ReadLinesResult",
+    "SearchReplaceResult",
     # Constants
     "DEFAULT_MAX_READ_CHARS",
     # Errors

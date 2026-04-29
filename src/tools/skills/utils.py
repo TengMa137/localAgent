@@ -12,9 +12,25 @@ def _is_skill_file(p: Path) -> bool:
     return p.is_file() and p.suffix.lower() in SKILL_EXTENSIONS
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    normalized = value.strip()
+    while len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"', "`"}:
+        normalized = normalized[1:-1].strip()
+    return normalized
+
+
 def _virtual_join(root: str, *parts: str) -> str:
-    root = root.rstrip("/") or "/"
-    cleaned = [p.strip("/").replace("\\", "/") for p in parts if p.strip("/")]
+    root = _strip_wrapping_quotes(root.replace("\\", "/")).rstrip("/") or "/"
+    normalized_parts = [
+        _strip_wrapping_quotes(p.replace("\\", "/"))
+        for p in parts
+        if _strip_wrapping_quotes(p.replace("\\", "/")).strip("/")
+    ]
+    if len(normalized_parts) == 1:
+        part = normalized_parts[0]
+        if part == root or part.startswith(root + "/"):
+            return part
+    cleaned = [p.strip("/") for p in normalized_parts]
     return root + "/" + "/".join(cleaned) if cleaned else root
 
 

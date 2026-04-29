@@ -156,7 +156,7 @@ def make_skills(
         _, instructions = _parse_frontmatter(content)
 
         return "\n".join([
-            f"# {relative_path}",
+            f"# {vpath}",
             "",
             "---",
             "",

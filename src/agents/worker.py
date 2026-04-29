@@ -9,22 +9,48 @@ from pydantic_ai.usage import UsageLimits
 
 from .utils import (
     model,
-    load_skill,
-    rag_toolset,
-    web_toolset,
+    MCP_URL,
+    rag_service,
+    rag_validator,
     _now
 )
+from .query_policy import TaskKind, extract_arxiv_ids, extract_urls
+from .search_guard import review_search_query
+from tools.retrieval.interceptor import (
+    arxiv_fetch_and_ingest,
+    arxiv_search_results,
+    select_urls_from_search_results,
+    web_crawl_and_ingest,
+    web_search_results,
+)
+from tools.retrieval.toolset import _get_doc_ids
 
 from .observability import observable_run, _rt, task_log_store, TaskLog
 
 
 MAX_PARALLEL_TASKS = 3
 MAX_TOOL_CALLS = 10
+MAX_EVIDENCE_ITEMS = 6
 
 class TaskSpec(BaseModel):
-    objective:       str
-    relevant_files:  Optional[List[str]] = None
+    objective:              str
+    kind:                   TaskKind = TaskKind.WEB_SEARCH
+    query:                  Optional[str] = None
+    urls:                   List[str] = Field(default_factory=list)
+    relevant_files:         List[str] = Field(default_factory=list)
+    requires_current_info:  bool = False
+    as_of:                  Optional[str] = None
+    user_prompt:            Optional[str] = None
     relevant_skills: Optional[List[str]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_none_lists(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            for field in ("urls", "relevant_files"):
+                if values.get(field) is None:
+                    values[field] = []
+        return values
 
 class WorkerOutput(BaseModel):
     summary:              str
@@ -45,31 +71,17 @@ class WorkerOutput(BaseModel):
 
 
 
-WORKER_SYSTEM_PROMPT = f"""
-You are a focused research worker. Today is {_now()}.
+WORKER_SYSTEM_PROMPT = """
+You are a focused evidence extractor.
 
-Investigate ONE objective thoroughly and return a structured result.
+You receive ONE objective and retrieved evidence. Do not request tools.
+Return a structured result using only the evidence provided.
 
-Principles:
-  - Prefer retrieved information over assumptions
+Rules:
+  - Prefer exact evidence over assumptions
   - Never fabricate sources or citations
-  - Stop when sufficient evidence is gathered
-  - Most tasks require no more than 3-5 tool calls
-
-Tool usage order:
-  1. relevant_files in your instructions → rag_search_tool (auto-ingested on first access)
-  2. Insufficient → web_search_tool
-  3. URL known → web_crawl_tool, then rag_search_tool with that URL as doc ref
-  4. Broad sweep → rag_search_tool with no filter
-
-Tool discipline:
-  - Do not repeat the same query
-  - Do not call fs_list or read_file — file discovery is the planner's job
-  - After web_crawl_tool, use the URL as the rag doc reference immediately
-
-Citation rules:
-  - cited_node_ids must come from rag_search_tool results only
-  - Never fabricate URLs or authors
+  - cited_node_ids must come from evidence node_id values only
+  - If evidence is insufficient, say so in uncertainties
 """
 
 
@@ -90,9 +102,74 @@ def _build_worker_instructions(task: TaskSpec) -> str:
         )
     return (
         f"Objective:\n  {task.objective}\n"
+        f"Task kind: {task.kind.value}\n"
+        f"Query: {task.query or task.objective}\n"
+        f"Requires current info: {task.requires_current_info}\n"
+        f"As of: {task.as_of or _now()}\n"
+        f"Original user prompt: {task.user_prompt or task.objective}\n"
         f"{files_section}{skills_section}"
-        "Follow the tool usage order and output schema strictly."
+        "Use only the retrieved evidence in the prompt and output schema strictly."
     )
+
+
+async def _rag_search(question: str, docs: list[str] | None = None) -> list[dict]:
+    doc_ids = await _get_doc_ids(rag_service, rag_validator, docs)
+    return await rag_service.search(question=question, doc_ids=doc_ids)
+
+
+def _format_evidence(results: list[dict]) -> str:
+    if not results:
+        return "No evidence retrieved."
+
+    chunks = []
+    for idx, item in enumerate(results[:MAX_EVIDENCE_ITEMS], start=1):
+        chunks.append(
+            "\n".join(
+                [
+                    f"EVIDENCE {idx}",
+                    f"node_id: {item.get('node_id', '')}",
+                    f"source: {item.get('source', '')}",
+                    f"title: {item.get('title', '')}",
+                    f"text: {str(item.get('text', ''))[:1500]}",
+                ]
+            )
+        )
+    return "\n\n".join(chunks)
+
+
+async def _retrieve_evidence(task: TaskSpec) -> list[dict]:
+    query = task.query or task.objective
+
+    if task.kind == TaskKind.LOCAL_RAG:
+        return await _rag_search(query, task.relevant_files or None)
+
+    if task.kind == TaskKind.URL_CRAWL:
+        urls = task.urls or extract_urls(task.objective)
+        if urls:
+            await web_crawl_and_ingest(MCP_URL, rag_service, urls)
+            return await _rag_search(query, urls)
+        return await _rag_search(query, task.relevant_files or None)
+
+    if task.kind == TaskKind.ARXIV:
+        arxiv_ids = extract_arxiv_ids(task.objective)
+        if not arxiv_ids:
+            papers = await arxiv_search_results(MCP_URL, query, max_results=5)
+            arxiv_ids = [p.get("arxiv_id", "") for p in papers[:3] if p.get("arxiv_id")]
+        if arxiv_ids:
+            await arxiv_fetch_and_ingest(MCP_URL, rag_service, arxiv_ids)
+        return await _rag_search(query, arxiv_ids or None)
+
+    review = await review_search_query(
+        original_prompt=task.user_prompt or task.objective,
+        task_objective=task.objective,
+        proposed_query=query,
+    )
+    search_results = await web_search_results(MCP_URL, review.query)
+    urls = select_urls_from_search_results(search_results, max_urls=3)
+    if urls:
+        await web_crawl_and_ingest(MCP_URL, rag_service, urls)
+        return await _rag_search(review.query, urls)
+    return []
 
 
 async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
@@ -103,16 +180,18 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
     worker = Agent(
         model=model,
         system_prompt=WORKER_SYSTEM_PROMPT,
-        instructions=_build_worker_instructions(task),
         output_type=WorkerOutput,
-        tools=[load_skill],
-        toolsets=[web_toolset, rag_toolset],
     )
 
     try:
+        evidence = await _retrieve_evidence(task)
+        evidence_text = _format_evidence(evidence)
         result = await observable_run(
             worker,
-            task.objective,
+            (
+                f"{_build_worker_instructions(task)}\n\n"
+                f"Retrieved evidence:\n{evidence_text}"
+            ),
             label=f"worker:{task_id[:8]}",
             indent=2,
             usage_limits=UsageLimits(tool_calls_limit=MAX_TOOL_CALLS),
@@ -136,6 +215,7 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
             log.summary        = out.summary
             log.key_findings   = out.key_findings
             log.uncertainties  = out.uncertainties
+            log.suggested_next_steps = out.suggested_next_steps
             log.cited_node_ids = out.cited_node_ids
             log.trace          = messages
     except Exception as exc:

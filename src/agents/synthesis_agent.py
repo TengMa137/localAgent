@@ -19,6 +19,7 @@ Requirements:
   - Clear conclusion up front
   - Key findings grouped logically
   - Uncertainties stated explicitly
+  - If Time sensitive is true, include the As of date in the answer
   - Evidence-backed tone
 
 Do not hallucinate citations or sources.
