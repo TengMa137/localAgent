@@ -1,21 +1,20 @@
 import asyncio
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypeVar
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.usage import UsageLimits
 
-from .utils import (
+from .runtime.context import (
     model,
     MCP_URL,
     rag_service,
     rag_validator,
     _now
 )
-from .query_policy import TaskKind, extract_arxiv_ids, extract_urls
-from .search_guard import review_search_query
+from .runtime.query_policy import TaskKind, extract_arxiv_ids, extract_urls
 from tools.retrieval.interceptor import (
     arxiv_fetch_and_ingest,
     arxiv_search_results,
@@ -31,6 +30,7 @@ from .observability import observable_run, _rt, task_log_store, TaskLog
 MAX_PARALLEL_TASKS = 3
 MAX_TOOL_CALLS = 10
 MAX_EVIDENCE_ITEMS = 6
+T = TypeVar("T", bound=BaseModel)
 
 class TaskSpec(BaseModel):
     objective:              str
@@ -70,6 +70,33 @@ class WorkerOutput(BaseModel):
         return values
 
 
+class ReflectionOutput(BaseModel):
+    objective_complete: bool
+    confidence:         float
+    next_tasks:         List[TaskSpec]
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_none_lists(cls, values: Any) -> Any:
+        if isinstance(values, dict) and values.get("next_tasks") is None:
+            values["next_tasks"] = []
+        return values
+
+
+class SynthesisOutput(BaseModel):
+    report: str
+
+
+class SearchQueryReview(BaseModel):
+    query: str
+    time_sensitive: bool
+    changed: bool
+    reason: str
+
+
+class HistorySummaryOutput(BaseModel):
+    summary: str
+
 
 WORKER_SYSTEM_PROMPT = """
 You are a focused evidence extractor.
@@ -83,6 +110,126 @@ Rules:
   - cited_node_ids must come from evidence node_id values only
   - If evidence is insufficient, say so in uncertainties
 """
+
+
+REFLECT_SYSTEM_PROMPT = """
+Given current findings and uncertainties decide:
+
+  - objective_complete: true if the question can be answered confidently
+  - confidence: 0.0 to 1.0
+  - next_tasks: concrete follow-ups if incomplete; empty if done
+
+Avoid repeating tasks already listed as completed.
+"""
+
+
+SYNTHESIS_SYSTEM_PROMPT = """
+Produce a final well-structured research report.
+
+Requirements:
+  - Clear conclusion up front
+  - Key findings grouped logically
+  - Uncertainties stated explicitly
+  - If Time sensitive is true, include the As of date in the answer
+  - Evidence-backed tone
+
+Do not hallucinate citations or sources.
+"""
+
+
+SEARCH_GUARD_SYSTEM_PROMPT = """
+Review one proposed web search query against the original user prompt.
+
+Return a corrected query if needed.
+
+Rules:
+  - Preserve the user's intent.
+  - Add current/recent/date wording only when the original prompt requires it.
+  - Do not append today's exact date mechanically.
+  - If the query already captures the needed date or freshness, keep it.
+  - Keep the query concise.
+"""
+
+
+HISTORY_SUMMARY_SYSTEM_PROMPT = """
+Summarise the research conversation.
+
+Preserve: decisions made, evidence found, tasks spawned, open questions.
+Omit: small-talk, retries, raw tool output.
+Output plain prose, no lists, no headers.
+"""
+
+
+async def _run_structured_worker(
+    *,
+    prompt: str,
+    system_prompt: str,
+    output_type: type[T],
+    label: str,
+    indent: int,
+    message_history: Optional[list] = None,
+):
+    worker = Agent(
+        model=model,
+        system_prompt=system_prompt,
+        output_type=output_type,
+    )
+    return await observable_run(
+        worker,
+        prompt,
+        label=label,
+        indent=indent,
+        message_history=message_history,
+        usage_limits=UsageLimits(tool_calls_limit=MAX_TOOL_CALLS),
+    )
+
+
+async def review_search_query(
+    *,
+    original_prompt: str,
+    task_objective: str,
+    proposed_query: str,
+) -> SearchQueryReview:
+    result = await _run_structured_worker(
+        prompt=(
+            f"Current date: {_now()}\n"
+            f"Original user prompt: {original_prompt}\n"
+            f"Task objective: {task_objective}\n"
+            f"Proposed query: {proposed_query}"
+        ),
+        system_prompt=SEARCH_GUARD_SYSTEM_PROMPT,
+        output_type=SearchQueryReview,
+        label="search_guard",
+        indent=2,
+    )
+    review = result.output
+
+    if not review.query.strip():
+        return SearchQueryReview(
+            query=proposed_query,
+            time_sensitive=review.time_sensitive,
+            changed=False,
+            reason="Empty reviewed query; kept proposed query.",
+        )
+
+    return review
+
+
+async def run_history_summary_worker(
+    *,
+    message_history: list,
+    label: str = "summarise",
+    indent: int = 0,
+) -> str:
+    result = await _run_structured_worker(
+        prompt="Summarise this research conversation:",
+        system_prompt=HISTORY_SUMMARY_SYSTEM_PROMPT,
+        output_type=HistorySummaryOutput,
+        label=label,
+        indent=indent,
+        message_history=message_history,
+    )
+    return result.output.summary
 
 
 def _build_worker_instructions(task: TaskSpec) -> str:
@@ -177,24 +324,18 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
     log = TaskLog(task_id=task_id, objective=task.objective, status="running")
     _rt(f"[worker {task_id[:8]}] START → {task.objective[:80]}", "cyan")
 
-    worker = Agent(
-        model=model,
-        system_prompt=WORKER_SYSTEM_PROMPT,
-        output_type=WorkerOutput,
-    )
-
     try:
         evidence = await _retrieve_evidence(task)
         evidence_text = _format_evidence(evidence)
-        result = await observable_run(
-            worker,
-            (
+        result = await _run_structured_worker(
+            prompt=(
                 f"{_build_worker_instructions(task)}\n\n"
                 f"Retrieved evidence:\n{evidence_text}"
             ),
+            system_prompt=WORKER_SYSTEM_PROMPT,
+            output_type=WorkerOutput,
             label=f"worker:{task_id[:8]}",
             indent=2,
-            usage_limits=UsageLimits(tool_calls_limit=MAX_TOOL_CALLS),
         )
         messages   = result.all_messages()
         tool_calls = sum(
@@ -237,3 +378,48 @@ async def _run_workers_limited(tasks: List[TaskSpec]) -> List[Dict[str, Any]]:
             return await _run_worker(t)
 
     return await asyncio.gather(*[_run(t) for t in tasks])
+
+
+async def run_reflect_worker(
+    *,
+    objective: str,
+    state_summary: str,
+    label: str,
+    indent: int = 1,
+) -> ReflectionOutput:
+    result = await _run_structured_worker(
+        prompt=f"Original objective: {objective}\n{state_summary}",
+        system_prompt=REFLECT_SYSTEM_PROMPT,
+        output_type=ReflectionOutput,
+        label=label,
+        indent=indent,
+    )
+    return result.output
+
+
+async def run_synthesis_worker(
+    *,
+    question: str,
+    as_of: str,
+    time_sensitive: bool,
+    findings: list[str],
+    uncertainties: list[str],
+    sources: list[str],
+    label: str = "synthesis",
+    indent: int = 1,
+) -> str:
+    result = await _run_structured_worker(
+        prompt=(
+            f"Question: {question}\n"
+            f"As of: {as_of}\n"
+            f"Time sensitive: {time_sensitive}\n"
+            f"Findings: {findings}\n"
+            f"Uncertainties: {uncertainties}\n"
+            f"Sources: {sources}"
+        ),
+        system_prompt=SYNTHESIS_SYSTEM_PROMPT,
+        output_type=SynthesisOutput,
+        label=label,
+        indent=indent,
+    )
+    return result.output.report

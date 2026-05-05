@@ -4,18 +4,23 @@ from typing import Any, List, Dict, Optional
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
-from .utils import model, skills_prompt, validator, _now
-from .worker import TaskSpec, _run_workers_limited, MAX_PARALLEL_TASKS
-from .query_policy import (
+from .runtime.context import model, skills_prompt, validator, _now
+from .worker import (
+    TaskSpec,
+    _run_workers_limited,
+    MAX_PARALLEL_TASKS,
+    run_reflect_worker,
+    run_synthesis_worker,
+)
+from .runtime.query_policy import (
     TaskKind,
     extract_arxiv_ids,
     extract_urls,
     infer_task_kind,
 )
 
-from .synthesis_agent import synthesis_agent
-from .reflect_agent import reflect_agent
 from .observability import _rt, observable_run
+from .runtime.reports import write_agent_report
 from tools.filesystem.text_ops import read_text_with_policy
 
 MAX_TASKS_PER_PLAN = 5
@@ -376,7 +381,7 @@ def _needs_reflect(state: SessionState, results: List[Dict[str, Any]]) -> bool:
     return False
 
 
-async def plan_and_spawn(objective: str, matched_files: List[str]) -> str:
+async def _run_plan_workflow_internal(objective: str, matched_files: List[str]) -> str:
     """
     Execute a research task that requires web access or local file content.
 
@@ -401,7 +406,7 @@ async def plan_and_spawn(objective: str, matched_files: List[str]) -> str:
         A plain-text research report to weave into your reply.
     """
 
-    _rt(f"[plan_and_spawn] objective: {objective[:80]}", "yellow")
+    _rt(f"[plan_workflow] objective: {objective[:80]}", "yellow")
     state = SessionState(user_query=objective)
 
     _rt("[plan_agent] running ...", "dim")
@@ -452,19 +457,14 @@ async def plan_and_spawn(objective: str, matched_files: List[str]) -> str:
         _rt("[plan_agent] answered directly from file preview — skipping research loop", "green")
         state.findings = [plan_output.initial_answer]
 
-        final = await observable_run(
-            synthesis_agent,
-            (
-                f"Question: {objective}\n"
-                f"As of: {as_of}\n"
-                f"Time sensitive: {time_sensitive}\n"
-                f"Findings: {state.findings}\n"
-                f"Uncertainties: {state.uncertainties}"
-            ),
-            label="synthesis",
-            indent=1,
+        return await run_synthesis_worker(
+            question=objective,
+            as_of=as_of,
+            time_sensitive=time_sensitive,
+            findings=state.findings,
+            uncertainties=state.uncertainties,
+            sources=state.sources,
         )
-        return final.output.report
     else:
         # heuristic: no files = web task
         if plan_output.initial_answer and not matched_files:
@@ -495,23 +495,23 @@ async def plan_and_spawn(objective: str, matched_files: List[str]) -> str:
 
         _rt(f"[reflect] assessing completeness (confidence so far: {state.confidence:.2f})", "dim")
 
-        reflect = await observable_run(
-            reflect_agent,
-            f"Original objective: {objective}\n{_state_summary(state)}",
+        reflect = await run_reflect_worker(
+            objective=objective,
+            state_summary=_state_summary(state),
             label=f"reflect:iter{iteration+1}",
             indent=1,
         )
-        state.confidence = reflect.output.confidence
-        _rt(f"[reflect] complete={reflect.output.objective_complete} confidence={state.confidence:.2f}", "dim")
+        state.confidence = reflect.confidence
+        _rt(f"[reflect] complete={reflect.objective_complete} confidence={state.confidence:.2f}", "dim")
         
-        if reflect.output.objective_complete and state.findings:
+        if reflect.objective_complete and state.findings:
             _rt("[reflect] objective complete — moving to synthesis", "green")
             break
-        if reflect.output.objective_complete and not state.findings:
+        if reflect.objective_complete and not state.findings:
             _rt("[reflect] ignored complete=true because no findings were collected", "yellow")
 
         follow_up = _normalize_plan(
-            PlanOutput(tasks=reflect.output.next_tasks),
+            PlanOutput(tasks=reflect.next_tasks),
             objective=objective,
             matched_files=matched_files,
             as_of=as_of,
@@ -537,17 +537,25 @@ async def plan_and_spawn(objective: str, matched_files: List[str]) -> str:
 
     _rt("[synthesis] generating final report ...", "dim")
 
-    final = await observable_run(
-        synthesis_agent,
-        (
-            f"Question: {objective}\n"
-            f"As of: {as_of}\n"
-            f"Time sensitive: {time_sensitive}\n"
-            f"Findings: {state.findings}\n"
-            f"Uncertainties: {state.uncertainties}"
-        ),
-        label="synthesis",
-        indent=1,
+    report = await run_synthesis_worker(
+        question=objective,
+        as_of=as_of,
+        time_sensitive=time_sensitive,
+        findings=state.findings,
+        uncertainties=state.uncertainties,
+        sources=state.sources,
     )
     _rt("[synthesis] done", "green")
-    return final.output.report
+    return report
+
+
+async def run_plan_workflow(objective: str) -> str:
+    """Run the complex-task planning workflow and write plan-report.md."""
+    report = await _run_plan_workflow_internal(objective=objective, matched_files=[])
+    write_agent_report(
+        "plan",
+        objective=objective,
+        summary=report,
+        answer=report,
+    )
+    return report

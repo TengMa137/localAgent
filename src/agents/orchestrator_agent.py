@@ -9,18 +9,15 @@ Flow:
   → Orchestrator (persistent history, intent classification)
       ├── direct / clarify  →  reply immediately
       └── research
-            ├── if local files involved: list_files tool → match → clarify if ambiguous
-            └── plan_and_spawn(objective, matched_files)
-                  → Python file previews + plan_agent (decide tasks or answer directly)
-                  → workers (Python retrieval + evidence extraction, parallel)
-                  → optional reflect loop
-                  → synthesis
+            ├── local files → run_fs_task
+            ├── web/current → run_web_task
+            └── complex    → run_plan_workflow
 
 Agent roles:
 
   Orchestrator — only stateful agent. Holds compressed conversation history.
-    Classifies intent, resolves local file paths, delegates all content
-    retrieval to workers via plan_and_spawn. Never reads content directly.
+    Classifies intent and delegates to specialist agents/workflows.
+    Never reads file or web content directly.
 
   plan_agent — one-shot. Receives objective, resolved paths, and Python-built
     previews; if sufficient, returns initial_answer with empty tasks to skip
@@ -30,22 +27,19 @@ Agent roles:
     by task kind, then the worker model extracts findings from evidence.
     Workers share the RAG store across parallel runs.
 
-  reflect_agent — one-shot and conditional. Assesses findings only when
-    deterministic completion checks are insufficient.
+  Worker steps — stateless one-shot LLM calls for evidence extraction,
+    reflection, and synthesis.
 
-  synthesis_agent — one-shot. Produces final report from findings.
-
-Orchestrator file resolution:
-  Only calls list_files tool when user input suggests local file intent.
-  Fuzzy-matches results against user's request.
-  Passes single confident match or full plausible list to plan_and_spawn.
-  Clarifies if zero matches or multiple ambiguous ones.
+Specialist routing:
+  fs_agent owns local file discovery/read/write/edit.
+  web_agent owns search/query/URL selection/crawl.
+  RAG is deterministic infrastructure inside fs/web/workflow code, not an
+  orchestrator-facing tool.
 
 File + RAG contract:
-  Orchestrator resolves paths, Python builds plan previews, plan normalization
-  repairs TaskSpec routing, and worker Python code performs deterministic
-  local RAG, web search/crawl, URL crawl, or arXiv retrieval.
-  Worker models do not receive filesystem or web tools in the common path.
+  fs_agent resolves and handles local files. web_agent handles web search and
+  crawl. Python triggers RAG deterministically inside fs/web/workflow code for
+  large, multi-file, or fetched-document retrieval.
 
 History compression:
   Orchestrator history_processor summarises old turns when message count
@@ -56,26 +50,19 @@ from typing import List, Optional
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelRequest
-from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart
+from pydantic_ai import ModelRetry
+from pydantic_ai.tools import DeferredToolRequests, RunContext
 
-from .utils import model, fs_toolset
-from .plan_agent import plan_and_spawn
-from .observability import observable_run
+from .fs_agent import run_fs_task as _run_fs_task
+from .plan_agent import run_plan_workflow as _run_plan_workflow
+from .runtime.context import model
+from .web_agent import run_web_task as _run_web_task
+from .worker import run_history_summary_worker
+from .observability import _rt
 
 COMPRESS_AFTER     = 10
 KEEP_RECENT        = 5
-
-_summarise_agent = Agent(
-    model=model,
-    system_prompt="""
-Summarise the research conversation below.
-Preserve: decisions made, evidence found, tasks spawned, open questions.
-Omit: small-talk, retries, raw tool output.
-Output plain prose, no lists, no headers.
-""",
-)
-
 
 def _safe_cut(messages: List[ModelMessage], target: int) -> int:
     """
@@ -109,13 +96,11 @@ async def _compress_history(messages: List[ModelMessage]) -> List[ModelMessage]:
     if not to_summarise:
         return messages
 
-    summary = await observable_run(
-        _summarise_agent,
-        "Summarise this research conversation:",
-        label="summarise",
-        message_history=to_summarise,
+    summary = await run_history_summary_worker(message_history=to_summarise)
+    summary_message = ModelResponse(
+        parts=[TextPart(content=f"Conversation summary so far:\n{summary}")]
     )
-    return summary.new_messages() + verbatim
+    return [summary_message] + verbatim
 
 
 
@@ -123,18 +108,139 @@ class OrchestratorResponse(BaseModel):
     reply:         str
     session_title: Optional[str] = None  # kebab-case slug, first turn only
 
-ORCHESTRATOR_FS_TOOLS = {"list_files", "list_directory", "stat_path"}
 
-fs_toolset_orch = fs_toolset.filtered(
-    lambda ctx, tool_def: tool_def.name in ORCHESTRATOR_FS_TOOLS
-)
+_tool_run_cache: dict[str, list[tuple[str, str, str, bool]]] = {}
+
+
+def _normalize_objective(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _run_cache_key(ctx: RunContext) -> str:
+    if ctx.metadata and ctx.metadata.get("turn_id"):
+        return str(ctx.metadata["turn_id"])
+    return ctx.run_id or str(id(ctx.messages))
+
+
+def _trim_tool_cache() -> None:
+    while len(_tool_run_cache) > 128:
+        _tool_run_cache.pop(next(iter(_tool_run_cache)))
+
+
+async def _run_specialist_once(
+    ctx: RunContext,
+    *,
+    tool_name: str,
+    objective: str,
+    runner,
+) -> str:
+    run_key = _run_cache_key(ctx)
+    calls = _tool_run_cache.setdefault(run_key, [])
+    _trim_tool_cache()
+    objective_key = _normalize_objective(objective)
+
+    for prior_name, prior_objective, prior_result, prior_failed in calls:
+        if prior_name != tool_name or prior_objective != objective_key:
+            continue
+        _rt(
+            f"[orchestrator] banned duplicate specialist call: {tool_name}",
+            "yellow",
+        )
+        message = (
+            f"Duplicate specialist call blocked: {tool_name} already ran with "
+            "the same objective in this turn. Rethink the next step. Either "
+            "answer the user from the prior result below, or call a different "
+            "specialist tool only if a distinct missing information need remains.\n\n"
+            f"Prior {tool_name} result:\n{prior_result}"
+        )
+        if prior_failed:
+            return message
+        raise ModelRetry(message)
+
+    _rt(f"[orchestrator] specialist route: {tool_name}", "yellow")
+    result = await runner(objective)
+    failed = "failed before a grounded result" in result.casefold()
+    calls.append((tool_name, objective_key, result, failed))
+    return (
+        f"{result}\n\n"
+        "Specialist tool call complete. You may call another specialist only "
+        "for a distinct missing information need. Do not repeat this same tool "
+        "with the same objective."
+    )
+
+
+async def run_fs_task(ctx: RunContext, objective: str) -> str:
+    """
+    Use for local filesystem work.
+
+    Call this when the user asks to find, inspect, read, summarize, grep,
+    write, or edit local files under validator roots such as /docs or /skills.
+    The fs agent owns path discovery with list/stat/grep/read tools and writes
+    fs-report.md. Its result is intended to be forwardable to the user.
+    Pass the user's local-file wording as-is. Do not invent concrete paths,
+    filenames, or extensions; fs_agent will discover real paths.
+
+    Args:
+        objective: A complete local-file instruction using the user's wording.
+            Include real paths only if the user supplied them; otherwise pass
+            descriptive terms, edit requirements, and desired output format.
+    """
+    return await _run_specialist_once(
+        ctx,
+        tool_name="run_fs_task",
+        objective=objective,
+        runner=_run_fs_task,
+    )
+
+
+async def run_web_task(ctx: RunContext, objective: str) -> str:
+    """
+    Use for web, URL, current-information, and arXiv lookup work.
+
+    Call this when the user asks for current/recent/latest information,
+    provides URLs, asks for web search/crawl, or asks for arXiv/DOI/paper
+    lookup. The web agent chooses search queries and URLs, crawls selected
+    pages, deterministically searches RAG over fetched content, and writes
+    web-report.md. Its result is intended to be forwardable to the user.
+
+    Args:
+        objective: A complete web research instruction. Include the user's
+            time constraints, URLs, entities, and desired output format.
+    """
+    return await _run_specialist_once(
+        ctx,
+        tool_name="run_web_task",
+        objective=objective,
+        runner=_run_web_task,
+    )
+
+
+async def run_plan_workflow(ctx: RunContext, objective: str) -> str:
+    """
+    Use for complex multi-step work that cannot be handled by one specialist.
+
+    Call this for reports, comparisons, or tasks that need several independent
+    fs/web/retrieval/worker steps. The workflow plans todo items, runs worker
+    batches, reflects when needed, synthesizes a final answer, and writes
+    plan-report.md. Its result is intended to be forwardable to the user.
+
+    Args:
+        objective: The full complex objective, including scope, constraints,
+            known files/URLs, and desired output format.
+    """
+    return await _run_specialist_once(
+        ctx,
+        tool_name="run_plan_workflow",
+        objective=objective,
+        runner=_run_plan_workflow,
+    )
+
 
 orchestrator = Agent(
     model=model,
     output_type=[OrchestratorResponse, DeferredToolRequests],
     history_processors=[_compress_history],
-    tools=[plan_and_spawn],
-    toolsets=[fs_toolset_orch],
+    tools=[run_fs_task, run_web_task, run_plan_workflow],
 )
 
 
@@ -143,15 +249,20 @@ def _orchestrator_prompt() -> str:
     return """
 You are a general-purpose AI assistant. 
 
-You can access web to get real time knowledge by calling plan_and_spawn tool. 
-Never read file content or web pages yourself. Delegate all content
-retrieval to workers via plan_and_spawn.
+You have persistent chat history plus optional session agent reports injected
+into the user prompt. Use these first.
+
+Never read file content or web pages yourself. Delegate:
+  - local file work to run_fs_task
+  - web/current/URL/arXiv work to run_web_task
+  - complex multi-step work to run_plan_workflow
 
 Intent classification:
 
   direct — answer immediately WITHOUT calling any tools.
     Use ONLY for: greetings, opinions, math, coding help, writing tasks,
-    or follow-up questions fully answerable from conversation history.
+    or follow-up questions fully answerable from conversation history and
+    injected session reports.
     Rule: if the answer could have changed since your training cutoff,
     or requires reading any file or URL, do NOT choose direct.
 
@@ -159,50 +270,37 @@ Intent classification:
     a wrong plan. Ask exactly one focused question. Do not use this as an
     excuse to avoid research.
 
-  research — required whenever ANY of the following are true:
-    • User provides or asks about a URL → crawl it
-    • User asks for current / recent / latest / updated information
-    • User names a file, extension, or says "my files", "the document", etc.
-    • User requests a web search, comparison, or report
-    • User mentions arXiv, a paper title, DOI, or academic lookup
-    • User asks about a specific person, company, or event you may not
-      have current data on
-    When in doubt between direct and research, choose research.
+  fs — required when the user names a file/path/extension, asks about local
+    files, asks to read/edit/write/search local content, or refers to "my files"
+    or "the document".
+
+  web — required when the user asks for current/recent/latest information,
+    provides URLs, requests web search/crawl, mentions arXiv/DOI/paper lookup,
+    or asks about specific modern people/companies/events that may have changed.
+
+  plan — required for complex tasks with multiple independent subtasks,
+    comparisons across local+web context, reports, or requests that need several
+    fs/web/worker steps.
 
 Direct and clarify:
   Reply immediately in the reply field. Do not call any tools.
 
-Research workflow:
-
-  Step 1 — Decide if local files are involved.
-    Local file intent signals: user mentions a filename, extension, path,
-    or phrases like "in my files", "the document", "read X", "summarise X".
-
-  Step 2 — If local files are involved:
-    Call list_files tool to get all available file paths.
-    Match results against what the user requested:
-      - One confident match: pass it directly to plan_and_spawn.
-      - Multiple plausible matches: pass all of them; plan_agent assigns
-        relevance per task.
-      - Zero matches or multiple ambiguous ones with no clear intent:
-        ask the user to clarify — do not call plan_and_spawn.
-    User may refer to files loosely (e.g. "a.txt"); deduce the full path
-    from list_files tool results (e.g. "/docs/a.txt") before passing it.
-
-  Step 3 — Call plan_and_spawn(objective, matched_files).
-    For web-only research, pass matched_files as an empty list.
-    IMPORTANT: list_files only gives you paths — it never gives you content.
-    Any question that depends on what is *inside* a file requires
-    plan_and_spawn, even for a single file.
-    For current/recent web requests, pass the user's objective as stated;
-    search_guard will review web search freshness before execution.
-
-  Step 4 — Weave the report into a clear conversational reply.
+Tool routing:
+  - Use run_fs_task for local-file objectives. The fs agent finds files and
+    deterministically uses RAG for large/multi-file reading.
+    Pass local-file wording verbatim; do not invent paths.
+  - Use run_web_task for web/current/URL/arXiv objectives. The web agent
+    searches/crawls and deterministically searches RAG over fetched content.
+  - Use run_plan_workflow for complex multi-step objectives.
+  - After a tool returns, write the final reply from that result. Do not call
+    another tool unless the first result explicitly says required information
+    is missing and the next tool is necessary.
 
 Rules:
-  - Never call plan_and_spawn for direct or clarify intents.
-  - Always resolve file paths from list_files tool before passing to plan_and_spawn.
-  - Never pass unresolved or guessed paths.
+  - Never call tools for direct or clarify intents.
+  - Do not call RAG directly; you do not have a RAG tool.
+  - You may call multiple specialist tools only for distinct information
+    needs. Never repeat the same tool with the same objective.
 
 session_title: first turn only — kebab-case slug max 6 words e.g.
 "q3-revenue-analysis". Null on all subsequent turns.

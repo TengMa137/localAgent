@@ -191,11 +191,21 @@ def make_filesystem_toolset(
         toolset = make_filesystem_toolset(filesystem_validator=validator)
     """
     toolset = FunctionToolset(id=id)
+    readable = ", ".join(filesystem_validator.readable_roots) or "none"
+    writable = ", ".join(filesystem_validator.writable_roots) or "none"
+    read_path_hint = (
+        f"Use only validator paths under readable roots: {readable}. "
+        "Call list_directory('/') to discover roots. Do not invent placeholder roots."
+    )
+    write_path_hint = (
+        f"Use only validator paths under writable roots: {writable}. "
+        "Do not invent placeholder roots."
+    )
 
     @toolset.tool(
         description=(
             "Read a text file. "
-            "Path format: '/mount/path' (e.g., '/docs/file.txt'). "
+            f"{read_path_hint} "
             "Do not use this on binary files (PDFs, images, etc) - "
             "pass them as attachments instead."
         )
@@ -252,7 +262,7 @@ def make_filesystem_toolset(
     @toolset.tool(
         description=(
             "Read a range of lines from a text file. "
-            "Path format: '/mount/path' (e.g., '/docs/file.txt')."
+            f"{read_path_hint}"
         )
     )
     async def read_lines(
@@ -294,7 +304,7 @@ def make_filesystem_toolset(
         description=(
             "Write a text file. "
             "Parent directories are created automatically. "
-            "Path format: '/mount/path' (e.g., '/output/file.txt')."
+            f"{write_path_hint}"
         )
     )
     async def write_file(
@@ -328,7 +338,7 @@ def make_filesystem_toolset(
         description=(
             "Create a directory. "
             "Parent directories are created automatically. "
-            "Path format: '/mount/path' (e.g., '/output/new-dir')."
+            f"{write_path_hint}"
         )
     )
     async def make_directory(
@@ -357,7 +367,7 @@ def make_filesystem_toolset(
         description=(
             "Edit a file by replacing exact text. "
             "The old_text must match exactly and appear only once. "
-            "Path format: '/mount/path' (e.g., '/output/file.txt')."
+            f"{write_path_hint}"
         )
     )
     async def edit_file(
@@ -417,7 +427,7 @@ def make_filesystem_toolset(
         description=(
             "Search and replace text in one file. "
             "Supports exact text or regex matching and can replace one or all matches. "
-            "Path format: '/mount/path' (e.g., '/output/file.txt')."
+            f"{write_path_hint}"
         )
     )
     async def search_and_replace(
@@ -478,7 +488,7 @@ def make_filesystem_toolset(
         description=(
             "Inspect a path. "
             "Returns existence, type, size, modified time, and validator permissions. "
-            "Path format: '/mount/path' (e.g., '/docs/file.txt')."
+            f"{read_path_hint}"
         )
     )
     async def stat_path(
@@ -504,7 +514,7 @@ def make_filesystem_toolset(
     @toolset.tool(
         description=(
             "List immediate children of a directory without recursion. "
-            "Path format: '/mount' or '/mount/subdir'."
+            f"{read_path_hint}"
         )
     )
     async def list_directory(
@@ -575,8 +585,8 @@ def make_filesystem_toolset(
     @toolset.tool(
         description=(
             "List files matching a glob pattern. "
-            "Path format: '/mount' or '/mount/subdir'. "
-            "Use '/' to list all mounts."
+            f"{read_path_hint} "
+            "Use '/' to list all readable roots."
         )
     )
     async def list_files(
@@ -652,7 +662,7 @@ def make_filesystem_toolset(
     @toolset.tool(
         description=(
             "Search readable text files for a regular expression. "
-            "Path format: '/mount' or '/mount/subdir'. "
+            f"{read_path_hint} "
             "Use file_pattern to limit files, e.g. '**/*.py'."
         )
     )
@@ -753,7 +763,7 @@ def make_filesystem_toolset(
     @toolset.tool(
         description=(
             "Delete a file. "
-            "Path format: '/mount/path' (e.g., '/output/file.txt')."
+            f"{write_path_hint}"
         )
     )
     async def delete_file(
@@ -782,7 +792,7 @@ def make_filesystem_toolset(
         description=(
             "Move or rename a file. "
             "Parent directories of destination are created automatically. "
-            "Path format: '/mount/path' (e.g., '/output/file.txt')."
+            f"{write_path_hint}"
         )
     )
     async def move_file(
@@ -830,7 +840,7 @@ def make_filesystem_toolset(
         description=(
             "Copy a file. "
             "Parent directories of destination are created automatically. "
-            "Path format: '/mount/path' (e.g., '/output/file.txt')."
+            f"Source: {read_path_hint} Destination: {write_path_hint}"
         )
     )
     async def copy_file(

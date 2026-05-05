@@ -10,7 +10,14 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from rag import rag_service
 from tools.retrieval import make_rag_toolset, make_web_toolset
 from tools.filesystem import FilesystemValidator, FilesystemValidatorConfig, Mount, make_filesystem_toolset
-from tools.skills import build_index, make_skills
+from tools.skills import build_index, make_skills, refresh_index
+
+
+def _mount_mode_env(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip().lower()
+    if value not in {"ro", "rw"}:
+        raise ValueError(f"{name} must be 'ro' or 'rw', got {value!r}")
+    return value
 
 
 model = OpenAIChatModel(
@@ -31,7 +38,8 @@ config = FilesystemValidatorConfig(
         Mount(
             host_path=os.getenv("LOCALAGENT_SKILLS_DIR", "skills"),
             mount_point="/skills",
-            mode="ro",
+            mode=_mount_mode_env("LOCALAGENT_SKILLS_MODE", "rw"),
+            write_approval=True,
         ),
     ]
 )
@@ -87,6 +95,13 @@ fs_toolset = ApprovalRequiredToolset(
 
 index = build_index(validator=validator, skills_root="/skills")
 skills_prompt, load_skill = make_skills(index, validator=validator, skills_root="/skills")
+
+
+def refresh_skills() -> str:
+    """Refresh the skills index and return the current prompt catalog."""
+    refresh_index(index, validator=validator, skills_root="/skills")
+    prompt, _ = make_skills(index, validator=validator, skills_root="/skills")
+    return prompt
 
 MCP_URL = os.getenv("LOCALAGENT_MCP_URL", "http://localhost:8000/sse")
 

@@ -27,6 +27,18 @@ def test_filesystem_tools_are_registered(filesystem_toolset):
 
 
 @pytest.mark.asyncio
+async def test_filesystem_tool_descriptions_name_actual_roots(tools_in_toolset):
+    descriptions = [
+        tool.tool_def.description
+        for tool in tools_in_toolset.values()
+        if tool.tool_def.description
+    ]
+
+    assert any("/data" in description for description in descriptions)
+    assert not any("'/mount" in description for description in descriptions)
+
+
+@pytest.mark.asyncio
 async def test_write_then_read_file(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
     result = await filesystem_toolset.call_tool("write", {"path":"/data/a.txt", "content":"hello"}, ctx, tools_in_toolset["write_file"])
     assert isinstance(result, WriteResult)

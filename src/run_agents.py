@@ -29,6 +29,8 @@ from pydantic_ai.usage import UsageLimits
 from rag import rag_service
 from agents.orchestrator_agent import OrchestratorResponse, orchestrator
 from agents.observability import observable_run, task_log_store, _c, log_event
+from agents.runtime.reports import REPORT_ROOT, load_agent_reports, set_report_dir
+from agents.runtime.skills_context import scan_skills_context
 
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
 
@@ -118,6 +120,7 @@ class ChatSession:
     message_history: List[ModelMessage] = field(default_factory=list)
     session_title:   Optional[str]      = None
     history_path:    Optional[Path]     = None
+    report_dir:      Optional[Path]     = None
 
 
 def _slugify(title: str) -> str:
@@ -139,13 +142,14 @@ def _resolve_history_path(slug: str) -> Path:
     return CHAT_HISTORY_DIR / f"{slug}-{ts}.json"
 
 
-def _init_history_path(session: ChatSession, response: OrchestratorResponse) -> None:
+def _init_session_paths_from_user_text(session: ChatSession, user_text: str) -> None:
     if session.history_path is not None:
         return
-    raw  = response.session_title or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    slug = _slugify(raw)
+    words = re.findall(r"[a-z0-9]+", user_text.lower())[:6]
+    slug = _slugify("-".join(words) or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"))
     session.session_title = slug
-    session.history_path  = _resolve_history_path(slug)
+    session.history_path = _resolve_history_path(slug)
+    session.report_dir = REPORT_ROOT / slug
 
 
 def _save_history(session: ChatSession) -> None:
@@ -154,6 +158,7 @@ def _save_history(session: ChatSession) -> None:
     try:
         payload = {
             "session_title": session.session_title,
+            "report_dir":    str(session.report_dir) if session.report_dir else None,
             "saved_at":      datetime.now(timezone.utc).isoformat(),
             "messages":      _MSG_ADAPTER.dump_python(
                 session.message_history, mode="json"
@@ -172,18 +177,33 @@ async def handle_turn(
     debug:     bool = False,
 ) -> None:
 
+    _init_session_paths_from_user_text(session, user_text)
+    set_report_dir(session.report_dir)
+    report_context = load_agent_reports(session.report_dir)
+    skills_context = scan_skills_context()
+    prompt_sections = [f"Current skill scan:\n{skills_context}"]
+    if report_context:
+        prompt_sections.append(
+            "Session agent reports from previous tool runs:\n"
+            f"{report_context}"
+        )
+    prompt_sections.append(f"User request:\n{user_text}")
+    prompt = "\n\n".join(prompt_sections)
+
     start = time.time()
+    turn_id = f"{session.session_title}:{time.time_ns()}"
     result = await observable_run(
         orchestrator,
-        user_text,
+        prompt,
         label="orchestrator",
         indent=0,
         message_history=session.message_history,
         usage_limits=UsageLimits(tool_calls_limit=10),
+        metadata={"turn_id": turn_id},
     )
-    duration = time.time() - start
     response: OrchestratorResponse = result.output
     session.message_history = result.all_messages()
+    duration = time.time() - start
 
     log_event(f"orchestrator completed in {duration:.2f}s")
 
@@ -191,7 +211,6 @@ async def handle_turn(
         _debug_messages(result.all_messages(), label="orchestrator")
         _summarize_messages(result.all_messages())
 
-    _init_history_path(session, response)
     print(f"\nAssistant: {response.reply}\n")
 
     # Show logs for any workers that ran during this turn. We identify them

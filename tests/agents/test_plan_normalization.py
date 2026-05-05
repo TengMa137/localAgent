@@ -1,5 +1,5 @@
 from agents.plan_agent import PlanOutput, _normalize_plan
-from agents.query_policy import TaskKind, extract_urls
+from agents.runtime.query_policy import TaskKind, extract_urls
 from agents.worker import TaskSpec
 
 

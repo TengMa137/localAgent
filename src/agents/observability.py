@@ -5,8 +5,9 @@ Drop-in replacement for agent.run() that streams events to stderr.
 
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Literal, Optional, TypeVar
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ToolCallPart, ToolReturnPart, TextPart, ModelResponse
@@ -16,6 +17,13 @@ from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDen
 from pydantic import BaseModel, Field
 
 T = TypeVar("T")
+ApprovalAction = Literal["approve", "deny", "suggest", "abort"]
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    action: ApprovalAction
+    message: str = ""
 
 COLORS = {
     "dim":    "\033[90m",
@@ -61,6 +69,8 @@ async def observable_run(
     deferred_tool_results: DeferredToolResults | None = kwargs.pop(
         "deferred_tool_results", None
     )
+    approval_rounds = 0
+    max_approval_rounds = int(os.getenv("LOCALAGENT_MAX_APPROVAL_ROUNDS", "3"))
 
     while True:
         run_kwargs = dict(
@@ -84,6 +94,12 @@ async def observable_run(
             "yellow",
             indent,
         )
+        approval_rounds += 1
+        if approval_rounds > max_approval_rounds:
+            raise RuntimeError(
+                f"{label} stopped after {max_approval_rounds} approval round(s) "
+                "without reaching a final answer."
+            )
         deferred_tool_results = _collect_local_approvals(output, label=label, indent=indent)
         current_history = result.all_messages()
         current_prompt = None
@@ -146,16 +162,38 @@ def _collect_local_approvals(
             continue
 
         args_preview = _preview_args(call)
-        approved = _prompt_for_tool_approval(call.tool_name, args_preview)
-        approvals[tool_call_id] = (
-            True
-            if approved
-            else ToolDenied(message=f"Local CLI denied tool call: {call.tool_name}")
-        )
-        verdict = "approved" if approved else "denied"
+        decision = _prompt_for_tool_approval(call.tool_name, args_preview)
+        if decision.action == "abort":
+            raise RuntimeError(
+                f"User aborted tool approval for {call.tool_name}. "
+                f"{decision.message}".strip()
+            )
+        if decision.action == "approve":
+            approvals[tool_call_id] = True
+        else:
+            reason = decision.message.strip()
+            if decision.action == "suggest":
+                message = (
+                    f"Local CLI denied tool call: {call.tool_name}.\n"
+                    "User suggested another way. Rethink why the proposed tool "
+                    "call was not approved and propose a different safer tool "
+                    f"call or answer without writing.\nSuggestion: {reason}"
+                )
+            else:
+                message = (
+                    f"Local CLI denied tool call: {call.tool_name}.\n"
+                    "Rethink why the user did not approve this call. Propose a "
+                    "different safer tool call, ask a clarification, or answer "
+                    "without writing."
+                )
+                if reason:
+                    message += f"\nReason: {reason}"
+            approvals[tool_call_id] = ToolDenied(message=message)
+
+        verdict = decision.action
         _rt(
             f"[{label}] {verdict} {_c(call.tool_name, 'yellow')}",
-            "green" if approved else "red",
+            "green" if decision.action == "approve" else "red",
             indent + 1,
         )
 
@@ -169,15 +207,15 @@ def _collect_local_approvals(
     return DeferredToolResults(approvals=approvals)
 
 
-def _prompt_for_tool_approval(tool_name: str, args_preview: str) -> bool:
+def _prompt_for_tool_approval(tool_name: str, args_preview: str) -> ApprovalDecision:
     env = os.getenv("LOCALAGENT_APPROVE_TOOLS", "").strip().lower()
     if env in {"1", "true", "yes", "always"}:
-        return True
+        return ApprovalDecision("approve")
     if env in {"0", "false", "no", "never"}:
-        return False
+        return ApprovalDecision("deny", "Denied by LOCALAGENT_APPROVE_TOOLS.")
 
     if not sys.stdin.isatty():
-        return False
+        return ApprovalDecision("deny", "Denied because stdin is not interactive.")
 
     print(
         _c("\nTool approval required", "yellow"),
@@ -188,8 +226,24 @@ def _prompt_for_tool_approval(tool_name: str, args_preview: str) -> bool:
     if args_preview:
         print(f"  args: {args_preview}", file=sys.stderr, flush=True)
 
-    reply = input("Approve this tool call? [y/N] ").strip().lower()
-    return reply in {"y", "yes"}
+    print(
+        "  options: [y] approve, [n] deny, [s] suggest another way, [a] abort run",
+        file=sys.stderr,
+        flush=True,
+    )
+    reply = input("Choose approval action [y/N/s/a]: ").strip().lower()
+    if reply in {"y", "yes"}:
+        return ApprovalDecision("approve")
+    if reply in {"s", "suggest"}:
+        suggestion = input("Suggest another way: ").strip()
+        return ApprovalDecision("suggest", suggestion or "No suggestion text provided.")
+    if reply in {"a", "abort", "q", "quit"}:
+        reason = input("Abort reason (optional): ").strip()
+        return ApprovalDecision("abort", reason)
+    if reply in {"n", "no"}:
+        reason = input("Deny reason (optional): ").strip()
+        return ApprovalDecision("deny", reason)
+    return ApprovalDecision("deny", "Denied by default.")
     
 
 

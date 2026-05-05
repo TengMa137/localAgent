@@ -12,24 +12,25 @@ The agent handles three kinds of requests from a single conversation loop:
 
 - **Direct** — answers immediately from the model's own knowledge (explanations, code, writing, maths).
 - **Clarify** — asks one focused question when a request is too ambiguous to act on safely.
-- **Research** — decomposes the request into typed sub-tasks, executes retrieval deterministically
-  in Python, asks small worker models to extract findings from retrieved evidence, then synthesises
-  a final report.
+- **Delegated work** — routes local file tasks to `fs_agent`, web/current tasks to
+  `web_agent`, and complex multi-step tasks to the planning workflow.
 
 The code is intentionally biased toward small local LLMs. Python owns the multi-step workflow,
-tool routing, path validation, approval handling, URL selection, and plan repair. LLM calls are
-kept narrow: classify, plan typed tasks, review web search queries, extract evidence, reflect
-only when needed, and synthesize.
+tool routing, path validation, approval handling, deterministic RAG handoffs, and report memory.
+LLM calls are kept narrow: classify, use specialist tools, plan typed tasks, extract evidence,
+reflect only when needed, and synthesize.
 
 Current implementation highlights:
 
 - Validator-backed filesystem tools now cover read, line reads, grep, stat, shallow/deep listing,
   directory creation, copy/move/delete, and single-file search/replace.
 - Filesystem writes can use local CLI approval via PydanticAI deferred-tool approval.
-- Agents receive explicit tool allowlists instead of broad substring-based filters.
+- The orchestrator exposes specialist tools instead of raw filesystem/RAG tools.
+- `fs_agent` owns local path discovery/read/write/edit and uses deterministic RAG for large or multi-file reads.
+- `web_agent` owns search/query/URL selection/crawl and then uses deterministic RAG over fetched content.
+- Agents write concise per-session markdown reports under `chat_history/reports/<session-title>/`.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
 - Workers are mostly tool-free: Python retrieves evidence, workers extract findings.
-- Web search queries pass through `search_guard_agent` before hitting the MCP web server.
 - Reflection is skipped when deterministic completion criteria are already met.
 
 ---
@@ -41,15 +42,18 @@ Current implementation highlights:
 ├── run_agents.py            # Entry point — interactive terminal chat
 ├── rag.py                   # Rag service entry point, import from rag_lib
 ├── agents/
-│   ├── orchestrator_agent.py # Conversation router and local file resolution
+│   ├── orchestrator_agent.py # Conversation router for fs/web/plan tools
+│   ├── fs_agent.py           # Filesystem specialist agent
+│   ├── web_agent.py          # Web/search/crawl specialist agent
 │   ├── plan_agent.py         # Planning, plan normalization, worker loop
-│   ├── worker.py             # Deterministic retrieval + evidence extraction
-│   ├── query_policy.py       # URL/arXiv extraction and task kind helpers
-│   ├── search_guard.py       # LLM review/repair of web search queries
-│   ├── reflect_agent.py      # Optional follow-up decision
-│   ├── synthesis_agent.py    # Final report generation
+│   ├── worker.py             # Stateless one-shot worker calls and retrieval
 │   ├── observability.py     # Real-time event streaming to stderr
-│   └── utils.py             # Model setup, toolset factories, skill loader
+│   └── runtime/
+│       ├── context.py        # Model setup, validators, toolsets, skill loader
+│       ├── query_policy.py   # URL/arXiv extraction and task kind helpers
+│       ├── rag_helpers.py    # Deterministic RAG helper functions for agents
+│       ├── reports.py        # Per-session markdown report memory
+│       └── skills_context.py # Deterministic /skills prompt context
 │
 ├── tools/
 │   ├── filesystem/          # Validator-backed read/write/list/grep/edit tools
@@ -58,7 +62,7 @@ Current implementation highlights:
 │
 ├── skills/                  # Skill markdown files loaded at runtime
 │
-└── chat_history/            # Per-session JSON logs (auto-created)
+└── chat_history/            # Per-session JSON logs and reports (auto-created)
 ```
 
 ---
@@ -142,11 +146,11 @@ endpoint works without code changes.
 ```bash
 # OpenAI
 export OPENAI_API_KEY=sk-...
-# set model = "openai:gpt-4o" in utils.py
+# set model = "openai:gpt-4o" in agents/runtime/context.py
 
 # Anthropic
 export ANTHROPIC_API_KEY=sk-ant-...
-# set model = "anthropic:claude-sonnet-4-5" in utils.py
+# set model = "anthropic:claude-sonnet-4-5" in agents/runtime/context.py
 ```
 
 ### Local via llama.cpp
@@ -203,8 +207,9 @@ No other changes needed — the rest of the agent stack is model-agnostic.
 
 **Notes on small models (≤ 1B):** Qwen3-0.6B handles simple single-turn tasks well: fetching
 a web page, answering a question from a local file, or doing a straightforward search.
-The agent now avoids asking tiny models to manage tool loops. Workers receive retrieved
-evidence and extract findings; Python performs the web/RAG/arXiv retrieval sequence.
+The agent avoids asking tiny models to manage broad tool loops. The orchestrator routes to
+specialist fs/web agents, and Python performs deterministic RAG handoffs when content is
+large, multi-file, or fetched from the web.
 
 ---
 
@@ -213,19 +218,51 @@ evidence and extract findings; Python performs the web/RAG/arXiv retrieval seque
 ### Orchestrator
 
 The orchestrator is the long-lived conversational agent. It accumulates `message_history`
-across turns and classifies each turn as `direct`, `clarify`, or `research`. A
+across turns and classifies each turn as direct, clarify, filesystem, web, or complex plan. A
 `history_processor` compresses old turns once history exceeds a configurable threshold,
 keeping the context window bounded without losing important decisions.
 
-For research turns it resolves any local file paths via `list_files`, then delegates all
-content retrieval to `plan_and_spawn` — it never reads file content or web pages itself.
+Before each turn, the CLI loads any per-session agent reports and injects them as context.
+It also refreshes and injects a deterministic `/skills` scan, so newly created or edited
+skills are visible on the next run. If chat/report/skill context is sufficient, the
+orchestrator answers directly. Otherwise it calls one or more specialist entry points for
+distinct information needs:
+
+| Route | Tool |
+|---|---|
+| local files, edits, local grep/read/write | `run_fs_task` |
+| current info, web search, URL crawl, arXiv lookup | `run_web_task` |
+| complex multi-step work | `run_plan_workflow` |
+
+The orchestrator does not receive raw filesystem or RAG toolsets. It never reads files or
+web pages directly.
+
+### fs_agent
+
+`fs_agent` has the approval-wrapped filesystem toolset. It discovers paths by listing,
+statting, grepping, and reading; it does not use a keyword path resolver. Small UTF-8 text
+files can be read directly. Directories, multiple files, truncated reads, and files larger
+than the direct read limit trigger deterministic RAG over the discovered paths.
+
+Before each fs task, the agent receives the current deterministic `/skills` catalog plus a
+readable file index. This prevents skill-related requests from depending on guessed paths.
+
+Writes and edits still go through the existing `FilesystemValidator` and deferred approval
+policy.
+
+### web_agent
+
+`web_agent` owns web query choice, search result inspection, URL selection, and crawl calls.
+After selected pages are crawled and indexed, Python deterministically searches RAG over the
+newly indexed URLs and appends that evidence to the web result.
+
+The orchestrator does not call RAG directly; RAG is infrastructure used by fs/web/workflow code.
 
 ### plan_agent
 
-A one-shot agent that receives the research objective, resolved file paths, and Python-built
-file previews. It has no filesystem tools. If the previews are sufficient it returns an
-`initial_answer` directly (skipping workers). Otherwise it decomposes the objective into
-up to `MAX_TASKS_PER_PLAN` independent `TaskSpec` objects for the worker pool.
+A one-shot agent used by `run_plan_workflow` for complex tasks. It receives the objective and
+available context, then decomposes the work into up to `MAX_TASKS_PER_PLAN` independent
+`TaskSpec` objects for the worker pool.
 
 After the model returns, Python normalizes the plan:
 
@@ -233,12 +270,15 @@ After the model returns, Python normalizes the plan:
 - resolves local file references only against actual readable paths
 - fills `query`, `as_of`, `user_prompt`, and task kind defaults
 - adds required local-file, URL-crawl, or arXiv tasks when those structural signals are present
-- preserves the planner's coarse current-info flag; search_guard owns web query freshness
+- preserves the planner's coarse current-info flag; the worker module reviews web query freshness
 
-### Worker agents
+### Worker steps
 
-Workers are stateless and single-shot. Each receives one `TaskSpec`, but it no longer chooses
-retrieval tools itself for the normal paths. Python executes retrieval from `TaskSpec.kind`:
+Worker steps are stateless and single-shot. The same worker module handles evidence
+extraction, web-query review, history compression, reflection, and synthesis with different
+system prompts and typed output schemas. For extraction, each worker receives one `TaskSpec`,
+but it no longer chooses retrieval tools itself for the normal paths. Python executes retrieval from
+`TaskSpec.kind`:
 
 | Kind | Python retrieval path |
 |---|---|
@@ -249,27 +289,33 @@ retrieval tools itself for the normal paths. Python executes retrieval from `Tas
 
 Multiple workers run in parallel via `asyncio.gather`, bounded by `MAX_PARALLEL_TASKS`.
 
-The worker model only extracts structured findings from the retrieved evidence. This is more
-reliable for small local models than asking them to choose tools repeatedly.
-
-### Search guard
-
-Before a web query is sent to the MCP web server, `search_guard_agent` reviews the proposed
-query against the original user prompt and current date. It can rewrite the query and marks
-whether the query is time-sensitive. There is no hardcoded list of freshness keywords; the
-guard owns that judgment.
-
-`_now()` is intentionally kept out of planner, orchestrator, and worker prompts so small
-models are not asked to duplicate freshness policy. It is still passed to search_guard and
-stored as `as_of` metadata for synthesis.
+The extraction worker only extracts structured findings from retrieved evidence. Reflection
+and synthesis are also one-round worker steps, so workflow observability and usage limits stay
+centralized.
 
 ### Reflect → Synthesise loop
 
-Reflection is now optional. After each worker batch Python first checks deterministic completion
+Reflection is optional. After each worker batch Python first checks deterministic completion
 criteria. If there are findings and no failures, suggested follow-ups, or blocking uncertainty,
-reflection is skipped. Otherwise `reflect_agent` assesses completeness and may propose follow-up
-tasks for the next iteration (up to `MAX_ITERATIONS`). Once complete, `synthesis_agent` produces
-the final report and includes the `as_of` date when the task is marked time-sensitive.
+reflection is skipped. Otherwise a reflect worker step assesses completeness and may propose
+follow-up tasks for the next iteration (up to `MAX_ITERATIONS`). Once complete, a synthesis
+worker step produces the final report and includes the `as_of` date when the task is marked
+time-sensitive.
+
+### Agent reports
+
+Specialist agents write concise markdown reports in:
+
+```text
+chat_history/reports/<session-title>/
+├── fs-report.md
+├── web-report.md
+└── plan-report.md
+```
+
+Reports are overwritten with the latest durable state for that agent: objective, summary,
+paths/sources, findings, and uncertainties. On the next turn, `run_agents.py` loads all
+`*-report.md` files for the session and injects them before the user request.
 
 ### Shared RAG knowledge base
 
@@ -320,7 +366,9 @@ Available filesystem tools include:
 | `copy_file`, `move_file`, `delete_file` | File management operations |
 
 Writes can require human approval. `Mount.write_approval=True` is enforced through
-PydanticAI's deferred-tool approval support. In the local CLI:
+PydanticAI's deferred-tool approval support. The default `/skills` mount is writable
+with approval so the agent can create or update skill files; set
+`LOCALAGENT_SKILLS_MODE=ro` to make it read-only. In the local CLI:
 
 ```bash
 # prompt interactively, default
@@ -332,6 +380,20 @@ LOCALAGENT_APPROVE_TOOLS=always uv run python src/run_agents.py
 # auto-deny filesystem writes
 LOCALAGENT_APPROVE_TOOLS=never uv run python src/run_agents.py
 ```
+
+Interactive approval supports four actions:
+
+| Action | Effect |
+|---|---|
+| `y` | Approve the proposed tool call |
+| `n` | Deny it, optionally with a reason |
+| `s` | Deny it and inject "suggest another way" feedback into the same agent run |
+| `a` | Abort the current agent run |
+
+When you choose `s`, the suggestion is returned to the model as the tool denial message, so
+the agent can rethink why the write was not approved and propose a different tool call.
+`LOCALAGENT_MAX_APPROVAL_ROUNDS` controls how many approval cycles a run may attempt before
+it is stopped; the default is `3`.
 
 ### Skills toolset
 
@@ -346,6 +408,11 @@ returns:
   what skills are available without loading all of them upfront.
 - `load_skill` — a tool the agent calls to read a specific skill on demand, keeping the
   initial context small.
+
+At runtime, `scan_skills_context()` refreshes this index before each orchestrator turn and
+before each filesystem task. The scanner injects exact skill paths such as
+`fitness/diet.md` and `fitness/workout.md` into context, so agents should prefer the scanned
+paths over invented names.
 
 ### RAG toolset
 
@@ -387,7 +454,9 @@ Runtime environment variables:
 | `LOCALAGENT_MCP_URL` | `http://localhost:8000/sse` | MCP web server SSE endpoint |
 | `LOCALAGENT_DOCS_DIR` | `user_docs` | Host directory mounted into the agent as `/docs` |
 | `LOCALAGENT_SKILLS_DIR` | `skills` | Host directory mounted into the agent as `/skills` |
+| `LOCALAGENT_SKILLS_MODE` | `rw` | Access mode for `/skills`; use `ro` to prevent skill writes |
 | `LOCALAGENT_APPROVE_TOOLS` | unset | `always` auto-approves deferred filesystem writes; `never` auto-denies |
+| `LOCALAGENT_MAX_APPROVAL_ROUNDS` | `3` | Maximum approval cycles before stopping the current agent run |
 
 Key constants in *_agents.py respectively:
 
@@ -427,19 +496,29 @@ running directly on the host. It should not be the default for host development.
 ## Chat history
 
 Each session is saved to `./chat_history/chats/<session-title>.json` after every turn, where
-`session-title` is a kebab-case slug the orchestrator generates on the first turn
-(e.g. `compare-llm-pricing.json`, note: not stable for small LLM, better to use timestamp). Change it at CHAT_HISTORY_DIR in run_agents.py.
+`session-title` is a kebab-case slug derived from the first user turn
+(e.g. `compare-llm-pricing.json`). Change the base path at `CHAT_HISTORY_DIR` in `run_agents.py`.
 
 The file stores the full `List[ModelMessage]` serialised via pydantic-ai's `TypeAdapter`,
-so it is round-trippable back into a live session.
+so it is round-trippable back into a live session. It also stores the report directory used
+for agent report memory.
 
 ```json
 {
   "session_title": "compare-llm-pricing",
+  "report_dir": "chat_history/reports/compare-llm-pricing",
   "saved_at": "2025-03-15T10:23:41+00:00",
   "messages": [ ... ]
 }
 ```
+
+Agent reports are saved next to chat history under:
+
+```text
+chat_history/reports/<session-title>/
+```
+
+Current report filenames are `fs-report.md`, `web-report.md`, and `plan-report.md`.
 
 ---
 
