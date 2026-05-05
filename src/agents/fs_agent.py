@@ -13,14 +13,18 @@ from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
 from .runtime.reports import report_path, write_agent_report
 from .runtime.skills_context import scan_skills_context
 from .runtime.context import fs_toolset, model, validator
+from tools.filesystem.text_ops import read_text_with_policy
 from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 
 MAX_FS_CONTEXT_FILES = 120
+SKILL_EDITING_POLICY_PATH = "/skills/skill_editing.md"
+MAX_SKILL_EDITING_POLICY_CHARS = 5000
 VIRTUAL_PATH_RE = re.compile(r"(?<!\S)/(?:[A-Za-z0-9._-]+/?)+")
 WRITE_INTENT_RE = re.compile(
     r"\b(create|write|add|new|edit|update|save|move|copy|delete|replace)\b",
     re.IGNORECASE,
 )
+SKILL_INTENT_RE = re.compile(r"\bskill(s)?\b|/skills\b|skills/", re.IGNORECASE)
 
 
 class FsAgentResult(BaseModel):
@@ -141,6 +145,44 @@ def _is_write_intent(objective: str) -> bool:
     return bool(WRITE_INTENT_RE.search(objective))
 
 
+def _is_skills_path(path: str) -> bool:
+    return path == "/skills" or path.startswith("/skills/")
+
+
+def _needs_skill_editing_policy(objective: str, write_targets: list[str]) -> bool:
+    if any(_is_skills_path(path) for path in write_targets):
+        return True
+    return _is_write_intent(objective) and bool(SKILL_INTENT_RE.search(objective))
+
+
+def _skill_editing_policy_context(objective: str, write_targets: list[str]) -> str:
+    if not _needs_skill_editing_policy(objective, write_targets):
+        return ""
+
+    try:
+        text, _ = read_text_with_policy(validator, SKILL_EDITING_POLICY_PATH)
+    except Exception as exc:
+        return (
+            "Skill editing policy hook:\n"
+            f"- Intended source: {SKILL_EDITING_POLICY_PATH}\n"
+            f"- Status: could not read policy ({exc})\n"
+            "- If writing under /skills, proceed conservatively and state this uncertainty.\n"
+        )
+
+    truncated = len(text) > MAX_SKILL_EDITING_POLICY_CHARS
+    policy = text[:MAX_SKILL_EDITING_POLICY_CHARS].strip()
+    return (
+        "Skill editing policy hook:\n"
+        f"Source: {SKILL_EDITING_POLICY_PATH}\n"
+        f"Policy truncated: {truncated}\n"
+        "This task appears to create, edit, move, copy, or delete skill files. "
+        "Apply the policy below before writing under /skills. If the policy "
+        "requires user approval or a safer proposal, follow that policy before "
+        "calling write/edit tools.\n\n"
+        f"{policy}\n"
+    )
+
+
 def _sanitize_objective_paths(objective: str) -> tuple[str, list[str], list[str]]:
     invalid: list[str] = []
     write_targets: list[str] = []
@@ -183,10 +225,15 @@ def _fs_task_prompt(objective: str) -> tuple[str, list[str], list[str]]:
         if write_targets
         else "- none"
     )
+    skill_policy_section = _skill_editing_policy_context(
+        sanitized_objective,
+        write_targets,
+    )
 
     prompt = (
         f"{_roots_context()}\n\n"
         f"{scan_skills_context()}\n\n"
+        f"{skill_policy_section}\n"
         "Readable file index (actual validator paths):\n"
         f"{file_section}\n"
         f"File index truncated: {truncated}\n\n"

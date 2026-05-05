@@ -120,6 +120,34 @@ def test_fs_task_prompt_includes_file_index_and_write_targets():
     assert write_targets == ["/skills/fitness/movement_recovery.md"]
     assert "Valid write target path hints" in prompt
     assert "- /skills/fitness/movement_recovery.md" in prompt
+    assert "Skill editing policy hook" in prompt
+    assert "Source: /skills/skill_editing.md" in prompt
+
+
+def test_fs_task_prompt_includes_skill_policy_for_loose_skill_write():
+    from agents import fs_agent
+
+    prompt, invalid, write_targets = fs_agent._fs_task_prompt(
+        "write a new skill under skills/fitness about recovery movements"
+    )
+
+    assert invalid == []
+    assert write_targets == []
+    assert "Skill editing policy hook" in prompt
+    assert "Source: /skills/skill_editing.md" in prompt
+    assert "Skill Improvement Guidelines" in prompt
+
+
+def test_fs_task_prompt_omits_skill_policy_for_non_skill_write():
+    from agents import fs_agent
+
+    prompt, invalid, write_targets = fs_agent._fs_task_prompt(
+        "write a short local note about recovery"
+    )
+
+    assert invalid == []
+    assert write_targets == []
+    assert "Skill editing policy hook" not in prompt
 
 
 def test_prompt_for_tool_approval_suggestion(monkeypatch):

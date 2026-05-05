@@ -414,6 +414,11 @@ before each filesystem task. The scanner injects exact skill paths such as
 `fitness/diet.md` and `fitness/workout.md` into context, so agents should prefer the scanned
 paths over invented names.
 
+When a filesystem task appears to create, edit, move, copy, or delete skill files, `fs_agent`
+deterministically loads `/skills/skill_editing.md` into the task prompt. This is a Python
+hook, not an orchestrator choice, so skill edits receive the editing policy even when the
+model would otherwise forget to call a skill-loading tool.
+
 ### RAG toolset
 
 | Tool | Purpose |
