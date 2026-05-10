@@ -91,12 +91,12 @@ def test_default_skills_mount_is_writable_with_approval():
 def test_fs_preflight_replaces_missing_path_hint():
     from agents import fs_agent
 
-    sanitized, invalid, write_targets = fs_agent._sanitize_objective_paths(
+    sanitized, analysis = fs_agent._sanitize_objective_paths(
         "find and read the /skills/local-fitness-skills file"
     )
 
-    assert invalid == ["/skills/local-fitness-skills"]
-    assert write_targets == []
+    assert analysis.invalid_paths == ["/skills/local-fitness-skills"]
+    assert analysis.write_targets == []
     assert "/skills/local-fitness-skills" not in sanitized
     assert "local fitness skills" in sanitized
 
@@ -104,20 +104,20 @@ def test_fs_preflight_replaces_missing_path_hint():
 def test_fs_task_prompt_includes_file_index_and_write_targets():
     from agents import fs_agent
 
-    prompt, invalid, write_targets = fs_agent._fs_task_prompt(
+    prompt, analysis = fs_agent._fs_task_prompt(
         "summarize the /skills/local-fitness-skills file"
     )
-    assert invalid == ["/skills/local-fitness-skills"]
-    assert write_targets == []
+    assert analysis.invalid_paths == ["/skills/local-fitness-skills"]
+    assert analysis.write_targets == []
     assert "Invalid exact path hints" in prompt
     assert "/skills/fitness/diet.md" in prompt
     assert "/skills/fitness/workout.md" in prompt
 
-    prompt, invalid, write_targets = fs_agent._fs_task_prompt(
+    prompt, analysis = fs_agent._fs_task_prompt(
         "create /skills/fitness/movement_recovery.md."
     )
-    assert invalid == []
-    assert write_targets == ["/skills/fitness/movement_recovery.md"]
+    assert analysis.invalid_paths == []
+    assert analysis.write_targets == ["/skills/fitness/movement_recovery.md"]
     assert "Valid write target path hints" in prompt
     assert "- /skills/fitness/movement_recovery.md" in prompt
     assert "Skill editing policy hook" in prompt
@@ -127,12 +127,12 @@ def test_fs_task_prompt_includes_file_index_and_write_targets():
 def test_fs_task_prompt_includes_skill_policy_for_loose_skill_write():
     from agents import fs_agent
 
-    prompt, invalid, write_targets = fs_agent._fs_task_prompt(
+    prompt, analysis = fs_agent._fs_task_prompt(
         "write a new skill under skills/fitness about recovery movements"
     )
 
-    assert invalid == []
-    assert write_targets == []
+    assert analysis.invalid_paths == []
+    assert analysis.write_targets == []
     assert "Skill editing policy hook" in prompt
     assert "Source: /skills/skill_editing.md" in prompt
     assert "Skill Improvement Guidelines" in prompt
@@ -141,12 +141,12 @@ def test_fs_task_prompt_includes_skill_policy_for_loose_skill_write():
 def test_fs_task_prompt_omits_skill_policy_for_non_skill_write():
     from agents import fs_agent
 
-    prompt, invalid, write_targets = fs_agent._fs_task_prompt(
+    prompt, analysis = fs_agent._fs_task_prompt(
         "write a short local note about recovery"
     )
 
-    assert invalid == []
-    assert write_targets == []
+    assert analysis.invalid_paths == []
+    assert analysis.write_targets == []
     assert "Skill editing policy hook" not in prompt
 
 
@@ -210,6 +210,33 @@ def test_write_and_load_agent_report(tmp_path):
     assert "The note says the important fact." in loaded
     assert "Objective: Read notes" in loaded
     assert "- /docs/notes.md" in loaded
+
+    set_report_dir(None)
+
+
+def test_agent_report_appends_runs_in_same_session(tmp_path):
+    from agents.runtime.reports import load_agent_reports, set_report_dir, write_agent_report
+
+    set_report_dir(tmp_path)
+    write_agent_report(
+        "fs",
+        objective="first",
+        summary="first summary",
+        answer="first answer",
+    )
+    write_agent_report(
+        "fs",
+        objective="second",
+        summary="second summary",
+        answer="second answer",
+    )
+
+    loaded = load_agent_reports(tmp_path)
+    assert loaded.count("## Run ") == 2
+    assert "Objective: first" in loaded
+    assert "Objective: second" in loaded
+    assert "first answer" in loaded
+    assert "second answer" in loaded
 
     set_report_dir(None)
 
@@ -360,3 +387,67 @@ async def test_specialist_guard_returns_failed_duplicate_without_retry():
 
     assert "Duplicate specialist call blocked" in second
     assert "Error: nope" in second
+
+
+@pytest.mark.asyncio
+async def test_specialist_guard_marks_file_access_problem_terminal():
+    from agents import orchestrator_agent
+
+    ctx = _ctx("test-specialist-terminal-access")
+    orchestrator_agent._tool_run_cache.pop(ctx.run_id, None)
+
+    async def failed_runner(objective: str) -> str:
+        return (
+            "I could not complete the filesystem request because of a file access problem.\n"
+            "No further agent retry can fix this automatically."
+        )
+
+    first = await orchestrator_agent._run_specialist_once(
+        ctx,
+        tool_name="run_fs_task",
+        objective="edit read only file",
+        runner=failed_runner,
+    )
+
+    assert "Return this result to the user" in first
+    assert "do not create another plan" in first
+
+
+def test_fs_task_prompt_terminal_missing_file_after_full_index(monkeypatch, tmp_path):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "actual.md").write_text("hello")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    _prompt, analysis = fs_agent._fs_task_prompt("read /docs/not-present.md")
+
+    assert analysis.invalid_paths == ["/docs/not-present.md"]
+    assert analysis.terminal_issues
+    assert "File not found" in analysis.terminal_issues[0].reason
+
+
+def test_fs_task_prompt_terminal_read_only_write(monkeypatch, tmp_path):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "actual.md").write_text("hello")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    _prompt, analysis = fs_agent._fs_task_prompt("update /docs/actual.md")
+
+    assert analysis.invalid_paths == ["/docs/actual.md"]
+    assert analysis.terminal_issues
+    assert "read-only" in analysis.terminal_issues[0].reason

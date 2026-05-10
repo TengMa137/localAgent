@@ -8,7 +8,7 @@ from pydantic_ai.usage import UsageLimits
 
 from .observability import observable_run
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
-from .runtime.reports import write_agent_report
+from .runtime.reports import current_report_dir, load_agent_report_summaries, write_agent_report
 from .runtime.context import model, web_toolset
 
 
@@ -57,9 +57,17 @@ async def run_web_task(objective: str) -> str:
     """
     Run one web/current-info task, then search RAG over crawled web documents.
     """
+    report_memory = load_agent_report_summaries(current_report_dir())
+    prompt = f"Objective: {objective}"
+    if report_memory:
+        prompt = (
+            "Concise prior session report memory:\n"
+            f"{report_memory}\n\n"
+            f"{prompt}"
+        )
     result = await observable_run(
         web_agent,
-        f"Objective: {objective}",
+        prompt,
         label="web_agent",
         indent=1,
         usage_limits=UsageLimits(tool_calls_limit=10),

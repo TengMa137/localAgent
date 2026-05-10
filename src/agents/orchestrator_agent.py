@@ -41,16 +41,17 @@ File + RAG contract:
   crawl. Python triggers RAG deterministically inside fs/web/workflow code for
   large, multi-file, or fetched-document retrieval.
 
-History compression:
-  Orchestrator history_processor summarises old turns when message count
-  exceeds COMPRESS_AFTER, keeping KEEP_RECENT messages verbatim.
+History:
+  Orchestrator is the persistent agent. The CLI stores the full Pydantic AI
+  message list between turns; specialist agents receive concise report memory
+  rather than the full conversation transcript.
 """
 
 from typing import List, Optional
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart
+from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai import ModelRetry
 from pydantic_ai.tools import DeferredToolRequests, RunContext
 
@@ -58,11 +59,7 @@ from .fs_agent import run_fs_task as _run_fs_task
 from .plan_agent import run_plan_workflow as _run_plan_workflow
 from .runtime.context import model
 from .web_agent import run_web_task as _run_web_task
-from .worker import run_history_summary_worker
 from .observability import _rt
-
-COMPRESS_AFTER     = 10
-KEEP_RECENT        = 5
 
 def _safe_cut(messages: List[ModelMessage], target: int) -> int:
     """
@@ -78,30 +75,6 @@ def _safe_cut(messages: List[ModelMessage], target: int) -> int:
                 return i
         i -= 1
     return 0
-
-
-async def _compress_history(messages: List[ModelMessage]) -> List[ModelMessage]:
-    """
-    Orchestrator history_processor. When message count exceeds COMPRESS_AFTER,
-    summarises everything before the safe cut-point and keeps KEEP_RECENT
-    messages verbatim for immediate context.
-    """
-    if len(messages) <= COMPRESS_AFTER:
-        return messages
-
-    tail_start   = _safe_cut(messages, max(0, len(messages) - KEEP_RECENT))
-    to_summarise = messages[:tail_start]
-    verbatim     = messages[tail_start:]
-
-    if not to_summarise:
-        return messages
-
-    summary = await run_history_summary_worker(message_history=to_summarise)
-    summary_message = ModelResponse(
-        parts=[TextPart(content=f"Conversation summary so far:\n{summary}")]
-    )
-    return [summary_message] + verbatim
-
 
 
 class OrchestratorResponse(BaseModel):
@@ -125,6 +98,18 @@ def _run_cache_key(ctx: RunContext) -> str:
 def _trim_tool_cache() -> None:
     while len(_tool_run_cache) > 128:
         _tool_run_cache.pop(next(iter(_tool_run_cache)))
+
+
+def _is_terminal_specialist_failure(result: str) -> bool:
+    text = result.casefold()
+    return any(
+        marker in text
+        for marker in (
+            "failed before a grounded result",
+            "because of a file access problem",
+            "no further agent retry can fix this automatically",
+        )
+    )
 
 
 async def _run_specialist_once(
@@ -159,8 +144,15 @@ async def _run_specialist_once(
 
     _rt(f"[orchestrator] specialist route: {tool_name}", "yellow")
     result = await runner(objective)
-    failed = "failed before a grounded result" in result.casefold()
+    failed = _is_terminal_specialist_failure(result)
     calls.append((tool_name, objective_key, result, failed))
+    if failed:
+        return (
+            f"{result}\n\n"
+            "Specialist tool call complete with a terminal access/error report. "
+            "Return this result to the user; do not create another plan to fix "
+            "the same access problem in the agent loop."
+        )
     return (
         f"{result}\n\n"
         "Specialist tool call complete. You may call another specialist only "
@@ -239,7 +231,6 @@ async def run_plan_workflow(ctx: RunContext, objective: str) -> str:
 orchestrator = Agent(
     model=model,
     output_type=[OrchestratorResponse, DeferredToolRequests],
-    history_processors=[_compress_history],
     tools=[run_fs_task, run_web_task, run_plan_workflow],
 )
 
@@ -295,6 +286,10 @@ Tool routing:
   - After a tool returns, write the final reply from that result. Do not call
     another tool unless the first result explicitly says required information
     is missing and the next tool is necessary.
+  - If a filesystem tool result says there is a file access problem or that no
+    further agent retry can fix it automatically, return that markdown report
+    to the user. Do not route to plan_workflow or start a repair loop for the
+    same inaccessible or missing file.
 
 Rules:
   - Never call tools for direct or clarify intents.

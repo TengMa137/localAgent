@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -44,8 +45,17 @@ def write_agent_report(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     forwardable_answer = (answer or summary).strip() or "No answer returned."
+    heading = f"# {agent_name.replace('_', ' ').title()} Report"
+    existing = ""
+    if path.exists():
+        try:
+            existing = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing = ""
+
+    run_heading = "## Run " + datetime.now(timezone.utc).isoformat()
     lines = [
-        f"# {agent_name.replace('_', ' ').title()} Report",
+        run_heading,
         "",
         "Answer:",
         forwardable_answer,
@@ -70,7 +80,13 @@ def write_agent_report(
         lines.extend(["", f"{heading}:"])
         lines.extend(f"- {item}" for item in dict.fromkeys(cleaned))
 
-    path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    entry = "\n".join(lines).strip()
+    if existing:
+        content = f"{existing}\n\n---\n\n{entry}\n"
+    else:
+        content = f"{heading}\n\n{entry}\n"
+
+    path.write_text(content, encoding="utf-8")
 
 
 def load_agent_reports(report_dir: Path | None) -> str:
@@ -87,3 +103,31 @@ def load_agent_reports(report_dir: Path | None) -> str:
             sections.append(f"REPORT FILE: {path.name}\n{content}")
 
     return "\n\n---\n\n".join(sections)
+
+
+def load_agent_report_summaries(report_dir: Path | None, *, max_chars: int = 4000) -> str:
+    """Load compact prior report memory for one-shot specialist agents."""
+    full = load_agent_reports(report_dir)
+    if not full:
+        return ""
+
+    kept_lines: list[str] = []
+    keep_next = False
+    for line in full.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("REPORT FILE:") or stripped.startswith("## Run "):
+            kept_lines.append(stripped)
+            keep_next = False
+            continue
+        if stripped in {"Answer:", "Objective:", "Summary:", "Uncertainties:"}:
+            kept_lines.append(stripped)
+            keep_next = True
+            continue
+        if keep_next and stripped:
+            kept_lines.append(stripped)
+            keep_next = False
+
+    text = "\n".join(kept_lines).strip()
+    if len(text) > max_chars:
+        return text[-max_chars:]
+    return text

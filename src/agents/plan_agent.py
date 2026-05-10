@@ -20,11 +20,11 @@ from .runtime.query_policy import (
 )
 
 from .observability import _rt, observable_run
-from .runtime.reports import write_agent_report
+from .runtime.reports import current_report_dir, load_agent_report_summaries, write_agent_report
 from tools.filesystem.text_ops import read_text_with_policy
 
 MAX_TASKS_PER_PLAN = 5
-MAX_ITERATIONS = 3
+MAX_ITERATIONS = 1
 MAX_PLAN_PREVIEW_CHARS = 4000
 
 class PlanOutput(BaseModel):
@@ -551,7 +551,15 @@ async def _run_plan_workflow_internal(objective: str, matched_files: List[str]) 
 
 async def run_plan_workflow(objective: str) -> str:
     """Run the complex-task planning workflow and write plan-report.md."""
-    report = await _run_plan_workflow_internal(objective=objective, matched_files=[])
+    report_memory = load_agent_report_summaries(current_report_dir())
+    workflow_objective = objective
+    if report_memory:
+        workflow_objective = (
+            "Concise prior session report memory:\n"
+            f"{report_memory}\n\n"
+            f"Objective: {objective}"
+        )
+    report = await _run_plan_workflow_internal(objective=workflow_objective, matched_files=[])
     write_agent_report(
         "plan",
         objective=objective,

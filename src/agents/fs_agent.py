@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
+from difflib import get_close_matches
+from pathlib import Path
 from typing import List
 
 from pydantic import BaseModel, Field, model_validator
@@ -10,9 +13,10 @@ from pydantic_ai.usage import UsageLimits
 
 from .observability import _rt, observable_run
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
-from .runtime.reports import report_path, write_agent_report
+from .runtime.reports import current_report_dir, load_agent_report_summaries, report_path, write_agent_report
 from .runtime.skills_context import scan_skills_context
 from .runtime.context import fs_toolset, model, validator
+from tools.filesystem.errors import PathNotWritableError, ValidationError
 from tools.filesystem.text_ops import read_text_with_policy
 from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 
@@ -25,6 +29,25 @@ WRITE_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 SKILL_INTENT_RE = re.compile(r"\bskill(s)?\b|/skills\b|skills/", re.IGNORECASE)
+CREATE_INTENT_RE = re.compile(r"\b(create|new|add|save)\b", re.IGNORECASE)
+MUTATE_EXISTING_INTENT_RE = re.compile(
+    r"\b(edit|update|move|copy|delete|replace|append|modify)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class PathHintIssue:
+    path: str
+    reason: str
+    suggestions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PathAnalysis:
+    invalid_paths: list[str] = field(default_factory=list)
+    write_targets: list[str] = field(default_factory=list)
+    terminal_issues: list[PathHintIssue] = field(default_factory=list)
 
 
 class FsAgentResult(BaseModel):
@@ -145,6 +168,14 @@ def _is_write_intent(objective: str) -> bool:
     return bool(WRITE_INTENT_RE.search(objective))
 
 
+def _is_create_intent(objective: str) -> bool:
+    return bool(CREATE_INTENT_RE.search(objective))
+
+
+def _is_existing_mutation_intent(objective: str) -> bool:
+    return bool(MUTATE_EXISTING_INTENT_RE.search(objective))
+
+
 def _is_skills_path(path: str) -> bool:
     return path == "/skills" or path.startswith("/skills/")
 
@@ -183,9 +214,18 @@ def _skill_editing_policy_context(objective: str, write_targets: list[str]) -> s
     )
 
 
-def _sanitize_objective_paths(objective: str) -> tuple[str, list[str], list[str]]:
-    invalid: list[str] = []
-    write_targets: list[str] = []
+def _path_suggestions(path: str, files: list[str], *, limit: int = 5) -> list[str]:
+    candidates = files + sorted({str(Path(path).parent) for path in files})
+    return get_close_matches(path, candidates, n=limit, cutoff=0.68)
+
+
+def _sanitize_objective_paths(
+    objective: str,
+    files: list[str] | None = None,
+) -> tuple[str, PathAnalysis]:
+    if files is None:
+        files = _readable_file_index()
+    analysis = PathAnalysis()
     sanitized = objective
     for raw_candidate in dict.fromkeys(VIRTUAL_PATH_RE.findall(objective)):
         candidate = _clean_path_hint(raw_candidate)
@@ -196,43 +236,100 @@ def _sanitize_objective_paths(objective: str) -> tuple[str, list[str], list[str]
         try:
             if _is_write_intent(objective):
                 validator.get_path_config(candidate, op="write")
-                write_targets.append(candidate)
+                analysis.write_targets.append(candidate)
                 continue
             _, resolved, _ = validator.get_path_config(candidate, op="read")
-        except Exception:
-            invalid.append(candidate)
+        except PathNotWritableError as exc:
+            analysis.invalid_paths.append(candidate)
+            suggestions = _path_suggestions(candidate, files)
+            analysis.terminal_issues.append(
+                PathHintIssue(
+                    path=candidate,
+                    reason=str(exc),
+                    suggestions=suggestions,
+                )
+            )
+            sanitized = sanitized.replace(candidate, _humanize_path_hint(candidate))
+            continue
+        except ValidationError as exc:
+            analysis.invalid_paths.append(candidate)
+            suggestions = _path_suggestions(candidate, files)
+            if not suggestions:
+                analysis.terminal_issues.append(
+                    PathHintIssue(
+                        path=candidate,
+                        reason=str(exc),
+                        suggestions=suggestions,
+                    )
+                )
+            sanitized = sanitized.replace(candidate, _humanize_path_hint(candidate))
+            continue
+        except Exception as exc:
+            analysis.invalid_paths.append(candidate)
+            suggestions = _path_suggestions(candidate, files)
+            if not suggestions:
+                analysis.terminal_issues.append(
+                    PathHintIssue(
+                        path=candidate,
+                        reason=str(exc),
+                        suggestions=suggestions,
+                    )
+                )
             sanitized = sanitized.replace(candidate, _humanize_path_hint(candidate))
             continue
         if not resolved.exists():
-            invalid.append(candidate)
+            analysis.invalid_paths.append(candidate)
+            suggestions = _path_suggestions(candidate, files)
+            if (
+                not suggestions
+                and not (_is_write_intent(objective) and _is_create_intent(objective))
+                and (_is_existing_mutation_intent(objective) or not _is_write_intent(objective))
+            ):
+                analysis.terminal_issues.append(
+                    PathHintIssue(
+                        path=candidate,
+                        reason=(
+                            "File not found after checking every readable file "
+                            "and considering close filename matches."
+                        ),
+                        suggestions=suggestions,
+                    )
+                )
             sanitized = sanitized.replace(candidate, _humanize_path_hint(candidate))
-    return sanitized, invalid, write_targets
+    return sanitized, analysis
 
 
-def _fs_task_prompt(objective: str) -> tuple[str, list[str], list[str]]:
-    sanitized_objective, invalid_paths, write_targets = _sanitize_objective_paths(objective)
+def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
     files = _readable_file_index()
+    sanitized_objective, analysis = _sanitize_objective_paths(objective, files)
     listed_files = files[:MAX_FS_CONTEXT_FILES]
     file_section = "\n".join(f"- {path}" for path in listed_files) or "- none"
     truncated = len(files) > len(listed_files)
     invalid_section = (
-        "\n".join(f"- {path}" for path in invalid_paths)
-        if invalid_paths
+        "\n".join(f"- {path}" for path in analysis.invalid_paths)
+        if analysis.invalid_paths
         else "- none"
     )
     write_target_section = (
-        "\n".join(f"- {path}" for path in write_targets)
-        if write_targets
+        "\n".join(f"- {path}" for path in analysis.write_targets)
+        if analysis.write_targets
         else "- none"
     )
     skill_policy_section = _skill_editing_policy_context(
         sanitized_objective,
-        write_targets,
+        analysis.write_targets,
+    )
+    report_memory = load_agent_report_summaries(current_report_dir())
+    report_section = (
+        f"Concise prior session report memory:\n{report_memory}\n\n"
+        if report_memory
+        else ""
     )
 
     prompt = (
         f"{_roots_context()}\n\n"
         f"{scan_skills_context()}\n\n"
+        f"{report_section}"
         f"{skill_policy_section}\n"
         "Readable file index (actual validator paths):\n"
         f"{file_section}\n"
@@ -247,7 +344,44 @@ def _fs_task_prompt(objective: str) -> tuple[str, list[str], list[str]]:
         "after approval.\n\n"
         f"Objective: {sanitized_objective}"
     )
-    return prompt, invalid_paths, write_targets
+    return prompt, analysis
+
+
+def _format_access_problem_report(
+    *,
+    objective: str,
+    issues: list[PathHintIssue],
+) -> str:
+    lines = [
+        "I could not complete the filesystem request because of a file access problem.",
+        "",
+        "What I checked:",
+        "- Scanned every file under the readable validator roots.",
+        "- Considered close filename/path matches for the file path mentioned by the user.",
+        f"- {_roots_context()}",
+        "",
+        "Access problem:",
+    ]
+    for issue in issues:
+        lines.append(f"- {issue.path}: {issue.reason}")
+        if issue.suggestions:
+            lines.append("  Possible intended paths: " + ", ".join(issue.suggestions))
+    lines.extend(
+        [
+            "",
+            "No further agent retry can fix this automatically. The path needs to be corrected, made readable/writable in the validator, or changed on disk.",
+        ]
+    )
+    message = "\n".join(lines)
+    write_agent_report(
+        "fs",
+        objective=objective,
+        summary=message,
+        answer=message,
+        uncertainties=[issue.reason for issue in issues],
+        paths=[issue.path for issue in issues],
+    )
+    return message
 
 
 async def run_fs_task(objective: str) -> str:
@@ -261,11 +395,16 @@ async def run_fs_task(objective: str) -> str:
     path = report_path("fs")
     if path is not None:
         _rt(f"[fs_agent] report: {path}", "dim", 1)
-    prompt, invalid_paths, write_targets = _fs_task_prompt(objective)
-    if invalid_paths:
-        _rt(f"[fs_agent] invalid path hints ignored: {invalid_paths}", "yellow", 1)
-    if write_targets:
-        _rt(f"[fs_agent] write target hints: {write_targets}", "dim", 1)
+    prompt, path_analysis = _fs_task_prompt(objective)
+    if path_analysis.invalid_paths:
+        _rt(f"[fs_agent] invalid path hints ignored: {path_analysis.invalid_paths}", "yellow", 1)
+    if path_analysis.write_targets:
+        _rt(f"[fs_agent] write target hints: {path_analysis.write_targets}", "dim", 1)
+    if path_analysis.terminal_issues:
+        return _format_access_problem_report(
+            objective=objective,
+            issues=path_analysis.terminal_issues,
+        )
 
     try:
         result = await observable_run(
@@ -277,8 +416,9 @@ async def run_fs_task(objective: str) -> str:
         )
     except Exception as exc:
         message = (
-            "Filesystem task failed before a grounded result was produced. "
-            f"Error: {exc}"
+            "I could not complete the filesystem request because of a file access problem.\n\n"
+            f"Error: {exc}\n\n"
+            "No further agent retry can fix this automatically. The path needs to be corrected, made readable/writable in the validator, or changed on disk."
         )
         _rt(f"[fs_agent] ERROR: {exc}", "red", 1)
         write_agent_report(
