@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import json
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -142,14 +143,23 @@ def _resolve_history_path(slug: str) -> Path:
     return CHAT_HISTORY_DIR / f"{slug}-{ts}.json"
 
 
+def _reset_report_dir(report_dir: Path) -> None:
+    """Start each fresh CLI session with report memory from this run only."""
+    if report_dir.exists():
+        shutil.rmtree(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+
 def _init_session_paths_from_user_text(session: ChatSession, user_text: str) -> None:
     if session.history_path is not None:
         return
     words = re.findall(r"[a-z0-9]+", user_text.lower())[:6]
     slug = _slugify("-".join(words) or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"))
-    session.session_title = slug
     session.history_path = _resolve_history_path(slug)
-    session.report_dir = REPORT_ROOT / slug
+    session.session_title = session.history_path.stem
+    session.report_dir = REPORT_ROOT / session.session_title
+    _reset_report_dir(session.report_dir)
+
 
 
 def _save_history(session: ChatSession) -> None:

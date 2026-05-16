@@ -1,5 +1,6 @@
-import re
-from typing import Any, List, Dict, Optional
+from collections.abc import Iterable
+from dataclasses import dataclass, field as dataclass_field
+from typing import Any
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -20,19 +21,42 @@ from .runtime.query_policy import (
 )
 
 from .observability import _rt, observable_run
-from .runtime.reports import current_report_dir, load_agent_report_summaries, write_agent_report
+from .runtime.reports import (
+    current_report_dir,
+    load_agent_report_summaries,
+    write_agent_report,
+)
 from tools.filesystem.text_ops import read_text_with_policy
 
 MAX_TASKS_PER_PLAN = 5
-MAX_ITERATIONS = 1
+MAX_ITERATIONS = 2
 MAX_PLAN_PREVIEW_CHARS = 4000
 
-class PlanOutput(BaseModel):
-    tasks:          List[TaskSpec]
-    initial_answer: Optional[str] = None  # set when provided preview is sufficient;
-                                           # empty tasks + this field skips research loop
 
-plan_agent = Agent(model=model, output_type=PlanOutput)
+class PlanOutput(BaseModel):
+    tasks: list[TaskSpec] = Field(default_factory=list)
+    initial_answer: str | None = None  # empty tasks + answer skips research loop
+
+
+async def run_fs_planning_context(objective: str) -> str:
+    """Gather filesystem context needed to write better TaskSpecs."""
+    from .fs_agent import run_fs_task
+
+    return await run_fs_task(objective)
+
+
+async def run_web_planning_context(objective: str) -> str:
+    """Gather web context needed to write better TaskSpecs."""
+    from .web_agent import run_web_task
+
+    return await run_web_task(objective)
+
+
+plan_agent = Agent(
+    model=model,
+    output_type=PlanOutput,
+    tools=[run_fs_planning_context, run_web_planning_context],
+)
 
 @plan_agent.system_prompt
 def _plan_prompt() -> str:
@@ -40,7 +64,22 @@ def _plan_prompt() -> str:
 You are a planning agent.
 
 You receive a research objective, resolved file paths, and optional file previews.
-You do not have filesystem tools. Use only the provided paths/previews.
+You may call specialist tools while planning when missing context would make
+the task specs guessy or incomplete.
+
+Available tools:
+  - run_fs_planning_context: local path discovery, path validation, local
+    file summaries, repo/codebase inspection, skill/document context.
+  - run_web_planning_context: current docs, selected URLs, latest facts,
+    package/API changes, arXiv/DOI lookup, or web source context.
+
+Tool rules:
+  - Call tools only for planning context needed to write good TaskSpecs.
+  - Do not call tools for work that a TaskSpec worker can retrieve directly.
+  - Do not rediscover reliable paths/URLs already provided in the prompt.
+  - If a filesystem tool reports a terminal file access problem, return an
+    initial_answer explaining that problem and no tasks.
+  - After gathering enough context, return PlanOutput.
 
 Available skills:
 {skills_prompt}
@@ -100,28 +139,23 @@ Bad task examples:
 
 class SessionState(BaseModel):
     user_query:      str
-    completed_tasks: List[str] = Field(default_factory=list)
-    findings:        List[str] = Field(default_factory=list)
-    uncertainties:   List[str] = Field(default_factory=list)
-    suggested_next_steps: List[str] = Field(default_factory=list)
-    sources:         List[str] = Field(default_factory=list)
-    confidence:      float     = 0.0
+    completed_tasks: list[str] = Field(default_factory=list)
+    findings:        list[str] = Field(default_factory=list)
+    uncertainties:   list[str] = Field(default_factory=list)
+    suggested_next_steps: list[str] = Field(default_factory=list)
+    sources:         list[str] = Field(default_factory=list)
+    confidence:      str       = "unknown"
 
 
-def _dedupe(items: List[str]) -> List[str]:
-    seen: set = set()
-    out: List[str] = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+def _dedupe(items: Iterable[str]) -> list[str]:
+    """Return items in first-seen order without duplicates."""
+    return list(dict.fromkeys(item for item in items if item))
 
 
 def _update_state(
     state:   SessionState,
-    tasks:   List[TaskSpec],
-    results: List[Dict[str, Any]],
+    tasks:   list[TaskSpec],
+    results: list[dict[str, Any]],
 ) -> None:
     for t, r in zip(tasks, results):
         state.completed_tasks.append(t.objective)
@@ -140,10 +174,10 @@ def _update_state(
 
 
 def _limit_tasks(
-    tasks:     List[TaskSpec],
-    completed: List[str],
+    tasks:     list[TaskSpec],
+    completed: list[str],
     k:         int,
-) -> List[TaskSpec]:
+) -> list[TaskSpec]:
     done = set(completed)
     return [t for t in tasks if t.objective not in done][:k]
 
@@ -153,11 +187,80 @@ def _state_summary(state: SessionState) -> str:
         f"Findings ({len(state.findings)}): {state.findings[:5]}\n"
         f"Uncertainties: {state.uncertainties[:3]}\n"
         f"Suggested next steps: {state.suggested_next_steps[:3]}\n"
-        f"Confidence: {state.confidence:.2f}"
+        f"Confidence: {state.confidence}"
     )
 
 
-def _readable_file_paths() -> List[str]:
+class PlanFileResolver:
+    """Resolve local file references for planner prompts and TaskSpecs."""
+
+    def __init__(self, all_files: list[str]):
+        """Store the readable validator file index used for matching."""
+        self.all_files = all_files
+
+    @classmethod
+    def from_validator(cls) -> "PlanFileResolver":
+        """Build a resolver from every readable validator file."""
+        return cls(_readable_file_paths())
+
+    def resolve(self, text: str, *, matched_files: list[str]) -> list[str]:
+        """Resolve explicit path fragments against readable files."""
+        candidates = _dedupe([*matched_files, *self.all_files])
+        return self._resolve_fragments(text, candidates)
+
+    def preview(self, paths: list[str]) -> str:
+        """Read short previews for planner context."""
+        unique_paths = _dedupe(paths)
+        if not unique_paths:
+            return "none"
+
+        sections = []
+        for path in unique_paths:
+            try:
+                text, _ = read_text_with_policy(validator, path)
+            except Exception as exc:
+                sections.append(f"PATH: {path}\nPREVIEW_ERROR: {exc}")
+                continue
+            sections.append(self._preview_section(path, text))
+        return "\n\n---\n\n".join(sections)
+
+    def _resolve_fragments(self, text: str, candidates: list[str]) -> list[str]:
+        """Resolve explicit slash path fragments."""
+        resolved: list[str] = []
+        for fragment in self._path_fragments(text):
+            for candidate in candidates:
+                candidate_rel = candidate.lstrip("/")
+                if candidate_rel.endswith(fragment) or candidate_rel.endswith(
+                    f"/{fragment}"
+                ):
+                    resolved.append(candidate)
+        return _dedupe(resolved)
+
+    @staticmethod
+    def _path_fragments(text: str) -> list[str]:
+        """Extract explicit slash fragments that look like file paths."""
+        fragments = []
+        for token in text.replace("`", " ").replace("'", " ").replace('"', " ").split():
+            cleaned = token.strip(".,;:!?()[]{}")
+            if "/" in cleaned and "." in cleaned:
+                fragments.append(cleaned.lstrip("/"))
+        return fragments
+
+    @staticmethod
+    def _preview_section(path: str, text: str) -> str:
+        """Format one file preview for the planner prompt."""
+        return "\n".join(
+            [
+                f"PATH: {path}",
+                f"TRUNCATED: {len(text) > MAX_PLAN_PREVIEW_CHARS}",
+                "PREVIEW:",
+                text[:MAX_PLAN_PREVIEW_CHARS],
+            ]
+        )
+
+
+def _readable_file_paths() -> list[str]:
+    """List every readable validator file as a virtual path."""
     files: set[str] = set()
     for root_virtual in validator.readable_roots:
         try:
@@ -181,310 +284,309 @@ def _readable_file_paths() -> List[str]:
 
 
 def _format_virtual_path(mount_point: str, rel: str) -> str:
+    """Join a validator mount point and relative path."""
     if mount_point == "/":
         return "/" + rel.lstrip("/")
     return f"{mount_point}/{rel.lstrip('/')}"
 
 
-def _extract_path_fragments(text: str) -> List[str]:
-    fragments = []
-    for token in text.replace("`", " ").replace("'", " ").replace('"', " ").split():
-        cleaned = token.strip(".,;:!?()[]{}")
-        if "/" in cleaned and "." in cleaned:
-            fragments.append(cleaned.lstrip("/"))
-    return fragments
+@dataclass
+class PlanNormalizer:
+    """Repair planner output into executable TaskSpecs."""
 
+    objective: str
+    matched_files: list[str]
+    as_of: str
+    resolver: PlanFileResolver
+    objective_urls: list[str] = dataclass_field(init=False)
+    objective_arxiv_ids: list[str] = dataclass_field(init=False)
+    objective_files: list[str] = dataclass_field(init=False)
 
-def _query_terms(text: str) -> set[str]:
-    stop = {
-        "a", "an", "and", "are", "check", "file", "for", "in", "it", "me",
-        "of", "out", "read", "summarize", "summary", "the", "to", "with",
-        "doc", "docs", "document", "documents", "skill", "skills",
-        "md", "markdown", "txt", "json", "yaml", "yml", "py",
-    }
-    return {
-        term
-        for term in re.findall(r"[a-z0-9]+", text.lower())
-        if len(term) >= 3 and term not in stop
-    }
-
-
-def _resolve_file_references(
-    text: str,
-    *,
-    matched_files: List[str],
-    all_files: List[str],
-) -> List[str]:
-    resolved: list[str] = []
-    candidates = _dedupe([*matched_files, *all_files])
-
-    for fragment in _extract_path_fragments(text):
-        for candidate in candidates:
-            candidate_rel = candidate.lstrip("/")
-            if candidate_rel.endswith(fragment) or candidate_rel.endswith("/" + fragment):
-                resolved.append(candidate)
-
-    if resolved:
-        return _dedupe(resolved)
-
-    terms = _query_terms(text)
-    if not terms:
-        return []
-
-    for candidate in candidates:
-        path_terms = set(re.findall(r"[a-z0-9]+", candidate.lower()))
-        if terms & path_terms:
-            resolved.append(candidate)
-
-    return _dedupe(resolved)
-
-
-def _build_plan_file_context(paths: List[str]) -> str:
-    unique_paths = _dedupe(paths)
-    if not unique_paths:
-        return "none"
-
-    sections = []
-    for path in unique_paths:
-        try:
-            text, _ = read_text_with_policy(validator, path)
-        except Exception as exc:
-            sections.append(f"PATH: {path}\nPREVIEW_ERROR: {exc}")
-            continue
-
-        truncated = len(text) > MAX_PLAN_PREVIEW_CHARS
-        preview = text[:MAX_PLAN_PREVIEW_CHARS]
-        sections.append(
-            "\n".join(
-                [
-                    f"PATH: {path}",
-                    f"TRUNCATED: {truncated}",
-                    "PREVIEW:",
-                    preview,
-                ]
-            )
+    def __post_init__(self) -> None:
+        """Resolve objective-level structural signals once."""
+        self.objective_urls = extract_urls(self.objective)
+        self.objective_arxiv_ids = extract_arxiv_ids(self.objective)
+        self.objective_files = self.resolver.resolve(
+            self.objective,
+            matched_files=self.matched_files,
         )
-    return "\n\n---\n\n".join(sections)
+
+    def normalize(self, plan_output: PlanOutput) -> PlanOutput:
+        """Return a normalized plan without relying on model consistency."""
+        if plan_output.initial_answer and not plan_output.tasks:
+            if self._objective_requires_tasks():
+                plan_output = plan_output.model_copy(update={"initial_answer": None})
+            else:
+                return plan_output.model_copy(update={"tasks": []})
+
+        planner_tasks = [
+            self._normalize_task(task)
+            for task in plan_output.tasks[:MAX_TASKS_PER_PLAN]
+        ]
+        required_tasks = self._required_tasks(planner_tasks)
+        open_slots = max(0, MAX_TASKS_PER_PLAN - len(required_tasks))
+        tasks = [*required_tasks, *planner_tasks[:open_slots]]
+
+        if not tasks:
+            tasks.append(self._fallback_task())
+        return plan_output.model_copy(update={"tasks": tasks[:MAX_TASKS_PER_PLAN]})
+
+    def _normalize_task(self, raw_task: TaskSpec) -> TaskSpec:
+        """Resolve files and fill TaskSpec defaults for one task."""
+        task_text = " ".join(
+            [raw_task.objective, raw_task.query or "", *raw_task.relevant_files]
+        )
+        task_files = self.resolver.resolve(
+            task_text,
+            matched_files=self.matched_files,
+        )
+        files = _dedupe(task_files)
+        kind = self._task_kind(raw_task, files)
+        if kind == TaskKind.LOCAL_RAG and not files:
+            files = _dedupe([*self.matched_files, *self.objective_files])
+        requires_current = raw_task.requires_current_info or kind == TaskKind.WEB_SEARCH
+        return raw_task.model_copy(
+            update={
+                "kind": kind,
+                "query": raw_task.query or raw_task.objective,
+                "relevant_files": files,
+                "requires_current_info": requires_current,
+                "as_of": raw_task.as_of or self.as_of,
+                "user_prompt": raw_task.user_prompt or self.objective,
+            }
+        )
+
+    def _task_kind(self, raw_task: TaskSpec, files: list[str]) -> TaskKind:
+        """Choose the retrieval route after file resolution."""
+        if files:
+            return TaskKind.LOCAL_RAG
+        return raw_task.kind or infer_task_kind(raw_task.objective, matched_files=files)
+
+    def _required_tasks(self, tasks: list[TaskSpec]) -> list[TaskSpec]:
+        """Build structural local, URL, or arXiv tasks omitted by the planner."""
+        required: list[TaskSpec] = []
+        local_files = _dedupe([*self.matched_files, *self.objective_files])
+        if local_files and not self._has_kind(tasks, TaskKind.LOCAL_RAG):
+            required.append(
+                TaskSpec(
+                    kind=TaskKind.LOCAL_RAG,
+                    objective=(
+                        "Search the provided local files for evidence relevant to: "
+                        f"{self.objective}"
+                    ),
+                    query=self.objective,
+                    relevant_files=local_files,
+                    requires_current_info=False,
+                    as_of=self.as_of,
+                    user_prompt=self.objective,
+                )
+            )
+
+        if self.objective_urls and not self._has_kind(tasks, TaskKind.URL_CRAWL):
+            required.append(
+                TaskSpec(
+                    kind=TaskKind.URL_CRAWL,
+                    objective=(
+                        "Crawl and retrieve evidence from the user-provided URL(s): "
+                        f"{self.objective}"
+                    ),
+                    query=self.objective,
+                    urls=self.objective_urls,
+                    requires_current_info=False,
+                    as_of=self.as_of,
+                    user_prompt=self.objective,
+                )
+            )
+
+        if self.objective_arxiv_ids and not self._has_kind(tasks, TaskKind.ARXIV):
+            required.append(
+                TaskSpec(
+                    kind=TaskKind.ARXIV,
+                    objective=(
+                        "Fetch and retrieve evidence for the arXiv paper(s): "
+                        f"{self.objective}"
+                    ),
+                    query=self.objective,
+                    requires_current_info=False,
+                    as_of=self.as_of,
+                    user_prompt=self.objective,
+                )
+            )
+        return required
+
+    def _fallback_task(self) -> TaskSpec:
+        """Create one task when the planner returned no usable work."""
+        local_files = _dedupe([*self.matched_files, *self.objective_files])
+        kind = infer_task_kind(self.objective, matched_files=self.matched_files)
+        return TaskSpec(
+            kind=kind,
+            objective=self.objective,
+            query=self.objective,
+            urls=self.objective_urls,
+            relevant_files=local_files,
+            requires_current_info=kind == TaskKind.WEB_SEARCH,
+            as_of=self.as_of,
+            user_prompt=self.objective,
+        )
+
+    def _objective_requires_tasks(self) -> bool:
+        """Return true for objectives unsafe to answer from planner text alone."""
+        kind = infer_task_kind(self.objective, matched_files=self.matched_files)
+        return (
+            kind == TaskKind.WEB_SEARCH
+            or bool(self.objective_urls)
+            or bool(self.objective_arxiv_ids)
+        )
+
+    @staticmethod
+    def _has_kind(tasks: list[TaskSpec], kind: TaskKind) -> bool:
+        """Check whether a task list already contains a route kind."""
+        return any(task.kind == kind for task in tasks)
 
 
 def _normalize_plan(
     plan_output: PlanOutput,
     *,
     objective: str,
-    matched_files: List[str],
+    matched_files: list[str],
     as_of: str,
 ) -> PlanOutput:
     """Repair planner omissions that small local models commonly make."""
-    objective_urls = extract_urls(objective)
-    objective_arxiv_ids = extract_arxiv_ids(objective)
-    all_files = _readable_file_paths()
-    objective_files = _resolve_file_references(
+    return PlanNormalizer(
         objective,
         matched_files=matched_files,
-        all_files=all_files,
+        as_of=as_of,
+        resolver=PlanFileResolver.from_validator(),
+    ).normalize(plan_output)
+
+
+def _needs_reflect(state: SessionState, results: list[dict[str, Any]]) -> bool:
+    """Decide whether reflection is needed after a worker batch."""
+    return (
+        any(r.get("status") == "failed" for r in results)
+        or bool(state.suggested_next_steps)
+        or (bool(state.uncertainties) and not state.findings)
     )
 
-    normalized_tasks: list[TaskSpec] = []
-    for raw_task in plan_output.tasks[:MAX_TASKS_PER_PLAN]:
-        task_files = _resolve_file_references(
-            " ".join([raw_task.objective, raw_task.query or "", *raw_task.relevant_files]),
+
+def _record_reflection_uncertainty(
+    state: SessionState,
+    *,
+    confidence: str,
+    objective_complete: bool,
+    reason: str,
+) -> None:
+    """Record why the plan stopped without a confident reflection pass."""
+    notes: list[str] = []
+    if confidence != "high":
+        notes.append(f"Reflection confidence was {confidence}.")
+    if not objective_complete:
+        notes.append("Reflection did not mark the objective complete.")
+    notes.append(reason)
+    state.uncertainties.append(" ".join(notes))
+    state.uncertainties = _dedupe(state.uncertainties)
+
+
+@dataclass
+class PlannerInput:
+    """Prepared prompt context for the planner model."""
+
+    objective: str
+    matched_files: list[str]
+    file_paths: list[str]
+    file_context: str
+    resolver: PlanFileResolver
+
+    @classmethod
+    def build(cls, objective: str, matched_files: list[str]) -> "PlannerInput":
+        """Resolve known local context before planner tool calls."""
+        resolver = PlanFileResolver.from_validator()
+        objective_files = resolver.resolve(objective, matched_files=matched_files)
+        file_paths = _dedupe([*matched_files, *objective_files])
+        return cls(
+            objective=objective,
             matched_files=matched_files,
-            all_files=all_files,
-        )
-        files = _dedupe(task_files)
-        if files:
-            kind = TaskKind.LOCAL_RAG
-        elif objective_files and raw_task.kind == TaskKind.WEB_SEARCH and not raw_task.requires_current_info:
-            files = objective_files
-            kind = TaskKind.LOCAL_RAG
-        else:
-            kind = raw_task.kind or infer_task_kind(raw_task.objective, matched_files=files)
-        task = raw_task.model_copy(
-            update={
-                "kind": kind,
-                "query": raw_task.query or raw_task.objective,
-                "relevant_files": files,
-                "requires_current_info": raw_task.requires_current_info,
-                "as_of": raw_task.as_of or as_of,
-                "user_prompt": raw_task.user_prompt or objective,
-            }
-        )
-        normalized_tasks.append(task)
-
-    kinds = {task.kind for task in normalized_tasks}
-    local_files = _dedupe([*matched_files, *objective_files])
-
-    if local_files and TaskKind.LOCAL_RAG not in kinds:
-        normalized_tasks.append(
-            TaskSpec(
-                kind=TaskKind.LOCAL_RAG,
-                objective=f"Search the provided local files for evidence relevant to: {objective}",
-                query=objective,
-                relevant_files=local_files,
-                requires_current_info=False,
-                as_of=as_of,
-                user_prompt=objective,
-            )
+            file_paths=file_paths,
+            file_context=resolver.preview(file_paths),
+            resolver=resolver,
         )
 
-    if objective_urls and TaskKind.URL_CRAWL not in kinds:
-        normalized_tasks.append(
-            TaskSpec(
-                kind=TaskKind.URL_CRAWL,
-                objective=f"Crawl and retrieve evidence from the user-provided URL(s): {objective}",
-                query=objective,
-                urls=objective_urls,
-                requires_current_info=False,
-                as_of=as_of,
-                user_prompt=objective,
-            )
+    def render_prompt(self) -> str:
+        """Render the model prompt for plan_agent."""
+        return (
+            f"Objective: {self.objective}\n"
+            f"Resolved file paths: {self.file_paths or 'none'}\n"
+            f"File previews:\n{self.file_context}"
         )
 
-    if objective_arxiv_ids and TaskKind.ARXIV not in kinds:
-        normalized_tasks.append(
-            TaskSpec(
-                kind=TaskKind.ARXIV,
-                objective=f"Fetch and retrieve evidence for the arXiv paper(s): {objective}",
-                query=objective,
-                requires_current_info=False,
-                as_of=as_of,
-                user_prompt=objective,
-            )
-        )
 
-    if not normalized_tasks and not plan_output.initial_answer:
-        normalized_tasks.append(
-            TaskSpec(
-                kind=infer_task_kind(objective, matched_files=matched_files),
-                objective=objective,
-                query=objective,
-                urls=objective_urls,
-                relevant_files=local_files,
-                requires_current_info=False,
-                as_of=as_of,
-                user_prompt=objective,
-            )
-        )
-
-    plan_output.tasks = normalized_tasks[:MAX_TASKS_PER_PLAN]
-
-    return plan_output
-
-
-def _needs_reflect(state: SessionState, results: List[Dict[str, Any]]) -> bool:
-    if any(r.get("status") == "failed" for r in results):
-        return True
-    if state.suggested_next_steps:
-        return True
-    if state.uncertainties and not state.findings:
-        return True
-    return False
-
-
-async def _run_plan_workflow_internal(objective: str, matched_files: List[str]) -> str:
-    """
-    Execute a research task that requires web access or local file content.
-
-    Call this whenever the user's intent involves ANY of:
-      - Searching the web for current or updated information
-      - Fetching or summarising a specific URL or web page
-      - Reading or analysing local files (pass resolved paths from list_files)
-      - arXiv or academic paper lookup
-      - Comparing, reporting, or synthesising across multiple sources
-
-    Do NOT call for questions answerable directly from conversation history
-    or general knowledge (greetings, math, coding snippets, opinions).
-
-    Args:
-        objective:     Full research objective in plain English. Include any
-                       specific URLs, date constraints, or output format the
-                       user requested.
-        matched_files: Absolute file paths resolved via list_files. Pass []
-                       for web-only tasks. Never pass guessed or partial paths.
-
-    Returns:
-        A plain-text research report to weave into your reply.
-    """
-
-    _rt(f"[plan_workflow] objective: {objective[:80]}", "yellow")
-    state = SessionState(user_query=objective)
-
-    _rt("[plan_agent] running ...", "dim")
-    as_of = _now()
-    all_files = _readable_file_paths()
-    objective_files = _resolve_file_references(
-        objective,
-        matched_files=matched_files,
-        all_files=all_files,
-    )
-    plan_file_paths = _dedupe([*matched_files, *objective_files])
-    plan_file_context = _build_plan_file_context(plan_file_paths)
-
+async def _run_planner(prompt: str) -> PlanOutput:
+    """Run plan_agent and validate its structured output."""
     plan_result = await observable_run(
         plan_agent,
-        (
-            f"Objective: {objective}\n"
-            f"Resolved file paths: {plan_file_paths or 'none'}\n"
-            f"File previews:\n{plan_file_context}"
-        ),
+        prompt,
         label="plan_agent",
         indent=1,
     )
-    plan_output = _normalize_plan(
-        plan_result.output,
-        objective=objective,
-        matched_files=matched_files,
+    if not isinstance(plan_result.output, PlanOutput):
+        raise RuntimeError(
+            f"plan_agent returned unexpected output: {type(plan_result.output).__name__}"
+        )
+    return plan_result.output
+
+
+async def _try_initial_answer(
+    *,
+    objective: str,
+    as_of: str,
+    state: SessionState,
+    plan_output: PlanOutput,
+    time_sensitive: bool,
+) -> str | None:
+    """Synthesize immediately when file previews fully answered the objective."""
+    if not plan_output.initial_answer or plan_output.tasks:
+        return None
+
+    _rt(
+        "[plan_agent] answered directly from file preview — skipping research loop",
+        "green",
+    )
+    state.findings = [plan_output.initial_answer]
+    return await run_synthesis_worker(
+        question=objective,
         as_of=as_of,
+        time_sensitive=time_sensitive,
+        findings=state.findings,
+        uncertainties=state.uncertainties,
+        sources=state.sources,
     )
 
-    # Guard: plan_agent returned nothing useful
-    if not plan_output.tasks and not plan_output.initial_answer:
-        _rt("[plan_agent] returned empty output — falling back to single web task", "yellow")
-        plan_output.tasks = [
-            TaskSpec(
-                kind=infer_task_kind(objective, matched_files=matched_files),
-                objective=objective,
-                query=objective,
-                relevant_files=matched_files,
-                requires_current_info=False,
-                as_of=as_of,
-                user_prompt=objective,
-            )
-        ]
-    time_sensitive = any(task.requires_current_info for task in plan_output.tasks)
-    # plan_agent answered directly from file preview — skip research loop
-    if plan_output.initial_answer and not plan_output.tasks and matched_files:
-        _rt("[plan_agent] answered directly from file preview — skipping research loop", "green")
-        state.findings = [plan_output.initial_answer]
 
-        return await run_synthesis_worker(
-            question=objective,
-            as_of=as_of,
-            time_sensitive=time_sensitive,
-            findings=state.findings,
-            uncertainties=state.uncertainties,
-            sources=state.sources,
-        )
-    else:
-        # heuristic: no files = web task
-        if plan_output.initial_answer and not matched_files:
-            _rt("[plan_agent] ignored initial_answer for web objective — forcing tasks", "yellow")
-            # Discard the premature answer and fall through to workers
-            plan_output.initial_answer = None
-
+async def _run_research_loop(
+    *,
+    objective: str,
+    matched_files: list[str],
+    as_of: str,
+    state: SessionState,
+    tasks: list[TaskSpec],
+) -> bool:
+    """Run worker batches and optional reflection until evidence is sufficient."""
+    used_current_info = False
     state_plan = _limit_tasks(
-        plan_output.tasks,
+        tasks,
         state.completed_tasks,
         MAX_TASKS_PER_PLAN,
     )
-
     _rt(f"[plan_agent] spawning {len(state_plan)} tasks", "yellow")
 
     for iteration in range(MAX_ITERATIONS):
         if not state_plan:
             break
-        batch   = state_plan[:MAX_PARALLEL_TASKS]
-        
+        batch = state_plan[:MAX_PARALLEL_TASKS]
+        used_current_info = used_current_info or any(
+            task.requires_current_info for task in batch
+        )
+
         _rt(f"[loop iter={iteration+1}] running {len(batch)} workers in parallel", "cyan")
         results = await _run_workers_limited(batch)
         _update_state(state, batch, results)
@@ -493,7 +595,10 @@ async def _run_plan_workflow_internal(objective: str, matched_files: List[str]) 
             _rt("[reflect] skipped — deterministic completion criteria met", "green")
             break
 
-        _rt(f"[reflect] assessing completeness (confidence so far: {state.confidence:.2f})", "dim")
+        _rt(
+            f"[reflect] assessing completeness (confidence so far: {state.confidence})",
+            "dim",
+        )
 
         reflect = await run_reflect_worker(
             objective=objective,
@@ -502,13 +607,40 @@ async def _run_plan_workflow_internal(objective: str, matched_files: List[str]) 
             indent=1,
         )
         state.confidence = reflect.confidence
-        _rt(f"[reflect] complete={reflect.objective_complete} confidence={state.confidence:.2f}", "dim")
-        
-        if reflect.objective_complete and state.findings:
+        _rt(
+            f"[reflect] complete={reflect.objective_complete} confidence={state.confidence}",
+            "dim",
+        )
+
+        confident = reflect.confidence == "high"
+        if reflect.objective_complete and state.findings and confident:
             _rt("[reflect] objective complete — moving to synthesis", "green")
             break
         if reflect.objective_complete and not state.findings:
             _rt("[reflect] ignored complete=true because no findings were collected", "yellow")
+        if not confident:
+            _rt(
+                f"[reflect] confidence {reflect.confidence} — looking for follow-up work",
+                "yellow",
+            )
+
+        if iteration + 1 >= MAX_ITERATIONS:
+            _record_reflection_uncertainty(
+                state,
+                confidence=reflect.confidence,
+                objective_complete=reflect.objective_complete,
+                reason="No planning iterations remain.",
+            )
+            break
+
+        if not reflect.next_tasks:
+            _record_reflection_uncertainty(
+                state,
+                confidence=reflect.confidence,
+                objective_complete=reflect.objective_complete,
+                reason="Reflection returned no follow-up tasks.",
+            )
+            break
 
         follow_up = _normalize_plan(
             PlanOutput(tasks=reflect.next_tasks),
@@ -516,27 +648,80 @@ async def _run_plan_workflow_internal(objective: str, matched_files: List[str]) 
             matched_files=matched_files,
             as_of=as_of,
         )
-
         state_plan = _limit_tasks(
             follow_up.tasks,
             state.completed_tasks,
             MAX_TASKS_PER_PLAN,
         )
+        if not state_plan:
+            _record_reflection_uncertainty(
+                state,
+                confidence=reflect.confidence,
+                objective_complete=reflect.objective_complete,
+                reason="Reflection follow-up tasks were already completed.",
+            )
+            break
         _rt(f"[reflect] spawning {len(state_plan)} follow-up tasks", "yellow")
-    
+
+    return used_current_info
+
+
+def _failed_research_report(state: SessionState) -> str:
+    """Explain that all retrieval or extraction work failed."""
+    attempted = "\n".join(f"- {task}" for task in state.completed_tasks) or "- none"
+    uncertainties = (
+        "\n".join(f"- {u}" for u in state.uncertainties)
+        or "- no evidence retrieved"
+    )
+    return (
+        "I couldn't produce a grounded summary because every retrieval/extraction task failed "
+        "or returned no findings.\n\n"
+        f"Attempted tasks:\n{attempted}\n\n"
+        f"Errors / uncertainties:\n{uncertainties}"
+    )
+
+
+async def _run_plan_workflow_internal(objective: str, matched_files: list[str]) -> str:
+    """Execute a complex research task with planning, workers, and synthesis."""
+    _rt(f"[plan_workflow] objective: {objective[:80]}", "yellow")
+    state = SessionState(user_query=objective)
+    as_of = _now()
+
+    _rt("[plan_agent] running ...", "dim")
+    planner_input = PlannerInput.build(objective, matched_files)
+    raw_plan = await _run_planner(planner_input.render_prompt())
+    plan_output = PlanNormalizer(
+        objective=objective,
+        matched_files=matched_files,
+        as_of=as_of,
+        resolver=planner_input.resolver,
+    ).normalize(raw_plan)
+
+    time_sensitive = any(task.requires_current_info for task in plan_output.tasks)
+    initial_report = await _try_initial_answer(
+        objective=objective,
+        as_of=as_of,
+        state=state,
+        plan_output=plan_output,
+        time_sensitive=time_sensitive,
+    )
+    if initial_report is not None:
+        return initial_report
+
+    loop_time_sensitive = await _run_research_loop(
+        objective=objective,
+        matched_files=matched_files,
+        as_of=as_of,
+        state=state,
+        tasks=plan_output.tasks,
+    )
+    time_sensitive = time_sensitive or loop_time_sensitive
+
     if not state.findings:
         _rt("[synthesis] skipped — no findings collected", "yellow")
-        attempted = "\n".join(f"- {task}" for task in state.completed_tasks) or "- none"
-        uncertainties = "\n".join(f"- {u}" for u in state.uncertainties) or "- no evidence retrieved"
-        return (
-            "I couldn't produce a grounded summary because every retrieval/extraction task failed "
-            "or returned no findings.\n\n"
-            f"Attempted tasks:\n{attempted}\n\n"
-            f"Errors / uncertainties:\n{uncertainties}"
-        )
+        return _failed_research_report(state)
 
     _rt("[synthesis] generating final report ...", "dim")
-
     report = await run_synthesis_worker(
         question=objective,
         as_of=as_of,

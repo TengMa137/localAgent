@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Literal, Optional, TypeVar
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field, model_validator
@@ -31,6 +31,7 @@ MAX_PARALLEL_TASKS = 3
 MAX_TOOL_CALLS = 10
 MAX_EVIDENCE_ITEMS = 6
 T = TypeVar("T", bound=BaseModel)
+ConfidenceLevel = Literal["low", "high"]
 
 class TaskSpec(BaseModel):
     objective:              str
@@ -72,15 +73,33 @@ class WorkerOutput(BaseModel):
 
 class ReflectionOutput(BaseModel):
     objective_complete: bool
-    confidence:         float
+    confidence:         ConfidenceLevel
     next_tasks:         List[TaskSpec]
 
     @model_validator(mode="before")
     @classmethod
-    def coerce_none_lists(cls, values: Any) -> Any:
-        if isinstance(values, dict) and values.get("next_tasks") is None:
+    def coerce_fields(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        if values.get("next_tasks") is None:
             values["next_tasks"] = []
+        values["confidence"] = cls._coerce_confidence(values.get("confidence"))
         return values
+
+    @staticmethod
+    def _coerce_confidence(value: Any) -> ConfidenceLevel:
+        """Accept old numeric confidence while keeping the model schema simple."""
+        if isinstance(value, bool):
+            return "high" if value else "low"
+        if isinstance(value, (int, float)):
+            return "high" if value >= 0.5 else "low"
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"high", "confident", "sufficient", "true", "1"}:
+                return "high"
+            if normalized in {"low", "uncertain", "insufficient", "false", "0"}:
+                return "low"
+        return "low"
 
 
 class SynthesisOutput(BaseModel):
@@ -116,9 +135,15 @@ REFLECT_SYSTEM_PROMPT = """
 Given current findings and uncertainties decide:
 
   - objective_complete: true if the question can be answered confidently
-  - confidence: 0.0 to 1.0
+  - confidence: "high" or "low"
   - next_tasks: concrete follow-ups if incomplete; empty if done
 
+Use confidence="high" only when the available evidence is enough to answer the
+objective. Use confidence="low" when important evidence is missing, ambiguous,
+stale, failed, or only partially relevant.
+If confidence="low", set objective_complete=false unless the evidence fully
+answers the objective despite minor caveats. Provide next_tasks whenever more
+retrieval could materially improve confidence.
 Avoid repeating tasks already listed as completed.
 """
 

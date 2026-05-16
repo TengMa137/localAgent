@@ -52,7 +52,6 @@ from typing import List, Optional
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelRequest
-from pydantic_ai import ModelRetry
 from pydantic_ai.tools import DeferredToolRequests, RunContext
 
 from .fs_agent import run_fs_task as _run_fs_task
@@ -83,6 +82,13 @@ class OrchestratorResponse(BaseModel):
 
 
 _tool_run_cache: dict[str, list[tuple[str, str, str, bool]]] = {}
+
+ORCHESTRATOR_DUPLICATE_MESSAGE = (
+    "Duplicate specialist call blocked: this specialist already ran with the "
+    "same objective in this turn. Answer the user from the prior specialist "
+    "result below, or call a different specialist only for a distinct missing "
+    "information need."
+)
 
 
 def _normalize_objective(text: str) -> str:
@@ -132,15 +138,10 @@ async def _run_specialist_once(
             "yellow",
         )
         message = (
-            f"Duplicate specialist call blocked: {tool_name} already ran with "
-            "the same objective in this turn. Rethink the next step. Either "
-            "answer the user from the prior result below, or call a different "
-            "specialist tool only if a distinct missing information need remains.\n\n"
+            f"{ORCHESTRATOR_DUPLICATE_MESSAGE}\n\n"
             f"Prior {tool_name} result:\n{prior_result}"
         )
-        if prior_failed:
-            return message
-        raise ModelRetry(message)
+        return message
 
     _rt(f"[orchestrator] specialist route: {tool_name}", "yellow")
     result = await runner(objective)
@@ -155,9 +156,10 @@ async def _run_specialist_once(
         )
     return (
         f"{result}\n\n"
-        "Specialist tool call complete. You may call another specialist only "
-        "for a distinct missing information need. Do not repeat this same tool "
-        "with the same objective."
+        "Specialist tool call complete. If the result includes a forwardable "
+        "answer, use that answer directly in your reply. You may call another "
+        "specialist only for a distinct missing information need. Do not repeat "
+        "this same tool with the same objective."
     )
 
 
@@ -261,17 +263,29 @@ Intent classification:
     a wrong plan. Ask exactly one focused question. Do not use this as an
     excuse to avoid research.
 
-  fs — required when the user names a file/path/extension, asks about local
-    files, asks to read/edit/write/search local content, or refers to "my files"
-    or "the document".
+  fs — use when the request is local-file activity. Strong signals include:
+    exact validator paths, slash-like paths, filenames with known suffixes
+    such as .py/.md/.json/.yaml/.toml/.txt/.pdf, directory names, "my files",
+    "local files", "repo", "codebase", "document", "skill", or requests to
+    find/read/edit/write/search/summarize local content. The user may want
+    local files even without naming an exact path; be sensitive to that.
+    Use fs_agent for path validation/discovery when a user-supplied path or
+    filename is important and may be wrong.
 
-  web — required when the user asks for current/recent/latest information,
-    provides URLs, requests web search/crawl, mentions arXiv/DOI/paper lookup,
-    or asks about specific modern people/companies/events that may have changed.
+  web — use when you are confident the task needs network/current/web access:
+    current/recent/latest/today pricing or facts, user-provided URLs, explicit
+    web search/crawl requests, arXiv/DOI/paper lookup, or modern entities/events
+    whose answer may have changed. Be more conservative with web than fs:
+    do not search the web merely because outside information might be helpful.
+    Use web_agent when web access is required to answer correctly.
 
-  plan — required for complex tasks with multiple independent subtasks,
-    comparisons across local+web context, reports, or requests that need several
-    fs/web/worker steps.
+  plan — use when the objective is complex enough to need decomposition:
+    multiple independent subtasks, local+web synthesis, comparisons, reports,
+    audits, investigations, or anything likely to require more than one round
+    of specialist calls. The planning workflow can refine the objective,
+    divide work, and acquire missing local/web context while planning. If prior
+    chat or reports already contain reliable paths/URLs, include them in the
+    plan objective.
 
 Direct and clarify:
   Reply immediately in the reply field. Do not call any tools.
@@ -282,10 +296,19 @@ Tool routing:
     Pass local-file wording verbatim; do not invent paths.
   - Use run_web_task for web/current/URL/arXiv objectives. The web agent
     searches/crawls and deterministically searches RAG over fetched content.
-  - Use run_plan_workflow for complex multi-step objectives.
-  - After a tool returns, write the final reply from that result. Do not call
-    another tool unless the first result explicitly says required information
-    is missing and the next tool is necessary.
+  - Use run_plan_workflow for complex multi-step objectives. Do not pre-call
+    fs/web only to make the plan cleaner; pass known reliable paths/URLs from
+    history or reports, and let the planning workflow handle missing context.
+  - You may call fs_agent and web_agent in the same turn when both are clearly
+    needed and the two needs are independent enough that one round of specialist
+    results should answer the user.
+  - After one round of specialist calls, answer from those results. If you
+    receive a specialist result with "Forwardable answer", use that answer
+    directly as the user reply unless you must add a brief caveat from the
+    specialist notes. Do not re-summarize a good specialist answer.
+  - If you would need another round to refine, split, compare, or recover
+    missing context, call run_plan_workflow for the original complex objective
+    instead of chaining specialist calls manually.
   - If a filesystem tool result says there is a file access problem or that no
     further agent retry can fix it automatically, return that markdown report
     to the user. Do not route to plan_workflow or start a repair loop for the

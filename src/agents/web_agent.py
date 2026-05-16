@@ -53,9 +53,39 @@ so include the practical result, not just a status label.
 )
 
 
+def _dedupe(items: List[str]) -> List[str]:
+    """Return items in first-seen order without duplicates."""
+    return list(dict.fromkeys(item for item in items if item))
+
+
+def _format_orchestrator_response(output: WebAgentResult) -> str:
+    """Format a compact web_agent handoff for the orchestrator history."""
+    notes: list[str] = [f"Summary: {output.summary.strip() or 'No summary returned.'}"]
+    if output.search_queries:
+        notes.append("Search queries: " + ", ".join(_dedupe(output.search_queries)))
+    if output.urls:
+        notes.append("Sources: " + ", ".join(_dedupe(output.urls)))
+    if output.findings:
+        notes.append(f"Detailed findings in web-report.md: {len(output.findings)} item(s)")
+    if output.uncertainties:
+        notes.append("Uncertainties: " + "; ".join(_dedupe(output.uncertainties)))
+
+    return "\n\n".join(
+        [
+            "Forwardable answer:\n"
+            f"{(output.answer or output.summary).strip() or 'No answer returned.'}",
+            "Orchestrator notes:\n" + "\n".join(f"- {note}" for note in notes),
+        ]
+    )
+
+
 async def run_web_task(objective: str) -> str:
     """
     Run one web/current-info task, then search RAG over crawled web documents.
+
+    Use from orchestrator or plan_agent when URL crawl, current information,
+    current docs, package/API changes, arXiv/DOI lookup, or web source
+    selection is needed. Crawled content is indexed into the shared RAG store.
     """
     report_memory = load_agent_report_summaries(current_report_dir())
     prompt = f"Objective: {objective}"
@@ -93,18 +123,4 @@ async def run_web_task(objective: str) -> str:
         uncertainties=output.uncertainties,
     )
 
-    sections = [output.answer or output.summary]
-    if output.answer and output.summary and output.answer.strip() != output.summary.strip():
-        sections.append(f"Summary:\n{output.summary}")
-    if output.findings:
-        sections.append(
-            "Findings:\n" + "\n".join(f"- {item}" for item in output.findings)
-        )
-    if output.urls:
-        sections.append("Sources:\n" + "\n".join(f"- {url}" for url in output.urls))
-    if output.uncertainties:
-        sections.append(
-            "Uncertainties:\n"
-            + "\n".join(f"- {item}" for item in output.uncertainties)
-        )
-    return "\n\n".join(sections)
+    return _format_orchestrator_response(output)

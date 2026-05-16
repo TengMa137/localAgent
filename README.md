@@ -260,9 +260,14 @@ The orchestrator does not call RAG directly; RAG is infrastructure used by fs/we
 
 ### plan_agent
 
-A one-shot agent used by `run_plan_workflow` for complex tasks. It receives the objective and
-available context, then decomposes the work into up to `MAX_TASKS_PER_PLAN` independent
-`TaskSpec` objects for the worker pool.
+`run_plan_workflow` handles complex tasks after the orchestrator chooses the plan route.
+`plan_agent` receives the objective, resolved file paths, and file previews. During its own
+planning run it may call bounded `fs_agent` and `web_agent` tools for missing local path/file
+context or URL/current-info context. Known reliable paths and URLs passed by the orchestrator
+from chat history or prior reports are included up front so they do not need to be rediscovered.
+
+After any needed specialist tool calls, `plan_agent` decomposes the work into up to
+`MAX_TASKS_PER_PLAN` independent `TaskSpec` objects for the worker pool.
 
 After the model returns, Python normalizes the plan:
 
