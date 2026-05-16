@@ -5,11 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "argon2-cffi>=25.1.0",
+    "fastapi>=0.124.0",
     "pydantic>=2.12.5",
     "pydantic-ai>=1.39.1",
     "pydantic-ai-slim[fastmcp,openai]>=1.39.1",
+    "pydantic-settings>=2.13.1",
+    "python-multipart>=0.0.21",
     "rag-lib",
     "sounddevice>=0.5.5",
+    "uvicorn[standard]>=0.38.0",
 ]
 
 [build-system]
@@ -20,7 +25,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.uv.sources]
-rag-lib = { path = "../rag_lib", editable = true }
+rag-lib = { path = "../../rag_lib", editable = true }
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

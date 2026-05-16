@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en"><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Local Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="assets/styles.css?v=admin-role-filter-removed-20260518">
+  </head>
+  <body>
+
+    <!-- LOGIN -->
+    <main id="login-view" class="login-shell" hidden="">
+      <div class="login-backdrop"></div>
+      <form id="login-form" class="login-panel">
+        <div class="login-logo">
+          <span class="logo-mark" aria-hidden="true">
+            <img class="logo-asset" src="assets/electric-brain-logo.png" alt="">
+          </span>
+          <span class="logo-wordmark">Local Agent</span>
+        </div>
+        <p class="login-tagline">Secure. Local. Intelligent.</p>
+        <div class="field-group">
+          <label for="login-username">Username</label>
+          <input id="login-username" name="username" autocomplete="username" required="" placeholder="username">
+        </div>
+        <div class="field-group">
+          <label for="login-password">Password</label>
+          <input id="login-password" name="password" type="password" autocomplete="current-password" required="" placeholder="••••••••">
+        </div>
+        <div class="login-actions">
+          <button type="submit" class="btn-primary">Sign in</button>
+          <button id="register-button" type="button" class="btn-ghost">Register</button>
+        </div>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </main>
+
+    <!-- APP -->
+    <main id="app-view" class="app-shell" hidden="">
+
+      <!-- SIDEBAR -->
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <button id="sidebar-logo-trigger" class="logo-mark sm sidebar-logo-button" type="button" aria-label="Local Agent logo" disabled>
+            <img class="logo-asset" src="assets/electric-brain-logo.png" alt="">
+          </button>
+          <span class="brand-name">Local Agent</span>
+          <button id="sidebar-collapse" class="btn-theme-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">
+            <span id="sidebar-collapse-icon">‹</span>
+          </button>
+        </div>
+
+        <div class="sidebar-top">
+          <button id="new-chat" class="btn-new-chat">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M7 1v12M1 7h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path>
+            </svg>
+            New chat
+          </button>
+        </div>
+
+        <nav id="session-list" class="session-list" aria-label="Chat history"></nav>
+
+        <div class="sidebar-bottom">
+          <div class="user-info">
+            <div class="user-avatar" id="user-avatar-initials">?</div>
+            <div class="user-meta">
+              <strong id="current-user"></strong>
+              <span id="current-role"></span>
+            </div>
+          </div>
+          <div class="sidebar-actions">
+            <button id="theme-toggle" class="btn-icon" type="button" aria-label="Switch to light theme" title="Switch dark / light theme">
+              <span id="theme-toggle-icon">○</span>
+            </button>
+            <button id="manage-users" class="btn-icon" title="Settings">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="5" cy="4" r="2.5" stroke="currentColor" stroke-width="1.2"></circle>
+                <path d="M1 12c0-2.2 1.8-4 4-4s4 1.8 4 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"></path>
+                <path d="M10 6.5l1 1 2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+              Settings
+            </button>
+            <button id="logout" class="btn-icon" title="Sign out">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M5 2H2a1 1 0 00-1 1v8a1 1 0 001 1h3M9 10l3-3-3-3M13 7H5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+              Logout
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- CHAT -->
+      <section class="chat-shell">
+        <div class="workbench">
+          <div id="messages" class="messages" aria-live="polite"></div>
+        </div>
+
+        <form id="composer" class="composer">
+          <div id="upload-status" class="upload-status composer-status" role="status"></div>
+          <div id="composer-attachments" class="attachment-strip composer-attachments" aria-label="Uploaded files"></div>
+          <div class="composer-inner">
+            <div class="composer-upload">
+              <button id="upload-menu-trigger" class="btn-composer-plus" type="button" aria-label="Add file or image" aria-haspopup="menu" aria-expanded="false">
+                <span aria-hidden="true">+</span>
+              </button>
+              <div id="upload-menu" class="upload-menu" role="menu" hidden="">
+                <button id="add-local-file" class="upload-menu-option" type="button" role="menuitem">
+                  Add file/image from local
+                </button>
+              </div>
+              <input id="file-input" type="file" hidden="">
+            </div>
+            <textarea id="message-input" rows="1" placeholder="Message Local Agent…" required=""></textarea>
+          </div>
+        </form>
+      </section>
+
+      <!-- SETTINGS PANEL -->
+      <section id="admin-panel" class="admin-panel" hidden="">
+        <div class="admin-card">
+          <header class="admin-card-header">
+            <div>
+              <h2>Settings</h2>
+              <p id="settings-owner"></p>
+            </div>
+            <button id="close-admin" class="btn-ghost-sm">✕ Close</button>
+          </header>
+
+          <section id="profile-password-section" class="settings-section">
+            <div class="settings-section-heading">
+              <h3>Your Password</h3>
+              <p>Update the password for the account currently signed in.</p>
+            </div>
+            <form id="change-password-form" class="password-form">
+              <input id="current-password" placeholder="Current password" type="password" autocomplete="current-password" required="">
+              <input id="own-new-password" placeholder="New password" type="password" autocomplete="new-password" minlength="8" required="">
+              <input id="own-confirm-password" placeholder="Confirm new password" type="password" autocomplete="new-password" minlength="8" required="">
+              <button type="submit" class="btn-primary sm">Update</button>
+            </form>
+            <p id="profile-password-status" class="settings-status" role="status"></p>
+          </section>
+
+          <section id="admin-settings-section" class="settings-section admin-section">
+            <div class="settings-section-heading">
+              <h3>Admin Controls</h3>
+              <p id="admin-power-note">Admin is the highest access level. Admins can create users, disable accounts, reset passwords, and view chat history.</p>
+            </div>
+            <form id="create-user-form" class="user-form">
+              <input id="new-user-username" placeholder="Username" required="">
+              <input id="new-user-password" placeholder="Password" type="password" minlength="8" required="">
+              <select id="new-user-role">
+                <option value="admin">Admin</option>
+                <option value="user">Normal user</option>
+              </select>
+              <button type="submit" class="btn-primary sm">Create</button>
+            </form>
+            <div id="user-list" class="user-list"></div>
+            <div class="settings-section-heading chat-history-heading">
+              <h3>Chat History</h3>
+              <p>All users' chat history is visible to admins.</p>
+            </div>
+            <div id="admin-chat-list" class="admin-chat-list"></div>
+            <div id="admin-chat-detail" class="admin-chat-detail"></div>
+          </section>
+          <p id="admin-error" class="error" role="alert"></p>
+        </div>
+      </section>
+
+      <section id="file-preview-modal" class="file-preview-modal" hidden="">
+        <div class="file-preview-card" role="dialog" aria-modal="true" aria-labelledby="file-preview-title">
+          <header class="file-preview-header">
+            <div>
+              <h2 id="file-preview-title">File preview</h2>
+              <p id="file-preview-meta"></p>
+            </div>
+            <button id="file-preview-close" class="btn-ghost-sm" type="button">Close</button>
+          </header>
+          <div id="file-preview-body" class="file-preview-body"></div>
+        </div>
+      </section>
+
+    </main>
+
+    <script src="assets/app.js?v=admin-role-filter-removed-20260518"></script>
+  
+
+
+</body></html>

@@ -1,3 +1,72 @@
-# Host development uses uv directly. This Compose file is reserved for the
-# future runtime stack described in README.md.
-services: {}
+services:
+  agent-app:
+    build:
+      context: ../..
+      dockerfile: localAgent.worktrees/feature-auth/Dockerfile
+    environment:
+      LOCALAGENT_MCP_URL: http://mcp-server:8000/sse
+      LOCALAGENT_MODEL_BASE_URL: ${LOCALAGENT_MODEL_BASE_URL:-http://host.docker.internal:8080/v1}
+      LOCALAGENT_MODEL_API_KEY: ${LOCALAGENT_MODEL_API_KEY:-no-key}
+      LOCALAGENT_ADMIN_USERNAME: ${LOCALAGENT_ADMIN_USERNAME:-}
+      LOCALAGENT_ADMIN_PASSWORD: ${LOCALAGENT_ADMIN_PASSWORD:-}
+      LOCALAGENT_COOKIE_SECURE: ${LOCALAGENT_COOKIE_SECURE:-false}
+      LOCALAGENT_STATE_DIR: /data/state
+      LOCALAGENT_DOCS_DIR: /data/docs
+      LOCALAGENT_SKILLS_DIR: /data/skills
+    ports:
+      - "${LOCALAGENT_BIND:-127.0.0.1}:${LOCALAGENT_PORT:-8088}:8080"
+    volumes:
+      - ./user_docs:/data/docs:ro
+      - ./skills:/data/skills
+      - agent_state:/data/state
+    depends_on:
+      mcp-server:
+        condition: service_healthy
+    networks:
+      - agent-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  mcp-server:
+    build:
+      context: ../../mcp_server_local/mcp_web
+      dockerfile: Dockerfile
+    expose:
+      - "8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PORT: "8000"
+    networks:
+      - agent-network
+    restart: unless-stopped
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /home/app/.cache:size=512m,mode=700,uid=10001,gid=10001
+    shm_size: "512mb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  agent_state:
+
+networks:
+  agent-network:
+    driver: bridge

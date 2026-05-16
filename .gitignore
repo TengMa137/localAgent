@@ -4,8 +4,11 @@
 .ruff_cache/
 __pycache__/
 .DS_Store
+.env
 test-old/
 mkdocs.yml
 Makefile
 chat_history/
+localagent_state/
 *.egg-info/
+*.od*

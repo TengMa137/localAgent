@@ -5,6 +5,7 @@ Features
 --------
 - Single orchestrator entry point with persistent message history
 - History auto-compressed when long (transparent to the user)
+- Optional --debug mode: full agent traces, tool calls, run summaries
 - Worker logs printed per turn in research mode
 - Chat history saved to ./chat_history/chats/<session-slug>.json
 - Full task log printed on exit
@@ -28,7 +29,13 @@ from pydantic_ai.usage import UsageLimits
 
 from rag import rag_service
 from agents.orchestrator_agent import OrchestratorResponse, run_orchestrator_turn
-from agents.observability import task_log_store, _c, log_event
+from agents.observability import (
+    start_trace_collection,
+    stop_trace_collection,
+    task_log_store,
+    _c,
+    log_event,
+)
 from agents.runtime.reports import REPORT_ROOT, load_agent_reports, set_report_dir
 from agents.runtime.skills_context import scan_skills_context
 from speech.stream_tts import StreamingTTSConfig, StreamingTTSPlayer
@@ -166,6 +173,7 @@ def _save_history(session: ChatSession) -> None:
     if not session.history_path or not session.message_history:
         return
     try:
+        session.history_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "session_title": session.session_title,
             "report_dir":    str(session.report_dir) if session.report_dir else None,
@@ -186,8 +194,58 @@ async def handle_turn(
     session:   ChatSession,
     debug:     bool = False,
     tts_player: StreamingTTSPlayer | None = None,
-) -> str:
+) -> None:
+    response, _result_messages, turn_logs, _trace_events = await run_turn(
+        user_text,
+        session,
+        debug=debug,
+    )
 
+    await _emit_assistant_reply(response.reply, tts_player=tts_player)
+
+    for log in turn_logs:
+        tid = log["task_id"][:8]
+        if log["status"] == "done":
+            print(_c(f"[worker {tid}] ✔ done", "green"))
+            if log.get("summary"):
+                print(f"  summary: {log['summary'][:200].replace(chr(10), ' ')}")
+        else:
+            print(_c(f"[worker {tid}] ✗ failed", "red"))
+            if log.get("error"):
+                print(f"  error: {log['error']}")
+        print()
+
+    if debug:
+        for log in turn_logs:
+            if log.get("trace"):
+                _debug_messages(
+                    log["trace"],
+                    label=f"worker {log['task_id'][:8]}",
+                )
+                _summarize_messages(log["trace"])
+
+        docs = rag_service.list_documents()
+        if docs:
+            print(_c(f"[rag] {len(docs)} documents in store", "dim"))
+            for d in docs[:10]:
+                print(_c(
+                    f"  • {d['doc_id']}  {d['source']}  ({d['nodes']} nodes)",
+                    "dim",
+                ))
+
+
+async def run_turn(
+    user_text: str,
+    session: ChatSession,
+    debug: bool = False,
+    trace_sink: Any = None,
+) -> tuple[OrchestratorResponse, list[ModelMessage], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Run one agent turn and update/persist the supplied session.
+
+    This is shared by the terminal CLI and the web backend. CLI-only printing
+    remains in ``handle_turn`` so HTTP callers can reuse the same runtime
+    without scraping stdout.
+    """
     _init_session_paths_from_user_text(session, user_text)
     set_report_dir(session.report_dir)
     report_context = load_agent_reports(session.report_dir)
@@ -203,14 +261,18 @@ async def handle_turn(
 
     start = time.time()
     turn_id = f"{session.session_title}:{time.time_ns()}"
-    result = await run_orchestrator_turn(
-        prompt,
-        label="orchestrator",
-        indent=0,
-        message_history=session.message_history,
-        usage_limits=UsageLimits(tool_calls_limit=10),
-        metadata={"turn_id": turn_id},
-    )
+    trace_token, trace_events = start_trace_collection(trace_sink)
+    try:
+        result = await run_orchestrator_turn(
+            prompt,
+            label="orchestrator",
+            indent=0,
+            message_history=session.message_history,
+            usage_limits=UsageLimits(tool_calls_limit=10),
+            metadata={"turn_id": turn_id},
+        )
+    finally:
+        stop_trace_collection(trace_token)
     response: OrchestratorResponse = result.output
     session.message_history = result.all_messages()
     duration = time.time() - start
@@ -221,10 +283,9 @@ async def handle_turn(
         _debug_messages(result.all_messages(), label="orchestrator")
         _summarize_messages(result.all_messages())
 
-    await _emit_assistant_reply(response.reply, tts_player=tts_player)
-
     # Show logs for any workers that ran during this turn. We identify them
     # by recency — logs added since the previous turn are the current ones.
+    turn_logs: list[dict[str, Any]] = []
     all_logs = list(task_log_store.all().values())
     if all_logs:
         # Workers from this turn are at the end of the store (insertion order)
@@ -240,38 +301,9 @@ async def handle_turn(
                 item for item in all_logs
                 if (item.get("finished_at") or "") >= turn_start_iso
             ]
-            for log in turn_logs:
-                tid = log["task_id"][:8]
-                if log["status"] == "done":
-                    print(_c(f"[worker {tid}] ✔ done", "green"))
-                    if log.get("summary"):
-                        print(f"  summary: {log['summary'][:200].replace(chr(10), ' ')}")
-                else:
-                    print(_c(f"[worker {tid}] ✗ failed", "red"))
-                    if log.get("error"):
-                        print(f"  error: {log['error']}")
-                print()
-
-            if debug:
-                for log in turn_logs:
-                    if log.get("trace"):
-                        _debug_messages(
-                            log["trace"],
-                            label=f"worker {log['task_id'][:8]}",
-                        )
-                        _summarize_messages(log["trace"])
-
-                docs = rag_service.list_documents()
-                if docs:
-                    print(_c(f"[rag] {len(docs)} documents in store", "dim"))
-                    for d in docs[:10]:
-                        print(_c(
-                            f"  • {d['doc_id']}  {d['source']}  ({d['nodes']} nodes)",
-                            "dim",
-                        ))
 
     _save_history(session)
-    return response.reply
+    return response, result.all_messages(), turn_logs, trace_events
 
 
 async def _emit_assistant_reply(
@@ -289,9 +321,12 @@ async def _emit_assistant_reply(
 # MAIN LOOP
 async def run(
     *,
+    debug: bool = False,
     tts_player: StreamingTTSPlayer | None = None,
 ) -> None:
     print(BANNER)
+    if debug:
+        print(_c("[debug mode enabled — full agent traces printed]\n", "dim"))
     if tts_player is not None:
         print(_c("[tts mode enabled — assistant replies will be spoken]\n", "dim"))
 
@@ -315,6 +350,7 @@ async def run(
             await handle_turn(
                 user_input,
                 session,
+                debug=debug,
                 tts_player=tts_player,
             )
         except Exception as exc:
@@ -337,10 +373,13 @@ async def run(
 
 async def run_voice(
     *,
+    debug: bool = False,
     device: str | None = None,
     tts_player: StreamingTTSPlayer | None = None,
 ) -> None:
     print(BANNER)
+    if debug:
+        print(_c("[debug mode enabled — full agent traces printed]\n", "dim"))
     if tts_player is not None:
         print(_c("[tts mode enabled — assistant replies will be spoken]\n", "dim"))
 
@@ -348,7 +387,7 @@ async def run_voice(
 
     async def handle_text(text: str) -> None:
         try:
-            await handle_turn(text, session, tts_player=tts_player)
+            await handle_turn(text, session, debug=debug, tts_player=tts_player)
         except Exception as exc:
             print(f"\n[error: {exc}]\n")
 
@@ -371,6 +410,7 @@ async def run_voice(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="General Research Agent")
+    parser.add_argument("--debug", action="store_true", help="Print full agent traces")
     parser.add_argument(
         "--voice",
         action="store_true",
@@ -416,12 +456,13 @@ if __name__ == "__main__":
         if args.voice:
             asyncio.run(
                 run_voice(
+                    debug=args.debug,
                     device=args.voice_device,
                     tts_player=tts_player,
                 )
             )
         else:
-            asyncio.run(run(tts_player=tts_player))
+            asyncio.run(run(debug=args.debug, tts_player=tts_player))
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(0)

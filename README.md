@@ -131,6 +131,50 @@ uv run python src/run_agents.py
 
 Type anything to begin. Enter `exit`, `quit`, or press `Ctrl-C` to quit.
 
+### 5. Run the web app
+
+The web app serves a same-origin ChatGPT-style frontend and FastAPI backend.
+Create the admin account in backend configuration, then users can register
+normal accounts from the login page:
+
+```bash
+uv run uvicorn server:app --app-dir src --host 127.0.0.1 --port 8088
+```
+
+For local development, put the backend settings in `.env`:
+
+```dotenv
+LOCALAGENT_ADMIN_USERNAME=admin
+LOCALAGENT_ADMIN_PASSWORD=choose-a-long-random-password
+LOCALAGENT_COOKIE_SECURE=false
+```
+
+The app reads `.env` automatically through Pydantic settings. Use `.env` for a
+single local machine; use real environment variables or your container/host
+secret manager for deployment so secrets are not copied into the repo or image.
+
+Open `http://127.0.0.1:8088`. Browser auth uses server-side sessions with
+`HttpOnly` cookies; JWTs are not needed for this same-origin frontend.
+
+Admin users can list/create/disable users and view all users' chat history.
+Normal users can only access their own chat sessions.
+
+For Docker Compose:
+
+```bash
+LOCALAGENT_ADMIN_USERNAME=admin \
+LOCALAGENT_ADMIN_PASSWORD='choose-a-long-password' \
+docker compose up --build
+```
+
+The Compose stack runs:
+
+- `agent-app`: backend, frontend, agent runtime, and in-process `rag_lib`
+- `mcp-server`: internal-only web/search/arXiv MCP server
+
+By default the app is published at `127.0.0.1:8088` and the MCP server is not
+published to the host. (inspect: lsof -nP -iTCP:8088 -sTCP:LISTEN)
+
 ---
 
 ## Model providers
