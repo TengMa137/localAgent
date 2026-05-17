@@ -185,7 +185,7 @@ async def handle_turn(
     user_text: str,
     session:   ChatSession,
     debug:     bool = False,
-) -> None:
+) -> str:
 
     _init_session_paths_from_user_text(session, user_text)
     set_report_dir(session.report_dir)
@@ -270,6 +270,7 @@ async def handle_turn(
                         ))
 
     _save_history(session)
+    return response.reply
 
 
 # MAIN LOOP
@@ -312,57 +313,105 @@ async def run(debug: bool = False) -> None:
                 print(f"      {log['summary'][:120]}…")
 
 
+async def run_voice(
+    *,
+    debug: bool = False,
+    language: str | None = None,
+    device: str | None = None,
+    normalize_audio: bool = True,
+    save_audio_dir: Path | None = None,
+    save_failed_audio_dir: Path | None = None,
+) -> None:
+    print(BANNER)
+    if debug:
+        print(_c("[debug mode enabled — full agent traces printed]\n", "dim"))
+
+    session = ChatSession()
+
+    async def handle_text(text: str) -> None:
+        try:
+            await handle_turn(text, session, debug=debug)
+        except Exception as exc:
+            print(f"\n[error: {exc}]\n")
+
+    from speech.terminal_voice import run_enter_to_talk
+
+    selected_device: int | str | None = device
+    if selected_device is not None:
+        try:
+            selected_device = int(selected_device)
+        except ValueError:
+            pass
+
+    await run_enter_to_talk(
+        handle_text,
+        language=language,
+        device=selected_device,
+        normalize_audio=normalize_audio,
+        save_audio_dir=save_audio_dir,
+        save_failed_audio_dir=save_failed_audio_dir,
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="General Research Agent")
     parser.add_argument("--debug", action="store_true", help="Print full agent traces")
+    parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Use terminal Enter-to-talk ASR instead of typed input",
+    )
+    parser.add_argument(
+        "--voice-language",
+        help="Optional forced ASR language, e.g. English or Swedish",
+    )
+    parser.add_argument(
+        "--voice-device",
+        help="Input device index or name; use --list-audio-devices to inspect",
+    )
+    parser.add_argument(
+        "--voice-no-normalize",
+        action="store_true",
+        help="Do not amplify recorded audio before sending it to ASR",
+    )
+    parser.add_argument(
+        "--voice-save-audio-dir",
+        type=Path,
+        help="Directory to save each WAV sent to ASR for playback/debugging",
+    )
+    parser.add_argument(
+        "--voice-debug-audio",
+        action="store_true",
+        help="Save failed/no-speech recordings under /tmp/localagent-asr",
+    )
+    parser.add_argument(
+        "--list-audio-devices",
+        action="store_true",
+        help="List available input audio devices and exit",
+    )
     args = parser.parse_args()
 
     try:
-        asyncio.run(run(debug=args.debug))
+        if args.list_audio_devices:
+            from speech.terminal_voice import list_input_devices
+
+            list_input_devices()
+            sys.exit(0)
+        if args.voice:
+            asyncio.run(
+                run_voice(
+                    debug=args.debug,
+                    language=args.voice_language,
+                    device=args.voice_device,
+                    normalize_audio=not args.voice_no_normalize,
+                    save_audio_dir=args.voice_save_audio_dir,
+                    save_failed_audio_dir=(
+                        Path("/tmp/localagent-asr") if args.voice_debug_audio else None
+                    ),
+                )
+            )
+        else:
+            asyncio.run(run(debug=args.debug))
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(0)
-
-
-# from voice_input import run_voice_input
-
-# async def run(debug: bool = False, wake_word: str = "porcupine"):
-
-#     print(BANNER)
-
-#     session = ChatSession()
-
-#     async def handle_text(text: str):
-#         try:
-#             await handle_turn(text, session, debug=debug)
-#         except Exception as exc:
-#             print(f"\n[error: {exc}]\n")
-
-#     await run_voice_input(handle_text, wake_word=wake_word)
-
-
-
-# if __name__ == "__main__":
-
-#     parser = argparse.ArgumentParser(description="General Agent")
-
-#     # parser.add_argument(
-#     #     "--wake-word",
-#     #     type=str,
-#     #     default="porcupine",  # must match Porcupine built-ins unless custom
-#     #     help="Wake word for assistant"
-#     # )
-#     parser.add_argument(
-#         "--debug",
-#         action="store_true",
-#         help="Print full internal agent traces",
-#     )
-
-#     args = parser.parse_args()
-
-#     try:
-#         asyncio.run(run(debug=args.debug))
-
-#     except KeyboardInterrupt:
-#         print("\nInterrupted.")
-#         sys.exit(0)

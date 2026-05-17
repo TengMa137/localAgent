@@ -195,6 +195,121 @@ export LOCALAGENT_MODEL_API_KEY=no-key
 
 No other changes needed — the rest of the agent stack is model-agnostic.
 
+### Local speech via Qwen3 ASR/TTS
+
+The speech integration keeps the agent core text-only. A local frontend can send
+microphone audio to `voice_api.py`; the API transcribes with Qwen3-ASR and then
+passes the transcript into the existing `handle_turn(...)` path. Experimental
+TTS support can synthesize agent replies through `qwen3-tts.cpp`.
+
+Start a separate llama.cpp server for ASR:
+
+```bash
+llama-server \
+    -hf ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0 \
+    --port 8081 \
+    -c 8192
+```
+
+Then start the local voice API:
+
+```bash
+export LOCALAGENT_ASR_BASE_URL=http://localhost:8081/v1
+export LOCALAGENT_ASR_MODEL=Qwen3-ASR-1.7B-GGUF
+
+# Optional TTS via https://github.com/predict-woo/qwen3-tts.cpp
+export LOCALAGENT_TTS_CLI=/path/to/qwen3-tts.cpp/build/qwen3-tts-cli
+export LOCALAGENT_TTS_MODEL_DIR=/path/to/qwen3-tts.cpp/models
+
+uv run python src/voice_api.py --host 127.0.0.1 --port 8090
+```
+
+Useful endpoints:
+
+| Endpoint | Body | Result |
+|---|---|---|
+| `GET /health` | none | API health check |
+| `GET /speech/models` | none | Configured local speech models |
+| `POST /speech/asr` | `{"audio_base64": "...", "mime_type": "audio/wav"}` | Transcript only |
+| `POST /speech/tts` | `{"text": "...", "reference_audio_path": "optional"}` | WAV audio as base64 |
+| `POST /agent/voice-turn` | `{"audio_base64": "...", "mime_type": "audio/wav", "session_id": "optional", "tts": false}` | Transcript plus agent reply, optionally with reply audio |
+
+You can also test ASR/TTS directly from the command line without running the
+agent:
+
+```bash
+# Transcribe an existing audio file
+uv run python -m speech.qwen3 asr-file ./sample.wav
+
+# Record 5 seconds from the mic, save ./tmp/mic-*.wav, then print ASR text
+uv run python -m speech.qwen3 asr-mic --seconds 5 --out-dir ./tmp
+
+# Synthesize text and save ./tmp/tts-*.wav
+uv run python -m speech.qwen3 tts "Hello from local Qwen3 TTS." --out-dir ./tmp
+
+# Optional: use the saved mic clip as a voice reference for TTS
+uv run python -m speech.qwen3 tts "Now using a reference voice." \
+    --reference-audio ./tmp/mic-<timestamp>.wav \
+    --out-dir ./tmp
+```
+
+For terminal voice input, install the local microphone dependency:
+
+```bash
+uv add sounddevice
+```
+
+Then run:
+
+```bash
+uv run python src/run_agents.py --voice
+```
+
+Press Enter to start recording. While listening, the terminal shows a live audio
+level meter on one status line. Press Enter again to stop, transcribe the
+utterance, print the converted text, and send it into the agent. On macOS, allow
+microphone access for the terminal app.
+
+If transcription keeps returning no speech, inspect and select the microphone:
+
+```bash
+uv run python src/run_agents.py --list-audio-devices
+uv run python src/run_agents.py --voice --voice-device 1
+```
+
+If transcription is unrelated to what you said, save the exact WAV sent to ASR
+and play it back:
+
+```bash
+uv run python src/run_agents.py --voice --voice-device 0 --voice-save-audio-dir /tmp/localagent-asr
+afplay /tmp/localagent-asr/<saved-file>.wav
+```
+
+For intermittent no-speech failures, save only failed recordings:
+
+```bash
+uv run python src/run_agents.py --voice --voice-device 0 --voice-debug-audio
+ls /tmp/localagent-asr
+```
+
+If the saved audio is noisy or distorted, try disabling automatic gain:
+
+```bash
+uv run python src/run_agents.py --voice --voice-device 0 --voice-no-normalize
+```
+
+If the audio sounds clear but language detection is wrong, force the language:
+
+```bash
+uv run python src/run_agents.py --voice --voice-device 0 --voice-language English
+```
+
+With the GGUF `llama-server` backend this is utterance-level ASR: the terminal
+records a chunk, then Qwen3-ASR processes that complete audio chunk and returns
+text. Qwen3-ASR's upstream vLLM backend supports streaming inference, but the
+llama.cpp multimodal GGUF path used here is best treated as non-streaming audio
+input even if token output is streamed later.
+
 ---
 
 ## Tested models
@@ -461,6 +576,17 @@ Runtime environment variables:
 |---|---|---|
 | `LOCALAGENT_MODEL_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible model endpoint used by pydantic-ai and `rag_lib` |
 | `LOCALAGENT_MODEL_API_KEY` | `no-key` | API key sent to the model endpoint |
+| `LOCALAGENT_ASR_BASE_URL` | `http://localhost:8081/v1` | OpenAI-compatible Qwen3-ASR endpoint |
+| `LOCALAGENT_ASR_MODEL` | `Qwen3-ASR-1.7B-GGUF` | Model id sent to the ASR endpoint |
+| `LOCALAGENT_ASR_API_KEY` | `no-key` | API key sent to the ASR endpoint |
+| `LOCALAGENT_ASR_TIMEOUT_SECONDS` | `300` | ASR HTTP request timeout |
+| `LOCALAGENT_ASR_MAX_TOKENS` | `512` | Maximum generated ASR tokens |
+| `LOCALAGENT_TTS_CLI` | `qwen3-tts-cli` | qwen3-tts.cpp CLI executable path |
+| `LOCALAGENT_TTS_MODEL_DIR` | `models` | Directory containing qwen3-tts.cpp GGUF artifacts |
+| `LOCALAGENT_TTS_TIMEOUT_SECONDS` | `600` | TTS subprocess timeout |
+| `LOCALAGENT_TTS_TEMPERATURE` | unset | Optional qwen3-tts.cpp sampling temperature |
+| `LOCALAGENT_TTS_TOP_K` | unset | Optional qwen3-tts.cpp top-k value |
+| `LOCALAGENT_TTS_MAX_TOKENS` | unset | Optional qwen3-tts.cpp max audio-token count |
 | `LOCALAGENT_MCP_URL` | `http://localhost:8000/sse` | MCP web server SSE endpoint |
 | `LOCALAGENT_DOCS_DIR` | `user_docs` | Host directory mounted into the agent as `/docs` |
 | `LOCALAGENT_SKILLS_DIR` | `skills` | Host directory mounted into the agent as `/skills` |

@@ -9,6 +9,7 @@ dependencies = [
     "pydantic-ai>=1.39.1",
     "pydantic-ai-slim[fastmcp,openai]>=1.39.1",
     "rag-lib",
+    "sounddevice>=0.5.5",
 ]
 
 [build-system]
