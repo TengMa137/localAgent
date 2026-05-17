@@ -35,7 +35,7 @@ ConfidenceLevel = Literal["low", "high"]
 
 class TaskSpec(BaseModel):
     objective:              str
-    kind:                   TaskKind = TaskKind.WEB_SEARCH
+    kind:                   Optional[TaskKind] = None
     query:                  Optional[str] = None
     urls:                   List[str] = Field(default_factory=list)
     relevant_files:         List[str] = Field(default_factory=list)
@@ -258,6 +258,8 @@ async def run_history_summary_worker(
 
 
 def _build_worker_instructions(task: TaskSpec) -> str:
+    if task.kind is None:
+        raise ValueError("TaskSpec.kind is required before worker execution")
     files_section = ""
     if task.relevant_files:
         files_section = (
@@ -310,6 +312,8 @@ def _format_evidence(results: list[dict]) -> str:
 
 
 async def _retrieve_evidence(task: TaskSpec) -> list[dict]:
+    if task.kind is None:
+        raise ValueError("TaskSpec.kind is required before evidence retrieval")
     query = task.query or task.objective
 
     if task.kind == TaskKind.LOCAL_RAG:

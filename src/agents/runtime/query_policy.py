@@ -26,11 +26,15 @@ def extract_arxiv_ids(text: str) -> list[str]:
     return ids
 
 
-def infer_task_kind(text: str, *, matched_files: list[str] | None = None) -> TaskKind:
+def infer_task_kind(
+    text: str,
+    *,
+    matched_files: list[str] | None = None,
+) -> TaskKind | None:
     if extract_arxiv_ids(text) or "arxiv" in text.lower():
         return TaskKind.ARXIV
     if extract_urls(text):
         return TaskKind.URL_CRAWL
     if matched_files:
         return TaskKind.LOCAL_RAG
-    return TaskKind.WEB_SEARCH
+    return None

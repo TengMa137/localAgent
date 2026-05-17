@@ -9,12 +9,16 @@ from agents.plan_agent import (
     _run_research_loop,
     _normalize_plan,
 )
-from agents.runtime.query_policy import TaskKind, extract_urls
+from agents.runtime.query_policy import TaskKind, extract_urls, infer_task_kind
 from agents.worker import ReflectionOutput, TaskSpec
 
 
 def test_query_policy_extracts_urls():
     assert extract_urls("Read https://example.com/a.") == ["https://example.com/a"]
+
+
+def test_query_policy_has_no_default_retrieval_kind():
+    assert infer_task_kind("Explain recursion") is None
 
 
 def test_normalize_plan_forces_web_search_current_info():
@@ -186,6 +190,36 @@ def test_normalize_plan_extracts_file_path_from_task_objective():
     assert normalized.tasks[0].relevant_files == ["/skills/fitness/diet.md"]
 
 
+def test_normalize_plan_infers_url_kind_when_planner_omits_kind():
+    normalized = _normalize_plan(
+        PlanOutput(
+            tasks=[
+                TaskSpec(
+                    objective="Summarize https://example.com/docs",
+                    query="https://example.com/docs",
+                )
+            ]
+        ),
+        objective="Summarize https://example.com/docs",
+        matched_files=[],
+        as_of="now",
+    )
+
+    assert normalized.tasks[0].kind == TaskKind.URL_CRAWL
+    assert normalized.tasks[0].urls == ["https://example.com/docs"]
+
+
+def test_normalize_plan_drops_untyped_task_without_structural_route():
+    normalized = _normalize_plan(
+        PlanOutput(tasks=[TaskSpec(objective="Explain recursion")]),
+        objective="Explain recursion",
+        matched_files=[],
+        as_of="now",
+    )
+
+    assert normalized.tasks == []
+
+
 def test_normalize_plan_keeps_initial_answer_with_file_context():
     plan = PlanOutput(initial_answer="The preview fully answers this.")
 
@@ -236,7 +270,7 @@ def test_normalize_plan_keeps_initial_answer_for_non_web_terminal_issue():
     assert normalized.tasks == []
 
 
-def test_fallback_web_task_requires_current_info():
+def test_empty_plan_does_not_invent_default_web_task():
     normalized = _normalize_plan(
         PlanOutput(),
         objective="What changed in the package API?",
@@ -244,8 +278,8 @@ def test_fallback_web_task_requires_current_info():
         as_of="now",
     )
 
-    assert normalized.tasks[0].kind == TaskKind.WEB_SEARCH
-    assert normalized.tasks[0].requires_current_info is True
+    assert normalized.initial_answer is None
+    assert normalized.tasks == []
 
 
 def test_required_url_task_is_not_dropped_when_plan_is_full():

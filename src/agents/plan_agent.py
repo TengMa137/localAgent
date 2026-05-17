@@ -320,18 +320,21 @@ class PlanNormalizer:
                 return plan_output.model_copy(update={"tasks": []})
 
         planner_tasks = [
-            self._normalize_task(task)
-            for task in plan_output.tasks[:MAX_TASKS_PER_PLAN]
+            task
+            for raw_task in plan_output.tasks[:MAX_TASKS_PER_PLAN]
+            if (task := self._normalize_task(raw_task)) is not None
         ]
         required_tasks = self._required_tasks(planner_tasks)
         open_slots = max(0, MAX_TASKS_PER_PLAN - len(required_tasks))
         tasks = [*required_tasks, *planner_tasks[:open_slots]]
 
         if not tasks:
-            tasks.append(self._fallback_task())
+            fallback_task = self._fallback_task()
+            if fallback_task is not None:
+                tasks.append(fallback_task)
         return plan_output.model_copy(update={"tasks": tasks[:MAX_TASKS_PER_PLAN]})
 
-    def _normalize_task(self, raw_task: TaskSpec) -> TaskSpec:
+    def _normalize_task(self, raw_task: TaskSpec) -> TaskSpec | None:
         """Resolve files and fill TaskSpec defaults for one task."""
         task_text = " ".join(
             [raw_task.objective, raw_task.query or "", *raw_task.relevant_files]
@@ -342,13 +345,19 @@ class PlanNormalizer:
         )
         files = _dedupe(task_files)
         kind = self._task_kind(raw_task, files)
+        if kind is None:
+            return None
         if kind == TaskKind.LOCAL_RAG and not files:
             files = _dedupe([*self.matched_files, *self.objective_files])
+        urls = raw_task.urls
+        if kind == TaskKind.URL_CRAWL and not urls:
+            urls = _dedupe([*extract_urls(task_text), *self.objective_urls])
         requires_current = raw_task.requires_current_info or kind == TaskKind.WEB_SEARCH
         return raw_task.model_copy(
             update={
                 "kind": kind,
                 "query": raw_task.query or raw_task.objective,
+                "urls": urls,
                 "relevant_files": files,
                 "requires_current_info": requires_current,
                 "as_of": raw_task.as_of or self.as_of,
@@ -356,7 +365,7 @@ class PlanNormalizer:
             }
         )
 
-    def _task_kind(self, raw_task: TaskSpec, files: list[str]) -> TaskKind:
+    def _task_kind(self, raw_task: TaskSpec, files: list[str]) -> TaskKind | None:
         """Choose the retrieval route after file resolution."""
         if files:
             return TaskKind.LOCAL_RAG
@@ -414,10 +423,12 @@ class PlanNormalizer:
             )
         return required
 
-    def _fallback_task(self) -> TaskSpec:
-        """Create one task when the planner returned no usable work."""
+    def _fallback_task(self) -> TaskSpec | None:
+        """Create one deterministic task when structural evidence requires it."""
         local_files = _dedupe([*self.matched_files, *self.objective_files])
         kind = infer_task_kind(self.objective, matched_files=self.matched_files)
+        if kind is None:
+            return None
         return TaskSpec(
             kind=kind,
             objective=self.objective,
@@ -431,12 +442,7 @@ class PlanNormalizer:
 
     def _objective_requires_tasks(self) -> bool:
         """Return true for objectives unsafe to answer from planner text alone."""
-        kind = infer_task_kind(self.objective, matched_files=self.matched_files)
-        return (
-            kind == TaskKind.WEB_SEARCH
-            or bool(self.objective_urls)
-            or bool(self.objective_arxiv_ids)
-        )
+        return bool(self.objective_urls) or bool(self.objective_arxiv_ids)
 
     @staticmethod
     def _has_kind(tasks: list[TaskSpec], kind: TaskKind) -> bool:
