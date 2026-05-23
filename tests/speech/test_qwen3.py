@@ -1,12 +1,19 @@
 import base64
+import io
+import json
 import subprocess
-from types import SimpleNamespace
+import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from speech.qwen3 import (
+    Qwen3ASRConfig,
     Qwen3ASRProvider,
     Qwen3TTSConfig,
     Qwen3TTSProvider,
+    Qwen3TTSError,
     _parse_audio_device,
     _run_tts,
     parse_asr_output,
@@ -62,12 +69,70 @@ def test_transcription_body_uses_openai_audio_endpoint_fields():
     )
 
     assert b'name="model"' in body
-    assert b"Qwen3-ASR-1.7B-GGUF" in body
+    assert b"./models/qwen3-asr-1.7b-q8_0.gguf" in body
     assert b'name="language"' in body
     assert b"English" in body
     assert b'name="file"; filename="sample.wav"' in body
     assert b"Content-Type: audio/wav" in body
     assert b"wav" in body
+
+
+def test_default_configs_use_preferred_crispasr_servers():
+    asr = Qwen3ASRConfig()
+    tts = Qwen3TTSConfig()
+
+    assert asr.base_url == "http://localhost:8081/v1"
+    assert asr.backend == "qwen3"
+    assert asr.model == "./models/qwen3-asr-1.7b-q8_0.gguf"
+    assert tts.base_url == "http://localhost:8082/v1"
+    assert tts.backend == "qwen3-tts-customvoice"
+    assert tts.model == "./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf"
+    assert tts.codec_model == "./models/qwen3-tts-tokenizer-12hz.gguf"
+    assert tts.voice == "vivian"
+
+
+def test_asr_command_uses_crispasr_qwen_defaults():
+    provider = Qwen3ASRProvider(
+        Qwen3ASRConfig(
+            base_url="",
+            cli_path="/bin/crispasr",
+            backend="qwen3",
+            model="auto",
+            temperature=0.0,
+            max_tokens=128,
+            threads=2,
+            vad=True,
+        )
+    )
+
+    cmd = provider._build_transcription_command(
+        Path("/tmp/sample.wav"),
+        output_base=Path("/tmp/out"),
+        language="en",
+    )
+
+    assert cmd == [
+        "/bin/crispasr",
+        "--backend",
+        "qwen3",
+        "-m",
+        "auto",
+        "-f",
+        "/tmp/sample.wav",
+        "-of",
+        "/tmp/out",
+        "-np",
+        "-oj",
+        "-l",
+        "en",
+        "--vad",
+        "-t",
+        "2",
+        "-tp",
+        "0.0",
+        "-n",
+        "128",
+    ]
 
 
 def test_transcribe_base64_accepts_existing_data_url(monkeypatch):
@@ -99,16 +164,60 @@ def test_transcribe_base64_accepts_existing_data_url(monkeypatch):
     assert captured["language"] == "English"
 
 
+def test_asr_http_uses_openai_compatible_transcriptions_endpoint(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"text": "hello from asr"}'
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["data"] = request.data
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("speech.qwen3.urllib.request.urlopen", fake_urlopen)
+    provider = Qwen3ASRProvider(
+        Qwen3ASRConfig(
+            base_url="http://localhost:8081/v1",
+            model="./models/qwen3-asr-1.7b-q8_0.gguf",
+            timeout_seconds=12,
+        )
+    )
+
+    result = provider._transcribe_bytes_sync(
+        b"wav",
+        filename="sample.wav",
+        mime_type="audio/wav",
+        language="en",
+    )
+
+    assert captured["url"] == "http://localhost:8081/v1/audio/transcriptions"
+    assert captured["timeout"] == 12
+    assert b'name="file"; filename="sample.wav"' in captured["data"]
+    assert b'name="model"' in captured["data"]
+    assert b"./models/qwen3-asr-1.7b-q8_0.gguf" in captured["data"]
+    assert b'name="response_format"' in captured["data"]
+    assert result.text == "hello from asr"
+    assert result.provider == "crispasr-qwen3-asr"
+
+
 def test_tts_command_uses_qwen3_tts_cli_fields():
     provider = Qwen3TTSProvider(
         Qwen3TTSConfig(
-            cli_path="/bin/qwen3-tts-cli",
-            model_dir="/models/qwen3-tts",
+            base_url="",
+            cli_path="/bin/crispasr",
+            backend="qwen3-tts-customvoice",
+            model="auto",
+            reference_text="reference words",
             temperature=0.0,
-            top_k=1,
-            top_p=0.8,
-            max_tokens=128,
-            repetition_penalty=1.1,
             threads=2,
         )
     )
@@ -119,41 +228,42 @@ def test_tts_command_uses_qwen3_tts_cli_fields():
         reference_audio_path=Path("/tmp/ref.wav"),
     )
 
-    assert cmd[:7] == [
-        "/bin/qwen3-tts-cli",
+    assert cmd == [
+        "/bin/crispasr",
+        "--backend",
+        "qwen3-tts-customvoice",
         "-m",
-        "/models/qwen3-tts",
-        "-t",
+        "auto",
+        "--tts",
         "hello",
-        "-o",
+        "--tts-output",
         "/tmp/out.wav",
-    ]
-    assert cmd[7:] == [
-        "-r",
+        "--voice",
         "/tmp/ref.wav",
+        "--ref-text",
+        "reference words",
+        "--codec-model",
+        "./models/qwen3-tts-tokenizer-12hz.gguf",
         "--temperature",
         "0.0",
-        "--top-k",
-        "1",
-        "--top-p",
-        "0.8",
-        "--max-tokens",
-        "128",
-        "--repetition-penalty",
-        "1.1",
-        "-j",
+        "-t",
         "2",
     ]
 
 
 def test_tts_synthesize_reads_cli_output(monkeypatch):
     provider = Qwen3TTSProvider(
-        Qwen3TTSConfig(cli_path="/bin/qwen3-tts-cli", model_dir="/models/qwen3-tts")
+        Qwen3TTSConfig(
+            base_url="",
+            cli_path="/bin/crispasr",
+            backend="qwen3-tts-customvoice",
+            model="auto",
+        )
     )
 
     def fake_run(cmd, **kwargs):
         del kwargs
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"RIFF wav")
+        Path(cmd[cmd.index("--tts-output") + 1]).write_bytes(b"RIFF wav")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr("speech.qwen3.subprocess.run", fake_run)
@@ -163,7 +273,115 @@ def test_tts_synthesize_reads_cli_output(monkeypatch):
     assert result.audio_bytes == b"RIFF wav"
     assert result.audio_base64 == base64.b64encode(b"RIFF wav").decode("ascii")
     assert result.mime_type == "audio/wav"
-    assert result.provider == "qwen3-tts-cpp"
+    assert result.provider == "crispasr-qwen3-tts"
+
+
+def test_tts_http_uses_openai_compatible_speech_endpoint(monkeypatch):
+    captured = {}
+
+    class FakeHeaders:
+        def get_content_type(self):
+            return "audio/wav"
+
+    class FakeResponse:
+        headers = FakeHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b"RIFF wav"
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("speech.qwen3.urllib.request.urlopen", fake_urlopen)
+    provider = Qwen3TTSProvider(
+        Qwen3TTSConfig(
+            base_url="http://localhost:8082/v1",
+            model="./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf",
+            voice="vivian",
+            timeout_seconds=34,
+        )
+    )
+
+    result = provider._synthesize_sync(
+        "hello",
+        reference_audio_path=None,
+        instructions="speak plainly",
+        speed=1.2,
+    )
+
+    assert captured["url"] == "http://localhost:8082/v1/audio/speech"
+    assert captured["timeout"] == 34
+    assert captured["payload"] == {
+        "model": "./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf",
+        "input": "hello",
+        "response_format": "wav",
+        "voice": "vivian",
+        "instructions": "speak plainly",
+        "speed": 1.2,
+    }
+    assert result.audio_bytes == b"RIFF wav"
+    assert result.mime_type == "audio/wav"
+    assert result.provider == "crispasr-qwen3-tts"
+
+
+def test_tts_http_empty_audio_error_includes_voice_context(monkeypatch):
+    class FakeHeaders:
+        def get_content_type(self):
+            return "application/json"
+
+    class FakeResponse:
+        headers = FakeHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"voices":[{"name":"vivian"},{"name":"ryan"}]}'
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        if request.full_url.endswith("/voices"):
+            return FakeResponse()
+        body = (
+            b'{"error":{"message":"synthesis failed '
+            b'(backend returned empty audio)","code":"synthesis_failed"}}'
+        )
+        raise urllib.error.HTTPError(
+            request.full_url,
+            500,
+            "Internal Server Error",
+            {},
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr("speech.qwen3.urllib.request.urlopen", fake_urlopen)
+    provider = Qwen3TTSProvider(
+        Qwen3TTSConfig(
+            base_url="http://localhost:8082/v1",
+            voice="nonexistent",
+        )
+    )
+
+    with pytest.raises(Qwen3TTSError) as excinfo:
+        provider._synthesize_sync("hello", reference_audio_path=None)
+
+    message = str(excinfo.value)
+    assert "synthesis_failed" in message
+    assert "request voice='nonexistent'" in message
+    assert "server voices=vivian, ryan" in message
+    assert "LOCALAGENT_TTS_VOICE" in message
 
 
 def test_tts_cli_writes_output_file(monkeypatch, tmp_path):

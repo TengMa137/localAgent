@@ -127,9 +127,6 @@ LOCALAGENT_SKILLS_DIR=skills
 
 ```bash
 uv run python src/run_agents.py
-
-# enable full agent traces
-uv run python src/run_agents.py --debug
 ```
 
 Type anything to begin. Enter `exit`, `quit`, or press `Ctrl-C` to quit.
@@ -195,34 +192,94 @@ export LOCALAGENT_MODEL_API_KEY=no-key
 
 No other changes needed — the rest of the agent stack is model-agnostic.
 
-### Local speech via Qwen3 ASR/TTS
+### Local speech via CrispASR Qwen3 ASR/TTS
 
 The speech integration keeps the agent core text-only. A local frontend can send
-microphone audio to `voice_api.py`; the API transcribes with Qwen3-ASR and then
-passes the transcript into the existing `handle_turn(...)` path. Experimental
-TTS support can synthesize agent replies through `qwen3-tts.cpp`.
+microphone audio to `voice_api.py`; the API transcribes with CrispASR's Qwen3
+ASR backend and then passes the transcript into the existing `handle_turn(...)`
+path. TTS calls a second CrispASR server loaded with the Qwen3-TTS 0.6B
+CustomVoice backend.
 
-Start a separate llama.cpp server for ASR:
+Build or install `crispasr` from <https://github.com/CrispStrobe/CrispASR>, then
+download the preferred GGUF files into this repo's `./models` directory:
 
 ```bash
-llama-server \
-    -hf ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0 \
-    --port 8081 \
-    -c 8192
+mkdir -p models
+
+hf download cstr/qwen3-asr-1.7b-GGUF \
+    qwen3-asr-1.7b-q8_0.gguf \
+    --local-dir ./models
+
+hf download cstr/qwen3-tts-0.6b-customvoice-GGUF \
+    qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf \
+    --local-dir ./models
+
+hf download cstr/qwen3-tts-tokenizer-12hz-GGUF \
+    qwen3-tts-tokenizer-12hz.gguf \
+    --local-dir ./models
 ```
+
+Then start one ASR server and one TTS server. CrispASR keeps the loaded model
+resident inside each server process.
+
+```bash
+crispasr --server \
+    --backend qwen3 \
+    -m ./models/qwen3-asr-1.7b-q8_0.gguf \
+    --port 8081
+
+crispasr --server \
+    --backend qwen3-tts-customvoice \
+    -m ./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf \
+    --codec-model ./models/qwen3-tts-tokenizer-12hz.gguf \
+    --voice vivian \
+    --port 8082
+```
+
+For the CustomVoice TTS model, `vivian` is one of the baked speaker names, so no
+reference WAV or `--voice-dir` is required.
 
 Then start the local voice API:
 
 ```bash
 export LOCALAGENT_ASR_BASE_URL=http://localhost:8081/v1
-export LOCALAGENT_ASR_MODEL=Qwen3-ASR-1.7B-GGUF
+export LOCALAGENT_ASR_BACKEND=qwen3
+export LOCALAGENT_ASR_MODEL=./models/qwen3-asr-1.7b-q8_0.gguf
 
-# Optional TTS via https://github.com/predict-woo/qwen3-tts.cpp
-export LOCALAGENT_TTS_CLI=/path/to/qwen3-tts.cpp/build/qwen3-tts-cli
-export LOCALAGENT_TTS_MODEL_DIR=/path/to/qwen3-tts.cpp/models
+export LOCALAGENT_TTS_BASE_URL=http://localhost:8082/v1
+export LOCALAGENT_TTS_BACKEND=qwen3-tts-customvoice
+export LOCALAGENT_TTS_MODEL=./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf
+export LOCALAGENT_TTS_CODEC_MODEL=./models/qwen3-tts-tokenizer-12hz.gguf
+export LOCALAGENT_TTS_VOICE=vivian
 
 uv run python src/voice_api.py --host 127.0.0.1 --port 8090
 ```
+
+`LOCALAGENT_*_MODEL` is retained in requests and diagnostics. In server mode,
+CrispASR uses the model loaded at server startup, so keep the server command and
+environment values in sync.
+
+Quick server checks:
+
+```bash
+curl http://localhost:8081/health
+curl http://localhost:8081/v1/models
+curl http://localhost:8082/health
+curl http://localhost:8082/v1/models
+
+curl http://localhost:8081/v1/audio/transcriptions \
+    -F "file=@./sample.wav" \
+    -F "response_format=json"
+
+curl http://localhost:8082/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"input":"Hello from the local CrispASR TTS server.","voice":"vivian","response_format":"wav"}' \
+    -o ./tmp/tts-test.wav
+```
+
+CrispASR's TTS endpoint returns a normal audio response. The terminal runner
+can still provide near-real-time speech by splitting assistant replies into
+sentence-sized chunks, synthesizing each chunk, and playing them in order.
 
 Useful endpoints:
 
@@ -231,7 +288,7 @@ Useful endpoints:
 | `GET /health` | none | API health check |
 | `GET /speech/models` | none | Configured local speech models |
 | `POST /speech/asr` | `{"audio_base64": "...", "mime_type": "audio/wav"}` | Transcript only |
-| `POST /speech/tts` | `{"text": "...", "reference_audio_path": "optional"}` | WAV audio as base64 |
+| `POST /speech/tts` | `{"text": "...", "voice": "vivian", "instructions": "optional", "speed": 1.0}` | WAV audio as base64 |
 | `POST /agent/voice-turn` | `{"audio_base64": "...", "mime_type": "audio/wav", "session_id": "optional", "tts": false}` | Transcript plus agent reply, optionally with reply audio |
 
 You can also test ASR/TTS directly from the command line without running the
@@ -244,14 +301,43 @@ uv run python -m speech.qwen3 asr-file ./sample.wav
 # Record 5 seconds from the mic, save ./tmp/mic-*.wav, then print ASR text
 uv run python -m speech.qwen3 asr-mic --seconds 5 --out-dir ./tmp
 
-# Synthesize text and save ./tmp/tts-*.wav
+# Synthesize text through the configured CrispASR TTS server and save ./tmp/tts-*.wav
 uv run python -m speech.qwen3 tts "Hello from local Qwen3 TTS." --out-dir ./tmp
-
-# Optional: use the saved mic clip as a voice reference for TTS
-uv run python -m speech.qwen3 tts "Now using a reference voice." \
-    --reference-audio ./tmp/mic-<timestamp>.wav \
-    --out-dir ./tmp
 ```
+
+To speak assistant replies while using the terminal runner:
+
+```bash
+uv run python src/run_agents.py --tts
+```
+
+`--tts` targets the configured Qwen3-TTS CrispASR server at
+`LOCALAGENT_TTS_BASE_URL`.
+
+Terminal playback uses an available local audio player. On macOS, `afplay` is
+used automatically. On Linux, install `aplay`, `paplay`, or `ffplay`, or pass a
+player command:
+
+```bash
+uv run python src/run_agents.py --tts --tts-player afplay
+```
+
+The same flag also works with voice input:
+
+```bash
+uv run python src/run_agents.py --voice --tts
+```
+
+Useful TTS playback environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOCALAGENT_TTS_PLAYER` | auto-detect | Playback command that accepts an audio file path as its last argument |
+| `LOCALAGENT_TTS_MIN_CHARS` | `80` | Minimum text chunk size before sentence-boundary playback |
+| `LOCALAGENT_TTS_MAX_CHARS` | `260` | Maximum text chunk size before splitting at a word boundary |
+| `LOCALAGENT_TTS_MIN_SENTENCE_CHARS` | `1` | Minimum complete sentence size allowed to play immediately |
+| `LOCALAGENT_TTS_INITIAL_MAX_CHARS` | Qwen3 profile | Shorter first chunk target for faster time-to-first-audio |
+| `LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS` | Qwen3 profile | Split long sentences at commas/semicolons after this many chars |
 
 For terminal voice input, install the local microphone dependency:
 
@@ -277,38 +363,9 @@ uv run python src/run_agents.py --list-audio-devices
 uv run python src/run_agents.py --voice --voice-device 1
 ```
 
-If transcription is unrelated to what you said, save the exact WAV sent to ASR
-and play it back:
-
-```bash
-uv run python src/run_agents.py --voice --voice-device 0 --voice-save-audio-dir /tmp/localagent-asr
-afplay /tmp/localagent-asr/<saved-file>.wav
-```
-
-For intermittent no-speech failures, save only failed recordings:
-
-```bash
-uv run python src/run_agents.py --voice --voice-device 0 --voice-debug-audio
-ls /tmp/localagent-asr
-```
-
-If the saved audio is noisy or distorted, try disabling automatic gain:
-
-```bash
-uv run python src/run_agents.py --voice --voice-device 0 --voice-no-normalize
-```
-
-If the audio sounds clear but language detection is wrong, force the language:
-
-```bash
-uv run python src/run_agents.py --voice --voice-device 0 --voice-language English
-```
-
-With the GGUF `llama-server` backend this is utterance-level ASR: the terminal
-records a chunk, then Qwen3-ASR processes that complete audio chunk and returns
-text. Qwen3-ASR's upstream vLLM backend supports streaming inference, but the
-llama.cpp multimodal GGUF path used here is best treated as non-streaming audio
-input even if token output is streamed later.
+With the default CrispASR Qwen3 backend this is utterance-level ASR: the terminal
+records a chunk, then CrispASR processes that complete audio chunk and returns
+text.
 
 ---
 
@@ -576,17 +633,34 @@ Runtime environment variables:
 |---|---|---|
 | `LOCALAGENT_MODEL_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible model endpoint used by pydantic-ai and `rag_lib` |
 | `LOCALAGENT_MODEL_API_KEY` | `no-key` | API key sent to the model endpoint |
-| `LOCALAGENT_ASR_BASE_URL` | `http://localhost:8081/v1` | OpenAI-compatible Qwen3-ASR endpoint |
-| `LOCALAGENT_ASR_MODEL` | `Qwen3-ASR-1.7B-GGUF` | Model id sent to the ASR endpoint |
+| `LOCALAGENT_SPEECH_CLI` | `crispasr` | CrispASR executable used only when a speech base URL is set empty for CLI fallback |
+| `LOCALAGENT_ASR_BASE_URL` | `http://localhost:8081/v1` | OpenAI-compatible CrispASR ASR endpoint; set empty to use CLI mode |
+| `LOCALAGENT_ASR_BACKEND` | `qwen3` | CrispASR ASR backend |
+| `LOCALAGENT_ASR_MODEL` | `./models/qwen3-asr-1.7b-q8_0.gguf` | Preferred ASR model path sent in requests/metadata; server uses its loaded model |
 | `LOCALAGENT_ASR_API_KEY` | `no-key` | API key sent to the ASR endpoint |
-| `LOCALAGENT_ASR_TIMEOUT_SECONDS` | `300` | ASR HTTP request timeout |
+| `LOCALAGENT_ASR_TIMEOUT_SECONDS` | `300` | ASR request/subprocess timeout |
 | `LOCALAGENT_ASR_MAX_TOKENS` | `512` | Maximum generated ASR tokens |
-| `LOCALAGENT_TTS_CLI` | `qwen3-tts-cli` | qwen3-tts.cpp CLI executable path |
-| `LOCALAGENT_TTS_MODEL_DIR` | `models` | Directory containing qwen3-tts.cpp GGUF artifacts |
-| `LOCALAGENT_TTS_TIMEOUT_SECONDS` | `600` | TTS subprocess timeout |
-| `LOCALAGENT_TTS_TEMPERATURE` | unset | Optional qwen3-tts.cpp sampling temperature |
-| `LOCALAGENT_TTS_TOP_K` | unset | Optional qwen3-tts.cpp top-k value |
-| `LOCALAGENT_TTS_MAX_TOKENS` | unset | Optional qwen3-tts.cpp max audio-token count |
+| `LOCALAGENT_ASR_RESPONSE_FORMAT` | `json` | CrispASR server response format |
+| `LOCALAGENT_ASR_LANGUAGE` | unset | Optional language passed to CrispASR with `-l`/`language` |
+| `LOCALAGENT_ASR_THREADS` | unset | Optional CrispASR ASR thread count |
+| `LOCALAGENT_ASR_VAD` | unset | Set true to pass `--vad` in ASR CLI mode |
+| `LOCALAGENT_TTS_BASE_URL` | `http://localhost:8082/v1` | OpenAI-compatible CrispASR TTS endpoint; set empty to use CLI mode |
+| `LOCALAGENT_TTS_CLI` | `crispasr` | CrispASR executable for TTS CLI fallback |
+| `LOCALAGENT_TTS_BACKEND` | `qwen3-tts-customvoice` | CrispASR TTS backend |
+| `LOCALAGENT_TTS_MODEL` | `./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf` | Preferred TTS model path sent in requests/metadata; server uses its loaded model |
+| `LOCALAGENT_TTS_TIMEOUT_SECONDS` | `600` | TTS request/subprocess timeout |
+| `LOCALAGENT_TTS_VOICE` | `vivian` | CrispASR CustomVoice baked speaker name |
+| `LOCALAGENT_TTS_REF_TEXT` | unset | Reference text for Qwen3-TTS WAV voice cloning in CLI mode |
+| `LOCALAGENT_TTS_CODEC_MODEL` | `./models/qwen3-tts-tokenizer-12hz.gguf` | Qwen3-TTS codec GGUF path for server startup/CLI fallback |
+| `LOCALAGENT_TTS_TEMPERATURE` | unset | Optional CrispASR TTS sampling temperature |
+| `LOCALAGENT_TTS_SPEED` | unset | Optional CrispASR TTS server speed multiplier |
+| `LOCALAGENT_TTS_THREADS` | unset | Optional CrispASR TTS thread count |
+| `LOCALAGENT_TTS_PLAYER` | auto-detect | Terminal playback command used by `run_agents.py --tts` |
+| `LOCALAGENT_TTS_MIN_CHARS` | `80` | Minimum chunk size for terminal TTS playback |
+| `LOCALAGENT_TTS_MAX_CHARS` | `260` | Maximum chunk size for terminal TTS playback |
+| `LOCALAGENT_TTS_MIN_SENTENCE_CHARS` | `1` | Minimum complete sentence size allowed to play immediately |
+| `LOCALAGENT_TTS_INITIAL_MAX_CHARS` | Qwen3 profile | Shorter first chunk target for faster time-to-first-audio |
+| `LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS` | Qwen3 profile | Split long sentences at commas/semicolons after this many chars |
 | `LOCALAGENT_MCP_URL` | `http://localhost:8000/sse` | MCP web server SSE endpoint |
 | `LOCALAGENT_DOCS_DIR` | `user_docs` | Host directory mounted into the agent as `/docs` |
 | `LOCALAGENT_SKILLS_DIR` | `skills` | Host directory mounted into the agent as `/skills` |

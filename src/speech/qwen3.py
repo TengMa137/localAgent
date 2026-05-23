@@ -1,4 +1,4 @@
-"""Compact experimental Qwen3 speech providers."""
+"""CrispASR-backed Qwen speech providers."""
 
 from __future__ import annotations
 
@@ -17,10 +17,25 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 _ASR_TEXT_TAG = "<asr_text>"
 _LANG_PREFIX = "language "
+
+
+def _optional_float(name: str) -> float | None:
+    value = os.getenv(name)
+    return float(value) if value else None
+
+
+def _optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    return int(value) if value else None
+
+
+def _optional_text(value: object | None) -> str:
+    return value.strip() if isinstance(value, str) else ""
 
 
 @dataclass(frozen=True)
@@ -48,63 +63,82 @@ class TTSResult:
 
 @dataclass(frozen=True)
 class Qwen3ASRConfig:
-    """Runtime config for a Qwen3-ASR llama.cpp-compatible server."""
+    """Runtime config for CrispASR Qwen3-ASR.
+
+    The default assumes a persistent CrispASR server loaded from
+    ``./models/qwen3-asr-1.7b-q8_0.gguf``.
+    Set ``base_url`` to an empty string only for ad hoc CLI fallback.
+    """
 
     base_url: str = os.getenv("LOCALAGENT_ASR_BASE_URL", "http://localhost:8081/v1")
-    model: str = os.getenv("LOCALAGENT_ASR_MODEL", "Qwen3-ASR-1.7B-GGUF")
+    cli_path: str = os.getenv("LOCALAGENT_SPEECH_CLI", "crispasr")
+    backend: str = os.getenv("LOCALAGENT_ASR_BACKEND", "qwen3")
+    model: str = os.getenv("LOCALAGENT_ASR_MODEL", "./models/qwen3-asr-1.7b-q8_0.gguf")
     api_key: str = os.getenv("LOCALAGENT_ASR_API_KEY", "no-key")
     timeout_seconds: float = float(os.getenv("LOCALAGENT_ASR_TIMEOUT_SECONDS", "300"))
     max_tokens: int = int(os.getenv("LOCALAGENT_ASR_MAX_TOKENS", "512"))
-    temperature: float = float(os.getenv("LOCALAGENT_ASR_TEMPERATURE", "0.01"))
+    temperature: float = float(os.getenv("LOCALAGENT_ASR_TEMPERATURE", "0"))
+    response_format: str = os.getenv("LOCALAGENT_ASR_RESPONSE_FORMAT", "json")
+    language: str = os.getenv("LOCALAGENT_ASR_LANGUAGE", "")
+    threads: int | None = _optional_int("LOCALAGENT_ASR_THREADS")
+    vad: bool = os.getenv("LOCALAGENT_ASR_VAD", "").lower() in {"1", "true", "yes"}
+    output_json: bool = os.getenv("LOCALAGENT_ASR_OUTPUT_JSON", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+    }
 
 
 class Qwen3ASRError(RuntimeError):
-    """Raised when the local Qwen3-ASR backend cannot produce a transcript."""
-
-
-def _optional_float(name: str) -> float | None:
-    value = os.getenv(name)
-    return float(value) if value else None
-
-
-def _optional_int(name: str) -> int | None:
-    value = os.getenv(name)
-    return int(value) if value else None
+    """Raised when CrispASR cannot produce a transcript."""
 
 
 @dataclass(frozen=True)
 class Qwen3TTSConfig:
-    """Runtime config for qwen3-tts.cpp CLI synthesis."""
+    """Runtime config for CrispASR Qwen3-TTS."""
 
-    cli_path: str = os.getenv("LOCALAGENT_TTS_CLI", "qwen3-tts-cli")
-    model_dir: str = os.getenv("LOCALAGENT_TTS_MODEL_DIR", "models")
-    timeout_seconds: float = float(os.getenv("LOCALAGENT_TTS_TIMEOUT_SECONDS", "600"))
-    temperature: float | None = _optional_float("LOCALAGENT_TTS_TEMPERATURE")
-    top_k: int | None = _optional_int("LOCALAGENT_TTS_TOP_K")
-    top_p: float | None = _optional_float("LOCALAGENT_TTS_TOP_P")
-    max_tokens: int | None = _optional_int("LOCALAGENT_TTS_MAX_TOKENS")
-    repetition_penalty: float | None = _optional_float(
-        "LOCALAGENT_TTS_REPETITION_PENALTY"
+    base_url: str = os.getenv("LOCALAGENT_TTS_BASE_URL", "http://localhost:8082/v1")
+    cli_path: str = os.getenv(
+        "LOCALAGENT_TTS_CLI", os.getenv("LOCALAGENT_SPEECH_CLI", "crispasr")
     )
+    backend: str = os.getenv("LOCALAGENT_TTS_BACKEND", "qwen3-tts-customvoice")
+    model: str = os.getenv(
+        "LOCALAGENT_TTS_MODEL",
+        "./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf",
+    )
+    api_key: str = os.getenv("LOCALAGENT_TTS_API_KEY", "no-key")
+    timeout_seconds: float = float(os.getenv("LOCALAGENT_TTS_TIMEOUT_SECONDS", "600"))
+    voice: str = os.getenv("LOCALAGENT_TTS_VOICE", "vivian")
+    voice_dir: str = os.getenv("LOCALAGENT_TTS_VOICE_DIR", "")
+    reference_text: str = os.getenv("LOCALAGENT_TTS_REF_TEXT", "")
+    codec_model: str = os.getenv(
+        "LOCALAGENT_TTS_CODEC_MODEL",
+        "./models/qwen3-tts-tokenizer-12hz.gguf",
+    )
+    language: str = os.getenv("LOCALAGENT_TTS_LANGUAGE", "")
+    instructions: str = os.getenv("LOCALAGENT_TTS_INSTRUCTIONS", "")
+    response_format: str = os.getenv("LOCALAGENT_TTS_RESPONSE_FORMAT", "wav")
+    temperature: float | None = _optional_float("LOCALAGENT_TTS_TEMPERATURE")
+    speed: float | None = _optional_float("LOCALAGENT_TTS_SPEED")
     threads: int | None = _optional_int("LOCALAGENT_TTS_THREADS")
 
 
 class Qwen3TTSError(RuntimeError):
-    """Raised when qwen3-tts.cpp cannot produce audio."""
+    """Raised when CrispASR cannot produce audio."""
 
 
 class Qwen3ASRProvider:
-    """Transcribe audio through a local Qwen3-ASR GGUF server.
+    """Transcribe audio through CrispASR with the Qwen3 ASR backend.
 
-    Start the server with something like:
+    Preferred server mode:
 
-        llama-server -hf ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0 --port 8081
+        crispasr --server --backend qwen3 -m auto --port 8081
 
-    The provider sends audio to the OpenAI-style audio transcription endpoint.
-    This keeps the rest of the agent code text-only.
+    For ad hoc use, set ``LOCALAGENT_ASR_BASE_URL=`` and optionally override
+    ``LOCALAGENT_ASR_MODEL=auto`` so the CLI path can use CrispASR's downloader.
     """
 
-    provider_name = "qwen3-asr-llamacpp"
+    provider_name = "crispasr-qwen3-asr"
 
     def __init__(self, config: Qwen3ASRConfig | None = None) -> None:
         self.config = config or Qwen3ASRConfig()
@@ -129,6 +163,22 @@ class Qwen3ASRProvider:
     ) -> ASRResult:
         audio_base64 = _strip_data_url_prefix(audio_base64)
         audio_bytes = base64.b64decode(audio_base64)
+        if not self.config.base_url.strip():
+            suffix = mimetypes.guess_extension(mime_type) or ".wav"
+            temp_path: Path | None = None
+            try:
+                handle = tempfile.NamedTemporaryFile(
+                    prefix="localagent-asr-upload-",
+                    suffix=suffix,
+                    delete=False,
+                )
+                temp_path = Path(handle.name)
+                handle.close()
+                temp_path.write_bytes(audio_bytes)
+                return await self.transcribe_file(temp_path, language=language)
+            finally:
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
         return await asyncio.to_thread(
             self._transcribe_bytes_sync,
             audio_bytes,
@@ -138,8 +188,12 @@ class Qwen3ASRProvider:
         )
 
     def _transcribe_file_sync(self, path: Path, language: str | None) -> ASRResult:
-        mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
-        return self._transcribe_bytes_sync(path.read_bytes(), path.name, mime_type, language)
+        if self.config.base_url.strip():
+            mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
+            return self._transcribe_bytes_sync(
+                path.read_bytes(), path.name, mime_type, language
+            )
+        return self._transcribe_cli_sync(path, language)
 
     def _transcribe_bytes_sync(
         self,
@@ -170,13 +224,16 @@ class Qwen3ASRProvider:
                 body = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise Qwen3ASRError(f"Qwen3-ASR HTTP {exc.code}: {detail}") from exc
+            raise Qwen3ASRError(f"CrispASR ASR HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise Qwen3ASRError(
-                f"Could not reach Qwen3-ASR server at {url}: {exc.reason}"
+                f"Could not reach CrispASR ASR server at {url}: {exc.reason}"
             ) from exc
 
-        raw = _extract_transcription_text(json.loads(body))
+        try:
+            raw = _extract_transcription_text(json.loads(body))
+        except json.JSONDecodeError:
+            raw = body.strip()
         parsed_language, text = parse_asr_output(raw, user_language=language)
         return ASRResult(
             text=text,
@@ -196,11 +253,12 @@ class Qwen3ASRProvider:
         boundary = "----localagent-qwen3-asr"
         parts = [
             _multipart_field(boundary, "model", self.config.model),
+            _multipart_field(boundary, "response_format", self.config.response_format),
             _multipart_field(boundary, "temperature", str(self.config.temperature)),
-            _multipart_field(boundary, "max_tokens", str(self.config.max_tokens)),
         ]
-        if language:
-            parts.append(_multipart_field(boundary, "language", language))
+        request_language = _optional_text(language) or self.config.language
+        if request_language:
+            parts.append(_multipart_field(boundary, "language", request_language))
         parts.append(
             _multipart_file(
                 boundary,
@@ -213,16 +271,106 @@ class Qwen3ASRProvider:
         parts.append(f"--{boundary}--\r\n".encode("utf-8"))
         return boundary, b"".join(parts)
 
+    def _transcribe_cli_sync(self, path: Path, language: str | None) -> ASRResult:
+        handle = tempfile.NamedTemporaryFile(
+            prefix="localagent-asr-",
+            delete=False,
+        )
+        output_base = Path(handle.name)
+        handle.close()
+        output_base.unlink(missing_ok=True)
+        json_path = output_base.with_suffix(".json")
+        txt_path = output_base.with_suffix(".txt")
+        cmd = self._build_transcription_command(
+            path,
+            output_base=output_base,
+            language=language,
+        )
+
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout_seconds,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise Qwen3ASRError(
+                f"Could not find CrispASR CLI: {self.config.cli_path}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise Qwen3ASRError("CrispASR ASR timed out") from exc
+
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise Qwen3ASRError(f"CrispASR ASR failed: {detail}")
+
+        raw = ""
+        try:
+            if json_path.exists():
+                raw = _extract_crispasr_json_text(json.loads(json_path.read_text()))
+            elif txt_path.exists():
+                raw = txt_path.read_text().strip()
+            else:
+                raw = _clean_cli_transcript(completed.stdout)
+        finally:
+            output_base.unlink(missing_ok=True)
+            json_path.unlink(missing_ok=True)
+            txt_path.unlink(missing_ok=True)
+
+        parsed_language, text = parse_asr_output(raw, user_language=language)
+        return ASRResult(
+            text=text,
+            language=parsed_language,
+            raw_text=raw,
+            provider=self.provider_name,
+        )
+
+    def _build_transcription_command(
+        self,
+        audio_path: Path,
+        *,
+        output_base: Path,
+        language: str | None,
+    ) -> list[str]:
+        cmd = [
+            self.config.cli_path,
+            "--backend",
+            self.config.backend,
+            "-m",
+            self.config.model,
+            "-f",
+            str(audio_path),
+            "-of",
+            str(output_base),
+            "-np",
+        ]
+        if self.config.output_json:
+            cmd.append("-oj")
+        else:
+            cmd.append("-otxt")
+        request_language = _optional_text(language) or self.config.language
+        if request_language:
+            cmd.extend(["-l", request_language])
+        if self.config.vad:
+            cmd.append("--vad")
+        if self.config.threads is not None:
+            cmd.extend(["-t", str(self.config.threads)])
+        _append_optional(cmd, "-tp", self.config.temperature)
+        _append_optional(cmd, "-n", self.config.max_tokens)
+        return cmd
+
 
 class Qwen3TTSProvider:
-    """Synthesize speech through the qwen3-tts.cpp command-line binary.
+    """Synthesize speech through CrispASR's Qwen3-TTS backend.
 
-    Build https://github.com/predict-woo/qwen3-tts.cpp separately, then either
-    put `qwen3-tts-cli` on PATH or set LOCALAGENT_TTS_CLI. The model directory
-    should contain the converted GGUF artifacts from that project.
+    The default path calls a persistent CrispASR TTS server loaded from
+    ``./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf``. Set
+    ``LOCALAGENT_TTS_BASE_URL=`` only for ad hoc CLI fallback.
     """
 
-    provider_name = "qwen3-tts-cpp"
+    provider_name = "crispasr-qwen3-tts"
 
     def __init__(self, config: Qwen3TTSConfig | None = None) -> None:
         self.config = config or Qwen3TTSConfig()
@@ -232,6 +380,10 @@ class Qwen3TTSProvider:
         text: str,
         *,
         reference_audio_path: str | Path | None = None,
+        reference_text: str | None = None,
+        voice: str | None = None,
+        instructions: str | None = None,
+        speed: float | None = None,
     ) -> TTSResult:
         return await asyncio.to_thread(
             self._synthesize_sync,
@@ -239,6 +391,10 @@ class Qwen3TTSProvider:
             Path(reference_audio_path).expanduser().resolve()
             if reference_audio_path
             else None,
+            reference_text,
+            voice,
+            instructions,
+            speed,
         )
 
     async def synthesize_with_reference_base64(
@@ -247,6 +403,8 @@ class Qwen3TTSProvider:
         reference_audio_base64: str,
         *,
         reference_mime_type: str = "audio/wav",
+        reference_text: str | None = None,
+        speed: float | None = None,
     ) -> TTSResult:
         suffix = mimetypes.guess_extension(reference_mime_type) or ".wav"
         reference_audio_base64 = _strip_data_url_prefix(reference_audio_base64)
@@ -260,7 +418,12 @@ class Qwen3TTSProvider:
             reference_path = Path(handle.name)
             handle.close()
             reference_path.write_bytes(base64.b64decode(reference_audio_base64))
-            return await self.synthesize(text, reference_audio_path=reference_path)
+            return await self.synthesize(
+                text,
+                reference_audio_path=reference_path,
+                reference_text=reference_text,
+                speed=speed,
+            )
         finally:
             if reference_path is not None:
                 reference_path.unlink(missing_ok=True)
@@ -269,12 +432,25 @@ class Qwen3TTSProvider:
         self,
         text: str,
         reference_audio_path: Path | None,
+        reference_text: str | None = None,
+        voice: str | None = None,
+        instructions: str | None = None,
+        speed: float | None = None,
     ) -> TTSResult:
         clean_text = text.strip()
         if not clean_text:
             raise ValueError("text is required")
         if reference_audio_path is not None and not reference_audio_path.exists():
             raise FileNotFoundError(reference_audio_path)
+        if self.config.base_url.strip():
+            return self._synthesize_http_sync(
+                clean_text,
+                reference_audio_path=reference_audio_path,
+                reference_text=reference_text,
+                voice=voice,
+                instructions=instructions,
+                speed=speed,
+            )
 
         handle = tempfile.NamedTemporaryFile(
             prefix="localagent-tts-",
@@ -290,6 +466,10 @@ class Qwen3TTSProvider:
                     clean_text,
                     output_path=output_path,
                     reference_audio_path=reference_audio_path,
+                    reference_text=reference_text,
+                    voice=voice,
+                    instructions=instructions,
+                    speed=speed,
                 ),
                 capture_output=True,
                 text=True,
@@ -299,28 +479,148 @@ class Qwen3TTSProvider:
         except FileNotFoundError as exc:
             output_path.unlink(missing_ok=True)
             raise Qwen3TTSError(
-                f"Could not find qwen3-tts.cpp CLI: {self.config.cli_path}"
+                f"Could not find CrispASR CLI: {self.config.cli_path}"
             ) from exc
         except subprocess.TimeoutExpired as exc:
             output_path.unlink(missing_ok=True)
-            raise Qwen3TTSError("qwen3-tts.cpp synthesis timed out") from exc
+            raise Qwen3TTSError("CrispASR TTS timed out") from exc
 
         if completed.returncode != 0:
             output_path.unlink(missing_ok=True)
             detail = (completed.stderr or completed.stdout or "").strip()
-            raise Qwen3TTSError(f"qwen3-tts.cpp failed: {detail}")
+            raise Qwen3TTSError(f"CrispASR TTS failed: {detail}")
 
         try:
             audio_bytes = output_path.read_bytes()
         finally:
             output_path.unlink(missing_ok=True)
         if not audio_bytes:
-            raise Qwen3TTSError("qwen3-tts.cpp produced an empty WAV file")
+            raise Qwen3TTSError("CrispASR TTS produced an empty WAV file")
         return TTSResult(
             audio_bytes=audio_bytes,
             mime_type="audio/wav",
             provider=self.provider_name,
         )
+
+    def _synthesize_http_sync(
+        self,
+        text: str,
+        *,
+        reference_audio_path: Path | None,
+        reference_text: str | None,
+        voice: str | None,
+        instructions: str | None,
+        speed: float | None,
+    ) -> TTSResult:
+        request_voice = self._resolve_voice(reference_audio_path, voice)
+        request_instructions = _optional_text(instructions) or self.config.instructions
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "input": text,
+            "response_format": self.config.response_format,
+        }
+        if request_voice:
+            payload["voice"] = request_voice
+        if request_instructions:
+            payload["instructions"] = request_instructions
+        if self.config.language:
+            payload["language"] = self.config.language
+        request_speed = speed if speed is not None else self.config.speed
+        if request_speed is not None:
+            payload["speed"] = request_speed
+        url = self.config.base_url.rstrip("/") + "/audio/speech"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as resp:
+                audio_bytes = resp.read()
+                mime_type = resp.headers.get_content_type() or "audio/wav"
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            hint = self._tts_http_error_hint(
+                url=url,
+                detail=detail,
+                request_voice=request_voice,
+            )
+            raise Qwen3TTSError(
+                f"CrispASR TTS HTTP {exc.code}: {detail}{hint}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise Qwen3TTSError(
+                f"Could not reach CrispASR TTS server at {url}: {exc.reason}"
+            ) from exc
+
+        if not audio_bytes:
+            raise Qwen3TTSError("CrispASR TTS server returned empty audio")
+        return TTSResult(
+            audio_bytes=audio_bytes,
+            mime_type=mime_type,
+            provider=self.provider_name,
+        )
+
+    def _tts_http_error_hint(
+        self,
+        *,
+        url: str,
+        detail: str,
+        request_voice: str,
+    ) -> str:
+        if "synthesis_failed" not in detail and "empty audio" not in detail:
+            return ""
+
+        context = (
+            f"request voice={request_voice!r}"
+            if request_voice
+            else "request used server startup voice"
+        )
+        voices = self._fetch_server_voice_names(url)
+        if voices:
+            context += f"; server voices={', '.join(voices[:12])}"
+            if len(voices) > 12:
+                context += f", ... (+{len(voices) - 12} more)"
+        elif voices == []:
+            context += "; server reported no named voices"
+        context += (
+            "; check LOCALAGENT_TTS_VOICE against the CrispASR server backend"
+        )
+        return f" ({context})"
+
+    def _fetch_server_voice_names(self, speech_url: str) -> list[str] | None:
+        voices_url = speech_url.rsplit("/", 1)[0] + "/voices"
+        request = urllib.request.Request(
+            voices_url,
+            headers={"Authorization": f"Bearer {self.config.api_key}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=min(max(self.config.timeout_seconds, 0.1), 2.0),
+            ) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+
+        raw_voices = payload.get("voices") if isinstance(payload, dict) else None
+        if not isinstance(raw_voices, list):
+            return None
+
+        names: list[str] = []
+        for item in raw_voices:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                name = item["name"].strip()
+                if name:
+                    names.append(name)
+            elif isinstance(item, str) and item.strip():
+                names.append(item.strip())
+        return names
 
     def _build_synthesis_command(
         self,
@@ -328,26 +628,54 @@ class Qwen3TTSProvider:
         *,
         output_path: Path,
         reference_audio_path: Path | None = None,
+        reference_text: str | None = None,
+        voice: str | None = None,
+        instructions: str | None = None,
+        speed: float | None = None,
     ) -> list[str]:
         cmd = [
             self.config.cli_path,
+            "--backend",
+            self.config.backend,
             "-m",
-            self.config.model_dir,
-            "-t",
+            self.config.model,
+            "--tts",
             text,
-            "-o",
+            "--tts-output",
             str(output_path),
         ]
-        if reference_audio_path is not None:
-            cmd.extend(["-r", str(reference_audio_path)])
+        request_voice = self._resolve_voice(reference_audio_path, voice)
+        if request_voice:
+            cmd.extend(["--voice", request_voice])
+        ref_text = _optional_text(reference_text) or self.config.reference_text
+        if ref_text:
+            cmd.extend(["--ref-text", ref_text])
+        if self.config.voice_dir:
+            cmd.extend(["--voice-dir", self.config.voice_dir])
+        if self.config.codec_model:
+            cmd.extend(["--codec-model", self.config.codec_model])
+        request_instructions = _optional_text(instructions) or self.config.instructions
+        if request_instructions:
+            cmd.extend(["--instruct", request_instructions])
+        if self.config.language:
+            cmd.extend(["-l", self.config.language])
+        request_speed = speed if speed is not None else self.config.speed
+        _append_optional(cmd, "--speed", request_speed)
         _append_optional(cmd, "--temperature", self.config.temperature)
-        _append_optional(cmd, "--top-k", self.config.top_k)
-        _append_optional(cmd, "--top-p", self.config.top_p)
-        _append_optional(cmd, "--max-tokens", self.config.max_tokens)
-        _append_optional(cmd, "--repetition-penalty", self.config.repetition_penalty)
         if self.config.threads is not None:
-            cmd.extend(["-j", str(self.config.threads)])
+            cmd.extend(["-t", str(self.config.threads)])
         return cmd
+
+    def _resolve_voice(
+        self,
+        reference_audio_path: Path | None,
+        voice: str | None,
+    ) -> str:
+        if reference_audio_path is not None:
+            return str(reference_audio_path)
+        if isinstance(voice, str):
+            return voice.strip()
+        return self.config.voice.strip()
 
 
 def parse_asr_output(raw: str | None, user_language: str | None = None) -> tuple[str, str]:
@@ -395,6 +723,36 @@ def _extract_transcription_text(payload: dict[str, object]) -> str:
     except (KeyError, IndexError, TypeError) as exc:
         raise Qwen3ASRError(f"Unexpected ASR response payload: {payload!r}") from exc
     raise Qwen3ASRError(f"Unexpected ASR response payload: {payload!r}")
+
+
+def _extract_crispasr_json_text(payload: dict[str, object]) -> str:
+    text = payload.get("text")
+    if isinstance(text, str):
+        return text.strip()
+
+    transcription = payload.get("transcription")
+    if isinstance(transcription, list):
+        parts: list[str] = []
+        for item in transcription:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"].strip())
+        return " ".join(part for part in parts if part).strip()
+
+    return _clean_cli_transcript(json.dumps(payload, ensure_ascii=False))
+
+
+def _clean_cli_transcript(stdout: str) -> str:
+    lines = []
+    for line in stdout.splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        if clean.startswith("[") and "-->" in clean:
+            clean = clean.split("]", 1)[-1].strip()
+        if clean.lower().startswith(("crispasr:", "whisper_", "ggml_")):
+            continue
+        lines.append(clean)
+    return " ".join(lines).strip()
 
 
 def _multipart_field(boundary: str, name: str, value: str) -> bytes:

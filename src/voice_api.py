@@ -1,4 +1,14 @@
-"""Small local JSON API for frontend speech integration."""
+"""Optional local JSON bridge for external speech frontends.
+
+The terminal app does not need this module. ``run_agents.py --voice`` records
+audio locally and calls CrispASR directly, while ``run_agents.py --tts`` speaks
+assistant replies in the terminal.
+
+This server is useful when a browser, mobile client, or other frontend wants a
+simple JSON API that wraps base64 ASR, optional agent execution, session state,
+and optional TTS into one local service. CrispASR itself should still run as the
+underlying ASR/TTS server.
+"""
 
 from __future__ import annotations
 
@@ -39,13 +49,17 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "asr": {
-                        "provider": "qwen3-asr-llamacpp",
+                        "provider": "crispasr-qwen3-asr",
                         "model": asr_config.model,
+                        "backend": asr_config.backend,
                         "base_url": asr_config.base_url,
                     },
                     "tts": {
-                        "provider": "qwen3-tts-cpp",
-                        "model_dir": tts_config.model_dir,
+                        "provider": "crispasr-qwen3-tts",
+                        "model": tts_config.model,
+                        "backend": tts_config.backend,
+                        "codec_model": tts_config.codec_model,
+                        "base_url": tts_config.base_url,
                         "cli_path": tts_config.cli_path,
                     },
                 }
@@ -130,6 +144,12 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
 
     def _synthesize_text(self, text: str, payload: dict[str, Any]) -> TTSResult:
         provider = Qwen3TTSProvider()
+        raw_speed = payload.get("speed")
+        speed = (
+            float(raw_speed)
+            if isinstance(raw_speed, int | float) and not isinstance(raw_speed, bool)
+            else None
+        )
         reference_audio_base64 = payload.get("reference_audio_base64")
         if isinstance(reference_audio_base64, str) and reference_audio_base64.strip():
             return asyncio.run(
@@ -139,12 +159,18 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
                     reference_mime_type=str(
                         payload.get("reference_mime_type") or "audio/wav"
                     ),
+                    reference_text=payload.get("reference_text"),
+                    speed=speed,
                 )
             )
         return asyncio.run(
             provider.synthesize(
                 text,
                 reference_audio_path=payload.get("reference_audio_path"),
+                reference_text=payload.get("reference_text"),
+                voice=payload.get("voice"),
+                instructions=payload.get("instructions"),
+                speed=speed,
             )
         )
 
@@ -176,7 +202,7 @@ class VoiceAPIHandler(BaseHTTPRequestHandler):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the local agent voice API")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8081)
+    parser.add_argument("--port", type=int, default=8090)
     args = parser.parse_args()
 
     server = ThreadingHTTPServer((args.host, args.port), VoiceAPIHandler)

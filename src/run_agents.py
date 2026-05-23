@@ -5,7 +5,6 @@ Features
 --------
 - Single orchestrator entry point with persistent message history
 - History auto-compressed when long (transparent to the user)
-- Optional --debug mode: full agent traces, tool calls, run summaries
 - Worker logs printed per turn in research mode
 - Chat history saved to ./chat_history/chats/<session-slug>.json
 - Full task log printed on exit
@@ -32,6 +31,7 @@ from agents.orchestrator_agent import OrchestratorResponse, run_orchestrator_tur
 from agents.observability import task_log_store, _c, log_event
 from agents.runtime.reports import REPORT_ROOT, load_agent_reports, set_report_dir
 from agents.runtime.skills_context import scan_skills_context
+from speech.stream_tts import StreamingTTSConfig, StreamingTTSPlayer
 
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
 
@@ -185,6 +185,7 @@ async def handle_turn(
     user_text: str,
     session:   ChatSession,
     debug:     bool = False,
+    tts_player: StreamingTTSPlayer | None = None,
 ) -> str:
 
     _init_session_paths_from_user_text(session, user_text)
@@ -220,7 +221,7 @@ async def handle_turn(
         _debug_messages(result.all_messages(), label="orchestrator")
         _summarize_messages(result.all_messages())
 
-    print(f"\nAssistant: {response.reply}\n")
+    await _emit_assistant_reply(response.reply, tts_player=tts_player)
 
     # Show logs for any workers that ran during this turn. We identify them
     # by recency — logs added since the previous turn are the current ones.
@@ -273,11 +274,26 @@ async def handle_turn(
     return response.reply
 
 
+async def _emit_assistant_reply(
+    reply: str,
+    *,
+    tts_player: StreamingTTSPlayer | None,
+) -> None:
+    print(f"\nAssistant: {reply}\n")
+    if tts_player is None:
+        return
+    await tts_player.speak_text(reply)
+    await tts_player.drain()
+
+
 # MAIN LOOP
-async def run(debug: bool = False) -> None:
+async def run(
+    *,
+    tts_player: StreamingTTSPlayer | None = None,
+) -> None:
     print(BANNER)
-    if debug:
-        print(_c("[debug mode enabled — full agent traces printed]\n", "dim"))
+    if tts_player is not None:
+        print(_c("[tts mode enabled — assistant replies will be spoken]\n", "dim"))
 
     session = ChatSession()
 
@@ -296,7 +312,11 @@ async def run(debug: bool = False) -> None:
             break
 
         try:
-            await handle_turn(user_input, session, debug=debug)
+            await handle_turn(
+                user_input,
+                session,
+                tts_player=tts_player,
+            )
         except Exception as exc:
             print(f"\n[error: {exc}]\n")
 
@@ -311,26 +331,24 @@ async def run(debug: bool = False) -> None:
             print(f"  {tag} [{tid[:8]}] {log['objective'][:60]}")
             if log.get("summary"):
                 print(f"      {log['summary'][:120]}…")
+    if tts_player is not None:
+        await tts_player.close()
 
 
 async def run_voice(
     *,
-    debug: bool = False,
-    language: str | None = None,
     device: str | None = None,
-    normalize_audio: bool = True,
-    save_audio_dir: Path | None = None,
-    save_failed_audio_dir: Path | None = None,
+    tts_player: StreamingTTSPlayer | None = None,
 ) -> None:
     print(BANNER)
-    if debug:
-        print(_c("[debug mode enabled — full agent traces printed]\n", "dim"))
+    if tts_player is not None:
+        print(_c("[tts mode enabled — assistant replies will be spoken]\n", "dim"))
 
     session = ChatSession()
 
     async def handle_text(text: str) -> None:
         try:
-            await handle_turn(text, session, debug=debug)
+            await handle_turn(text, session, tts_player=tts_player)
         except Exception as exc:
             print(f"\n[error: {exc}]\n")
 
@@ -345,51 +363,49 @@ async def run_voice(
 
     await run_enter_to_talk(
         handle_text,
-        language=language,
         device=selected_device,
-        normalize_audio=normalize_audio,
-        save_audio_dir=save_audio_dir,
-        save_failed_audio_dir=save_failed_audio_dir,
     )
+    if tts_player is not None:
+        await tts_player.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="General Research Agent")
-    parser.add_argument("--debug", action="store_true", help="Print full agent traces")
     parser.add_argument(
         "--voice",
         action="store_true",
         help="Use terminal Enter-to-talk ASR instead of typed input",
     )
     parser.add_argument(
-        "--voice-language",
-        help="Optional forced ASR language, e.g. English or Swedish",
-    )
-    parser.add_argument(
         "--voice-device",
         help="Input device index or name; use --list-audio-devices to inspect",
-    )
-    parser.add_argument(
-        "--voice-no-normalize",
-        action="store_true",
-        help="Do not amplify recorded audio before sending it to ASR",
-    )
-    parser.add_argument(
-        "--voice-save-audio-dir",
-        type=Path,
-        help="Directory to save each WAV sent to ASR for playback/debugging",
-    )
-    parser.add_argument(
-        "--voice-debug-audio",
-        action="store_true",
-        help="Save failed/no-speech recordings under /tmp/localagent-asr",
     )
     parser.add_argument(
         "--list-audio-devices",
         action="store_true",
         help="List available input audio devices and exit",
     )
+    parser.add_argument(
+        "--tts",
+        action="store_true",
+        help="Speak assistant replies with chunked local TTS",
+    )
+    parser.add_argument(
+        "--tts-player",
+        help=(
+            "Audio playback command. Defaults to afplay, aplay, paplay, or "
+            "ffplay; can also be set with LOCALAGENT_TTS_PLAYER."
+        ),
+    )
     args = parser.parse_args()
+
+    tts_player = None
+    if args.tts:
+        tts_config_kwargs = {}
+        if args.tts_player:
+            tts_config_kwargs["player_command"] = args.tts_player
+        tts_config = StreamingTTSConfig(**tts_config_kwargs)
+        tts_player = StreamingTTSPlayer(config=tts_config)
 
     try:
         if args.list_audio_devices:
@@ -400,18 +416,12 @@ if __name__ == "__main__":
         if args.voice:
             asyncio.run(
                 run_voice(
-                    debug=args.debug,
-                    language=args.voice_language,
                     device=args.voice_device,
-                    normalize_audio=not args.voice_no_normalize,
-                    save_audio_dir=args.voice_save_audio_dir,
-                    save_failed_audio_dir=(
-                        Path("/tmp/localagent-asr") if args.voice_debug_audio else None
-                    ),
+                    tts_player=tts_player,
                 )
             )
         else:
-            asyncio.run(run(debug=args.debug))
+            asyncio.run(run(tts_player=tts_player))
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(0)
