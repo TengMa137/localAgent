@@ -66,8 +66,8 @@ def test_user_can_change_own_password(monkeypatch, tmp_path):
             json={"current_password": "admin-password", "new_password": "new-admin-password"},
         )
         assert response.status_code == 200
+        assert client.get("/api/me").status_code == 401
 
-        assert client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf}).status_code == 200
         assert client.post(
             "/api/auth/login",
             json={"username": "admin", "password": "admin-password"},
@@ -93,22 +93,70 @@ def test_admin_can_reset_user_password(monkeypatch, tmp_path):
         )
         assert create_user.status_code == 200
         user_id = create_user.json()["user"]["id"]
-        response = admin_client.patch(
-            f"/api/admin/users/{user_id}",
-            headers={"X-CSRF-Token": csrf},
-            json={"password": "changed-password"},
-        )
-        assert response.status_code == 200
 
-    with TestClient(server.app) as user_client:
-        assert user_client.post(
+        with TestClient(server.app) as user_client:
+            assert user_client.post(
+                "/api/auth/login",
+                json={"username": "normal", "password": "normal-password"},
+            ).status_code == 200
+            assert user_client.get("/api/me").status_code == 200
+
+            response = admin_client.patch(
+                f"/api/admin/users/{user_id}",
+                headers={"X-CSRF-Token": csrf},
+                json={"password": "changed-password"},
+            )
+            assert response.status_code == 200
+            assert user_client.get("/api/me").status_code == 401
+            assert user_client.post(
+                "/api/auth/login",
+                json={"username": "normal", "password": "normal-password"},
+            ).status_code == 401
+            assert user_client.post(
+                "/api/auth/login",
+                json={"username": "normal", "password": "changed-password"},
+            ).status_code == 200
+
+
+def test_blank_normalized_fields_are_rejected(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    with TestClient(server.app) as client:
+        assert client.post(
+            "/api/auth/register",
+            json={"username": "   ", "password": "normal-password"},
+        ).status_code == 422
+
+        assert client.post(
             "/api/auth/login",
-            json={"username": "normal", "password": "normal-password"},
-        ).status_code == 401
-        assert user_client.post(
-            "/api/auth/login",
-            json={"username": "normal", "password": "changed-password"},
+            json={"username": " admin ", "password": "admin-password"},
         ).status_code == 200
+        csrf = _csrf(client)
+
+        assert client.post(
+            "/api/admin/users",
+            headers={"X-CSRF-Token": csrf},
+            json={"username": "   ", "password": "normal-password", "role": "user"},
+        ).status_code == 422
+
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "   "},
+        )
+        assert create_chat.status_code == 200
+        assert create_chat.json()["session"]["title"] == "New chat"
+        chat_id = create_chat.json()["session"]["id"]
+
+        assert client.patch(
+            f"/api/chat/sessions/{chat_id}",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "   "},
+        ).status_code == 422
+        assert client.post(
+            f"/api/chat/sessions/{chat_id}/messages",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "   "},
+        ).status_code == 422
 
 
 def test_register_is_blocked_until_backend_admin_is_initialized(monkeypatch, tmp_path):

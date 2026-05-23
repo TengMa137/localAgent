@@ -11,7 +11,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Text
 
 from run_agents import _MSG_ADAPTER
 from server_app.serializers import message_metadata, public_branch_variant
-from server_app.utils import json_dumps, json_loads_dict
+from server_app.utils import json_dumps, json_loads_dict, sqlite_lastrowid
 
 
 def agent_lock_key(user_id: int, session_id: str) -> str:
@@ -207,7 +207,7 @@ def insert_user_message(
         """,
         (session_id, user_id, branch_id, content, created_at),
     )
-    return int(cur.lastrowid)
+    return sqlite_lastrowid(cur)
 
 
 def insert_assistant_placeholder(
@@ -228,7 +228,7 @@ def insert_assistant_placeholder(
         """,
         (session_id, user_id, branch_id, json_dumps(metadata), created_at),
     )
-    return int(cur.lastrowid)
+    return sqlite_lastrowid(cur)
 
 
 def session_upload_context(conn: sqlite3.Connection, session_id: str, user_id: int) -> list[str]:

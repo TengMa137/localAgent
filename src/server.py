@@ -6,8 +6,7 @@ import secrets
 import shutil
 import sqlite3
 import time
-from contextlib import asynccontextmanager
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -62,6 +61,7 @@ from server_app.utils import (
     json_dumps,
     row_has,
     slugish,
+    sqlite_lastrowid,
     utc_now,
 )
 
@@ -328,6 +328,10 @@ def _clear_session_cookies(response: Response) -> None:
     response.delete_cookie(CSRF_COOKIE, path="/")
 
 
+def _revoke_user_sessions(conn: sqlite3.Connection, user_id: int) -> None:
+    conn.execute("DELETE FROM web_sessions WHERE user_id = ?", (user_id,))
+
+
 def _get_current_user(request: Request) -> sqlite3.Row:
     token = request.cookies.get(SESSION_COOKIE, "")
     if not token:
@@ -464,7 +468,7 @@ def register(body: RegisterRequest, response: Response) -> dict[str, Any]:
                 status_code=409,
                 detail="Admin account is not initialized. Set LOCALAGENT_ADMIN_USERNAME and LOCALAGENT_ADMIN_PASSWORD on the backend.",
             )
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (sqlite_lastrowid(cur),)).fetchone()
         token, csrf_token = _create_web_session(conn, user_id=user["id"])
         _audit(conn, user["id"], "register_user", {})
         _set_session_cookies(response, token, csrf_token)
@@ -515,14 +519,20 @@ def me(user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
 
 
 @app.patch("/api/me/password")
-def change_my_password(body: ChangePasswordRequest, user: sqlite3.Row = Depends(current_user)) -> dict[str, bool]:
+def change_my_password(
+    body: ChangePasswordRequest,
+    response: Response,
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, bool]:
     try:
         ph.verify(user["password_hash"], body.current_password)
     except VerifyMismatchError:
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
     with db() as conn:
         conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (ph.hash(body.new_password), user["id"]))
+        _revoke_user_sessions(conn, user["id"])
         _audit(conn, user["id"], "change_own_password", {})
+    _clear_session_cookies(response)
     return {"ok": True}
 
 
@@ -546,13 +556,18 @@ def create_user(body: CreateUserRequest, admin: sqlite3.Row = Depends(require_ad
             )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409, detail="Username already exists.")
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (sqlite_lastrowid(cur),)).fetchone()
         _audit(conn, admin["id"], "admin_create_user", {"target_user_id": row["id"], "role": row["role"]})
         return {"user": public_user(row)}
 
 
 @app.patch("/api/admin/users/{user_id}")
-def update_user(user_id: int, body: UpdateUserRequest, admin: sqlite3.Row = Depends(require_admin)) -> dict[str, Any]:
+def update_user(
+    user_id: int,
+    body: UpdateUserRequest,
+    response: Response,
+    admin: sqlite3.Row = Depends(require_admin),
+) -> dict[str, Any]:
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         if not row:
@@ -562,11 +577,14 @@ def update_user(user_id: int, body: UpdateUserRequest, admin: sqlite3.Row = Depe
         if body.is_active is not None:
             conn.execute("UPDATE users SET is_active = ? WHERE id = ?", (1 if body.is_active else 0, user_id))
             if not body.is_active:
-                conn.execute("DELETE FROM web_sessions WHERE user_id = ?", (user_id,))
+                _revoke_user_sessions(conn, user_id)
         if body.password is not None:
             conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (ph.hash(body.password), user_id))
+            _revoke_user_sessions(conn, user_id)
         _audit(conn, admin["id"], "admin_update_user", {"target_user_id": user_id})
         updated = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user_id == admin["id"] and (body.password is not None or body.is_active is False):
+            _clear_session_cookies(response)
         return {"user": public_user(updated)}
 
 
@@ -737,7 +755,7 @@ async def upload_chat_file(
                 now,
             ),
         )
-        row = conn.execute("SELECT * FROM chat_files WHERE id = ?", (cur.lastrowid,)).fetchone()
+        row = conn.execute("SELECT * FROM chat_files WHERE id = ?", (sqlite_lastrowid(cur),)).fetchone()
         _audit(conn, user["id"], "chat_file_upload", {"session_id": session_id, "file_id": row["id"]})
         return {"file": public_chat_file(row)}
 
@@ -752,7 +770,11 @@ def get_chat_file_content(session_id: str, file_id: int, user: sqlite3.Row = Dep
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
     size = path.stat().st_size
-    sample = path.read_bytes() if size <= TEXT_PREVIEW_LIMIT else path.read_bytes()[:4096]
+    if size <= TEXT_PREVIEW_LIMIT:
+        sample = path.read_bytes()
+    else:
+        with path.open("rb") as fh:
+            sample = fh.read(4096)
     content_type = row["content_type"] or mimetypes.guess_type(row["filename"])[0]
     is_text = size <= TEXT_PREVIEW_LIMIT and is_text_preview(row["filename"], content_type, sample)
     content = path.read_text(encoding="utf-8", errors="replace") if is_text else ""
@@ -934,7 +956,7 @@ async def fork_chat_from_message(
             """,
             (session_id, user["id"], new_branch_id, root_message_id, next_variant, body.content, now),
         )
-        edited_message_id = int(cur.lastrowid)
+        edited_message_id = sqlite_lastrowid(cur)
         conn.execute(
             """
             UPDATE chat_sessions
@@ -1051,6 +1073,9 @@ async def _execute_chat_message(
                 debug=False,
                 trace_sink=wrapped_trace_sink,
             )
+        except asyncio.CancelledError:
+            persist_assistant_message("failed", "Agent run cancelled.")
+            raise
         except Exception as exc:
             error_text = f"Agent run failed: {exc}"
             persist_assistant_message("failed", error_text)
@@ -1117,15 +1142,21 @@ async def send_message(session_id: str, body: SendMessageRequest, user: sqlite3.
 @app.post("/api/chat/sessions/{session_id}/messages/stream")
 async def stream_message(session_id: str, body: SendMessageRequest, user: sqlite3.Row = Depends(current_user)) -> StreamingResponse:
     async def events():
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
+
+        def enqueue(item: dict[str, Any]) -> None:
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
 
         def sink(event: dict[str, Any]) -> None:
             if event.get("kind") == "text_delta" and event.get("label") == "orchestrator":
-                queue.put_nowait({"type": "text_delta", "content": event.get("content") or ""})
+                enqueue({"type": "text_delta", "content": event.get("content") or ""})
                 return
             compact = compact_trace_events([event])
             if compact:
-                queue.put_nowait({"type": "trace", "event": compact[0]})
+                enqueue({"type": "trace", "event": compact[0]})
 
         async def run_and_signal() -> None:
             try:
@@ -1136,7 +1167,6 @@ async def stream_message(session_id: str, body: SendMessageRequest, user: sqlite
                 await queue.put({"type": "error", "error": str(exc)})
 
         task = asyncio.create_task(run_and_signal())
-        task.add_done_callback(lambda done_task: done_task.exception() if not done_task.cancelled() else None)
         try:
             while True:
                 item = await queue.get()
@@ -1144,7 +1174,9 @@ async def stream_message(session_id: str, body: SendMessageRequest, user: sqlite
                 if item["type"] in {"done", "error"}:
                     break
         finally:
-            if task.done():
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
                 await task
 
     return StreamingResponse(events(), media_type="text/event-stream")

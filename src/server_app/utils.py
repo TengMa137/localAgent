@@ -38,6 +38,13 @@ def row_has(row: sqlite3.Row, key: str) -> bool:
     return key in row.keys()
 
 
+def sqlite_lastrowid(cursor: sqlite3.Cursor) -> int:
+    row_id = cursor.lastrowid
+    if row_id is None:
+        raise RuntimeError("Expected SQLite lastrowid after INSERT.")
+    return row_id
+
+
 def slugish(text: str) -> str:
     words = [part for part in "".join(ch.lower() if ch.isalnum() else " " for ch in text).split() if part]
     return " ".join(words[:6]) or "New chat"
