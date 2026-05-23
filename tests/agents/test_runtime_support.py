@@ -4,10 +4,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-from pydantic_ai import RunContext
 from pydantic_ai.messages import ModelRequest
-from pydantic_ai.models.test import TestModel
-from pydantic_ai.usage import RunUsage
 
 from tools.filesystem import FilesystemValidator, FilesystemValidatorConfig, Mount
 
@@ -303,6 +300,60 @@ def test_web_response_keeps_full_findings_out_of_tool_return():
     assert "large crawled/RAG finding that belongs in the report" not in formatted
 
 
+def test_orchestrator_decision_requires_route_payload():
+    from pydantic import ValidationError
+
+    from agents.orchestrator_agent import OrchestratorDecision
+
+    with pytest.raises(ValidationError):
+        OrchestratorDecision(route="direct")
+
+    with pytest.raises(ValidationError):
+        OrchestratorDecision(route="fs")
+
+    assert OrchestratorDecision(route="direct", reply="Hello").reply == "Hello"
+    assert (
+        OrchestratorDecision(route="fs", objective="Read the requested file").objective
+        == "Read the requested file"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_direct_decision_returns_reply():
+    from agents.orchestrator_agent import OrchestratorDecision, _response_from_decision
+
+    response = await _response_from_decision(
+        OrchestratorDecision(route="direct", reply="Use the cached answer."),
+    )
+
+    assert response.reply == "Use the cached answer."
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_delegated_decision_forwards_specialist_answer(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_from_decision
+
+    calls: list[str] = []
+
+    async def fake_fs_task(objective: str) -> str:
+        calls.append(objective)
+        return (
+            "Forwardable answer:\n"
+            f"Read result for {objective}.\n\n"
+            "Orchestrator notes:\n- Detailed findings in fs-report.md: 1 item(s)"
+        )
+
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task", fake_fs_task)
+
+    response = await _response_from_decision(
+        OrchestratorDecision(route="fs", objective="read notes.md"),
+    )
+
+    assert response.reply == "Read result for read notes.md."
+    assert calls == ["read notes.md"]
+
+
 def test_save_history_includes_report_dir(tmp_path):
     from run_agents import ChatSession, _save_history
 
@@ -368,147 +419,6 @@ def test_skills_context_includes_current_skill_paths():
     assert "Current /skills catalog" in context
     assert "fitness/diet.md" in context
     assert "fitness/workout.md" in context
-
-
-def _ctx(run_id: str) -> RunContext:
-    return RunContext(
-        deps=None,
-        model=TestModel(),
-        usage=RunUsage(),
-        prompt=None,
-        run_id=run_id,
-    )
-
-
-async def _counting_runner(calls: list[str], objective: str) -> str:
-    calls.append(objective)
-    return f"done: {objective}"
-
-
-@pytest.mark.asyncio
-async def test_specialist_guard_bans_same_tool_same_objective():
-    from agents import orchestrator_agent
-
-    ctx = _ctx("test-specialist-guard")
-    calls: list[str] = []
-    orchestrator_agent._tool_run_cache.pop(ctx.run_id, None)
-
-    first = await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective="read file",
-        runner=lambda objective: _counting_runner(calls, objective),
-    )
-    second = await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective="  READ   file ",
-        runner=lambda objective: _counting_runner(calls, objective),
-    )
-
-    assert calls == ["read file"]
-    assert "done: read file" in first
-    assert "Duplicate specialist call blocked" in second
-    assert "done: read file" in second
-
-
-@pytest.mark.asyncio
-async def test_specialist_guard_allows_different_tools_and_objectives():
-    from agents import orchestrator_agent
-
-    ctx = _ctx("test-specialist-allow-distinct")
-    calls: list[str] = []
-    orchestrator_agent._tool_run_cache.pop(ctx.run_id, None)
-
-    await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective="read file",
-        runner=lambda objective: _counting_runner(calls, objective),
-    )
-    await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_web_task",
-        objective="search web",
-        runner=lambda objective: _counting_runner(calls, objective),
-    )
-    await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective="edit file",
-        runner=lambda objective: _counting_runner(calls, objective),
-    )
-
-    assert calls == ["read file", "search web", "edit file"]
-
-
-@pytest.mark.asyncio
-async def test_specialist_guard_uses_turn_id_metadata_for_cache_key():
-    from agents import orchestrator_agent
-
-    ctx = _ctx("fallback-run-id")
-    ctx.metadata = {"turn_id": "explicit-turn-id"}
-    orchestrator_agent._tool_run_cache.pop("explicit-turn-id", None)
-
-    await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective="read file",
-        runner=lambda objective: _counting_runner([], objective),
-    )
-
-    assert orchestrator_agent._tool_run_cache["explicit-turn-id"][-1][2] == "done: read file"
-
-
-@pytest.mark.asyncio
-async def test_specialist_guard_returns_failed_duplicate_without_retry():
-    from agents import orchestrator_agent
-
-    ctx = _ctx("test-specialist-failed-duplicate")
-    orchestrator_agent._tool_run_cache.pop(ctx.run_id, None)
-
-    async def failed_runner(objective: str) -> str:
-        return "Filesystem task failed before a grounded result was produced. Error: nope"
-
-    await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective="write file",
-        runner=failed_runner,
-    )
-    second = await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective="write file",
-        runner=failed_runner,
-    )
-
-    assert "Duplicate specialist call blocked" in second
-    assert "Error: nope" in second
-
-
-@pytest.mark.asyncio
-async def test_specialist_guard_marks_file_access_problem_terminal():
-    from agents import orchestrator_agent
-
-    ctx = _ctx("test-specialist-terminal-access")
-    orchestrator_agent._tool_run_cache.pop(ctx.run_id, None)
-
-    async def failed_runner(objective: str) -> str:
-        return (
-            "I could not complete the filesystem request because of a file access problem.\n"
-            "No further agent retry can fix this automatically."
-        )
-
-    first = await orchestrator_agent._run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective="edit read only file",
-        runner=failed_runner,
-    )
-
-    assert "Return this result to the user" in first
-    assert "do not create another plan" in first
 
 
 def test_fs_task_prompt_terminal_missing_file_after_full_index(monkeypatch, tmp_path):

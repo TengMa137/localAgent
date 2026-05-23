@@ -16,8 +16,8 @@ The agent handles three kinds of requests from a single conversation loop:
   `web_agent`, and complex multi-step tasks to the planning workflow.
 
 The code is intentionally biased toward small local LLMs. Python owns the multi-step workflow,
-tool routing, path validation, approval handling, deterministic RAG handoffs, and report memory.
-LLM calls are kept narrow: classify, use specialist tools, plan typed tasks, extract evidence,
+specialist execution, path validation, approval handling, deterministic RAG handoffs, and report
+memory. LLM calls are kept narrow: choose a typed route, plan typed tasks, extract evidence,
 reflect only when needed, and synthesize.
 
 Current implementation highlights:
@@ -25,7 +25,7 @@ Current implementation highlights:
 - Validator-backed filesystem tools now cover read, line reads, grep, stat, shallow/deep listing,
   directory creation, copy/move/delete, and single-file search/replace.
 - Filesystem writes can use local CLI approval via PydanticAI deferred-tool approval.
-- The orchestrator exposes specialist tools instead of raw filesystem/RAG tools.
+- The orchestrator returns a typed semantic route decision; Python executes the selected specialist once.
 - `fs_agent` owns local path discovery/read/write/edit and uses deterministic RAG for large or multi-file reads.
 - `web_agent` owns search/query/URL selection/crawl and then uses deterministic RAG over fetched content.
 - Agents write concise per-session markdown reports under `chat_history/reports/<session-title>/`.
@@ -225,8 +225,8 @@ keeping the context window bounded without losing important decisions.
 Before each turn, the CLI loads any per-session agent reports and injects them as context.
 It also refreshes and injects a deterministic `/skills` scan, so newly created or edited
 skills are visible on the next run. If chat/report/skill context is sufficient, the
-orchestrator answers directly. Otherwise it calls one or more specialist entry points for
-distinct information needs:
+orchestrator answers directly. Otherwise it returns a typed route decision and Python executes
+the selected specialist once:
 
 | Route | Tool |
 |---|---|
@@ -234,8 +234,8 @@ distinct information needs:
 | current info, web search, URL crawl, arXiv lookup | `run_web_task` |
 | complex multi-step work | `run_plan_workflow` |
 
-The orchestrator does not receive raw filesystem or RAG toolsets. It never reads files or
-web pages directly.
+The orchestrator does not receive raw filesystem, web, or RAG toolsets. It never reads files or
+web pages directly, and it does not run a model-driven tool loop after choosing a route.
 
 ### fs_agent
 
@@ -261,13 +261,13 @@ The orchestrator does not call RAG directly; RAG is infrastructure used by fs/we
 ### plan_agent
 
 `run_plan_workflow` handles complex tasks after the orchestrator chooses the plan route.
-`plan_agent` receives the objective, resolved file paths, and file previews. During its own
-planning run it may call bounded `fs_agent` and `web_agent` tools for missing local path/file
-context or URL/current-info context. Known reliable paths and URLs passed by the orchestrator
-from chat history or prior reports are included up front so they do not need to be rediscovered.
+`plan_agent` receives the objective, resolved file paths, and file previews. It returns typed
+tasks directly; it does not call `fs_agent` or `web_agent` during planning. Known reliable
+paths and URLs passed by the orchestrator from chat history or prior reports are included up
+front so they do not need to be rediscovered.
 
-After any needed specialist tool calls, `plan_agent` decomposes the work into up to
-`MAX_TASKS_PER_PLAN` independent `TaskSpec` objects for the worker pool.
+`plan_agent` decomposes the work into up to `MAX_TASKS_PER_PLAN` independent `TaskSpec`
+objects for the worker pool.
 
 After the model returns, Python normalizes the plan:
 

@@ -50,13 +50,13 @@ def log_event(msg: str) -> None:
 
 
 async def observable_run(
-    agent: Agent,
+    agent: Agent[Any, Any],
     prompt: str,
     *,
     label: str = "agent",
     indent: int = 0,
-    message_history: Optional[list] = None,
-    **kwargs,
+    message_history: Optional[list[Any]] = None,
+    **kwargs: Any,
 ) -> Any:
     """
     Drop-in for agent.run() that streams every event to stderr in real time.
@@ -84,6 +84,8 @@ async def observable_run(
                 _handle_event(event, label=label, indent=indent)
 
         result = agent_run.result
+        if result is None:
+            raise RuntimeError(f"{label} finished without an agent result.")
         output = result.output
         if not isinstance(output, DeferredToolRequests):
             _rt(f"[{label}] ✓ done", "green", indent)
@@ -142,7 +144,10 @@ def _handle_event(event: Any, label: str, indent: int) -> None:
 
 def _preview_args(part: ToolCallPart) -> str:
     try:
-        raw = part.args.args_json() if hasattr(part.args, "args_json") else str(part.args)
+        args = part.args
+        if args is None:
+            return ""
+        raw = args.args_json() if hasattr(args, "args_json") else str(args)
         return raw[:120].replace("\n", " ")
     except Exception:
         return ""
@@ -154,7 +159,7 @@ def _collect_local_approvals(
     label: str,
     indent: int,
 ) -> DeferredToolResults:
-    approvals: dict[str, bool | ToolDenied] = {}
+    approvals: dict[str, Any] = {}
 
     for call in requests.approvals:
         tool_call_id = call.tool_call_id

@@ -28,8 +28,8 @@ from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.usage import UsageLimits
 
 from rag import rag_service
-from agents.orchestrator_agent import OrchestratorResponse, orchestrator
-from agents.observability import observable_run, task_log_store, _c, log_event
+from agents.orchestrator_agent import OrchestratorResponse, run_orchestrator_turn
+from agents.observability import task_log_store, _c, log_event
 from agents.runtime.reports import REPORT_ROOT, load_agent_reports, set_report_dir
 from agents.runtime.skills_context import scan_skills_context
 
@@ -202,8 +202,7 @@ async def handle_turn(
 
     start = time.time()
     turn_id = f"{session.session_title}:{time.time_ns()}"
-    result = await observable_run(
-        orchestrator,
+    result = await run_orchestrator_turn(
         prompt,
         label="orchestrator",
         indent=0,
@@ -228,7 +227,7 @@ async def handle_turn(
     all_logs = list(task_log_store.all().values())
     if all_logs:
         # Workers from this turn are at the end of the store (insertion order)
-        turn_had_tools = any(
+        turn_had_tools = result.delegated or any(
             getattr(p, "part_kind", "") == "tool-call"
             for m in result.all_messages()
             for p in getattr(m, "parts", [])

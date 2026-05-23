@@ -43,37 +43,22 @@ File + RAG contract:
 
 History:
   Orchestrator is the persistent agent. The CLI stores the full Pydantic AI
-  message list between turns; specialist agents receive concise report memory
-  rather than the full conversation transcript.
+  route-decision message list between turns; specialist agents receive concise
+  report memory rather than the full conversation transcript.
 """
 
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelRequest
-from pydantic_ai.tools import DeferredToolRequests, RunContext
+from pydantic_ai.messages import ModelMessage
 
+from .observability import _rt, observable_run
 from .fs_agent import run_fs_task as _run_fs_task
 from .plan_agent import run_plan_workflow as _run_plan_workflow
 from .runtime.context import model
 from .web_agent import run_web_task as _run_web_task
-from .observability import _rt
-
-def _safe_cut(messages: List[ModelMessage], target: int) -> int:
-    """
-    Walk back from target to find a ModelRequest that is not a tool-result
-    continuation, preventing splits of tool-call/tool-result pairs.
-    """
-    i = target
-    while i > 0:
-        msg = messages[i]
-        if isinstance(msg, ModelRequest):
-            part_types = {type(p).__name__ for p in msg.parts}
-            if "ToolReturnPart" not in part_types and "RetryPromptPart" not in part_types:
-                return i
-        i -= 1
-    return 0
 
 
 class OrchestratorResponse(BaseModel):
@@ -81,178 +66,90 @@ class OrchestratorResponse(BaseModel):
     session_title: Optional[str] = None  # kebab-case slug, first turn only
 
 
-_tool_run_cache: dict[str, list[tuple[str, str, str, bool]]] = {}
-
-ORCHESTRATOR_DUPLICATE_MESSAGE = (
-    "Duplicate specialist call blocked: this specialist already ran with the "
-    "same objective in this turn. Answer the user from the prior specialist "
-    "result below, or call a different specialist only for a distinct missing "
-    "information need."
-)
+RouteName = Literal["direct", "clarify", "fs", "web", "plan"]
+SpecialistRunner = Callable[[str], Awaitable[str]]
 
 
-def _normalize_objective(text: str) -> str:
-    return " ".join(text.casefold().split())
+class OrchestratorDecision(BaseModel):
+    """One semantic route decision from the stateful orchestrator LLM."""
 
-
-def _run_cache_key(ctx: RunContext) -> str:
-    if ctx.metadata and ctx.metadata.get("turn_id"):
-        return str(ctx.metadata["turn_id"])
-    return ctx.run_id or str(id(ctx.messages))
-
-
-def _trim_tool_cache() -> None:
-    while len(_tool_run_cache) > 128:
-        _tool_run_cache.pop(next(iter(_tool_run_cache)))
-
-
-def _is_terminal_specialist_failure(result: str) -> bool:
-    text = result.casefold()
-    return any(
-        marker in text
-        for marker in (
-            "failed before a grounded result",
-            "because of a file access problem",
-            "no further agent retry can fix this automatically",
-        )
+    route: RouteName
+    reply: str | None = Field(
+        default=None,
+        description="Required only for direct or clarify routes.",
     )
+    objective: str | None = Field(
+        default=None,
+        description="Required only for fs, web, or plan routes.",
+    )
+    routing_reason: str = Field(
+        default="",
+        description="Brief private rationale for the chosen route.",
+    )
+    session_title: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_route_payload(self) -> "OrchestratorDecision":
+        if self.route in {"direct", "clarify"}:
+            if not (self.reply and self.reply.strip()):
+                raise ValueError("reply is required for direct and clarify routes")
+            return self
+        if not (self.objective and self.objective.strip()):
+            raise ValueError("objective is required for delegated routes")
+        return self
 
 
-async def _run_specialist_once(
-    ctx: RunContext,
+@dataclass
+class OrchestratorRunResult:
+    """Small result adapter used by the CLI after external specialist execution."""
+
+    output: OrchestratorResponse
+    messages: list[ModelMessage]
+    decision: OrchestratorDecision
+    delegated: bool = False
+
+    def all_messages(self) -> list[ModelMessage]:
+        return self.messages
+
+
+async def _call_specialist(
     *,
     tool_name: str,
     objective: str,
-    runner,
+    runner: SpecialistRunner,
 ) -> str:
-    run_key = _run_cache_key(ctx)
-    calls = _tool_run_cache.setdefault(run_key, [])
-    _trim_tool_cache()
-    objective_key = _normalize_objective(objective)
-
-    for prior_name, prior_objective, prior_result, prior_failed in calls:
-        if prior_name != tool_name or prior_objective != objective_key:
-            continue
-        _rt(
-            f"[orchestrator] banned duplicate specialist call: {tool_name}",
-            "yellow",
-        )
-        message = (
-            f"{ORCHESTRATOR_DUPLICATE_MESSAGE}\n\n"
-            f"Prior {tool_name} result:\n{prior_result}"
-        )
-        return message
-
     _rt(f"[orchestrator] specialist route: {tool_name}", "yellow")
-    result = await runner(objective)
-    failed = _is_terminal_specialist_failure(result)
-    calls.append((tool_name, objective_key, result, failed))
-    if failed:
-        return (
-            f"{result}\n\n"
-            "Specialist tool call complete with a terminal access/error report. "
-            "Return this result to the user; do not create another plan to fix "
-            "the same access problem in the agent loop."
-        )
-    return (
-        f"{result}\n\n"
-        "Specialist tool call complete. If the result includes a forwardable "
-        "answer, use that answer directly in your reply. You may call another "
-        "specialist only for a distinct missing information need. Do not repeat "
-        "this same tool with the same objective."
-    )
-
-
-async def run_fs_task(ctx: RunContext, objective: str) -> str:
-    """
-    Use for local filesystem work.
-
-    Call this when the user asks to find, inspect, read, summarize, grep,
-    write, or edit local files under validator roots such as /docs or /skills.
-    The fs agent owns path discovery with list/stat/grep/read tools and writes
-    fs-report.md. Its result is intended to be forwardable to the user.
-    Pass the user's local-file wording as-is. Do not invent concrete paths,
-    filenames, or extensions; fs_agent will discover real paths.
-
-    Args:
-        objective: A complete local-file instruction using the user's wording.
-            Include real paths only if the user supplied them; otherwise pass
-            descriptive terms, edit requirements, and desired output format.
-    """
-    return await _run_specialist_once(
-        ctx,
-        tool_name="run_fs_task",
-        objective=objective,
-        runner=_run_fs_task,
-    )
-
-
-async def run_web_task(ctx: RunContext, objective: str) -> str:
-    """
-    Use for web, URL, current-information, and arXiv lookup work.
-
-    Call this when the user asks for current/recent/latest information,
-    provides URLs, asks for web search/crawl, or asks for arXiv/DOI/paper
-    lookup. The web agent chooses search queries and URLs, crawls selected
-    pages, deterministically searches RAG over fetched content, and writes
-    web-report.md. Its result is intended to be forwardable to the user.
-
-    Args:
-        objective: A complete web research instruction. Include the user's
-            time constraints, URLs, entities, and desired output format.
-    """
-    return await _run_specialist_once(
-        ctx,
-        tool_name="run_web_task",
-        objective=objective,
-        runner=_run_web_task,
-    )
-
-
-async def run_plan_workflow(ctx: RunContext, objective: str) -> str:
-    """
-    Use for complex multi-step work that cannot be handled by one specialist.
-
-    Call this for reports, comparisons, or tasks that need several independent
-    fs/web/retrieval/worker steps. The workflow plans todo items, runs worker
-    batches, reflects when needed, synthesizes a final answer, and writes
-    plan-report.md. Its result is intended to be forwardable to the user.
-
-    Args:
-        objective: The full complex objective, including scope, constraints,
-            known files/URLs, and desired output format.
-    """
-    return await _run_specialist_once(
-        ctx,
-        tool_name="run_plan_workflow",
-        objective=objective,
-        runner=_run_plan_workflow,
-    )
+    return await runner(objective)
 
 
 orchestrator = Agent(
     model=model,
-    output_type=[OrchestratorResponse, DeferredToolRequests],
-    tools=[run_fs_task, run_web_task, run_plan_workflow],
+    output_type=OrchestratorDecision,
 )
 
 
 @orchestrator.system_prompt
 def _orchestrator_prompt() -> str:
     return """
-You are a general-purpose AI assistant. 
+You are a general-purpose AI assistant and semantic route decider.
 
 You have persistent chat history plus optional session agent reports injected
 into the user prompt. Use these first.
 
-Never read file content or web pages yourself. Delegate:
-  - local file work to run_fs_task
-  - web/current/URL/arXiv work to run_web_task
-  - complex multi-step work to run_plan_workflow
+Your job is to choose exactly one route:
+  - direct
+  - clarify
+  - fs
+  - web
+  - plan
+
+You cannot call tools. For delegated routes, Python executes the selected
+specialist after your decision. Base the route on the user's meaning,
+conversation history, and injected reports; do not perform keyword matching.
 
 Intent classification:
 
-  direct — answer immediately WITHOUT calling any tools.
+  direct — answer immediately in reply.
     Use ONLY for: greetings, opinions, math, coding help, writing tasks,
     or follow-up questions fully answerable from conversation history and
     injected session reports.
@@ -260,66 +157,126 @@ Intent classification:
     or requires reading any file or URL, do NOT choose direct.
 
   clarify — the request is genuinely ambiguous in a way that would produce
-    a wrong plan. Ask exactly one focused question. Do not use this as an
-    excuse to avoid research.
+    a wrong route or objective. Ask exactly one focused question in reply.
+    Do not use this as an excuse to avoid research.
 
-  fs — use when the request is local-file activity. Strong signals include:
-    exact validator paths, slash-like paths, filenames with known suffixes
-    such as .py/.md/.json/.yaml/.toml/.txt/.pdf, directory names, "my files",
-    "local files", "repo", "codebase", "document", "skill", or requests to
-    find/read/edit/write/search/summarize local content. The user may want
-    local files even without naming an exact path; be sensitive to that.
-    Use fs_agent for path validation/discovery when a user-supplied path or
-    filename is important and may be wrong.
+  fs — use when satisfying the request requires interacting with local
+    validator files: finding, reading, reviewing, editing, writing, validating
+    paths, or reasoning over the user's repo/codebase/docs/skills. The user may
+    mean local files even without naming an exact path; judge from the full
+    request and conversation context.
 
-  web — use when you are confident the task needs network/current/web access:
-    current/recent/latest/today pricing or facts, user-provided URLs, explicit
-    web search/crawl requests, arXiv/DOI/paper lookup, or modern entities/events
-    whose answer may have changed. Be more conservative with web than fs:
-    do not search the web merely because outside information might be helpful.
-    Use web_agent when web access is required to answer correctly.
+  web — use when answering correctly requires network/current/web access:
+    current facts, recent changes, user-provided URLs, web search/crawl,
+    arXiv/DOI/paper lookup, or modern entities/events whose answer may have
+    changed. Be more conservative with web than fs: do not search the web merely
+    because outside information might be helpful.
 
   plan — use when the objective is complex enough to need decomposition:
     multiple independent subtasks, local+web synthesis, comparisons, reports,
-    audits, investigations, or anything likely to require more than one round
-    of specialist calls. The planning workflow can refine the objective,
-    divide work, and acquire missing local/web context while planning. If prior
-    chat or reports already contain reliable paths/URLs, include them in the
-    plan objective.
+    audits, investigations, or anything likely to require several retrieval
+    tasks. Prefer fs or web for a single clear information need; do not choose
+    plan just to validate a path, search the web, or make a simple specialist
+    request sound more formal.
 
-Direct and clarify:
-  Reply immediately in the reply field. Do not call any tools.
+Output contract:
+  - route=direct or clarify: set reply; leave objective null unless useful.
+  - route=fs/web/plan: set objective to a complete instruction for that
+    specialist, using the user's wording and any reliable context from history
+    or reports. Keep reply null.
+  - routing_reason: one concise sentence for observability.
 
-Tool routing:
-  - Use run_fs_task for local-file objectives. The fs agent finds files and
-    deterministically uses RAG for large/multi-file reading.
-    Pass local-file wording verbatim; do not invent paths.
-  - Use run_web_task for web/current/URL/arXiv objectives. The web agent
-    searches/crawls and deterministically searches RAG over fetched content.
-  - Use run_plan_workflow for complex multi-step objectives. Do not pre-call
-    fs/web only to make the plan cleaner; pass known reliable paths/URLs from
-    history or reports, and let the planning workflow handle missing context.
-  - You may call fs_agent and web_agent in the same turn when both are clearly
-    needed and the two needs are independent enough that one round of specialist
-    results should answer the user.
-  - After one round of specialist calls, answer from those results. If you
-    receive a specialist result with "Forwardable answer", use that answer
-    directly as the user reply unless you must add a brief caveat from the
-    specialist notes. Do not re-summarize a good specialist answer.
-  - If you would need another round to refine, split, compare, or recover
-    missing context, call run_plan_workflow for the original complex objective
-    instead of chaining specialist calls manually.
-  - If a filesystem tool result says there is a file access problem or that no
-    further agent retry can fix it automatically, return that markdown report
-    to the user. Do not route to plan_workflow or start a repair loop for the
-    same inaccessible or missing file.
-
-Rules:
-  - Never call tools for direct or clarify intents.
-  - Do not call RAG directly; you do not have a RAG tool.
-  - You may call multiple specialist tools only for distinct information
-    needs. Never repeat the same tool with the same objective.
+Objective-writing rules:
+  - Preserve user constraints, paths, URLs, time requirements, and output format.
+  - Do not invent concrete paths, filenames, URLs, dates, or entities.
+  - If prior reports already contain enough information to answer, choose direct.
+  - If a prior report says a file access problem is terminal, choose direct and
+    return that access report rather than routing to plan.
 
 session_title: first turn only — kebab-case slug max 6 words e.g.
 "q3-revenue-analysis". Null on all subsequent turns.
 """
+
+
+def _route_runner(route: RouteName) -> tuple[str, SpecialistRunner]:
+    """Map a model route decision to the specialist entry point."""
+    if route == "fs":
+        return "run_fs_task", _run_fs_task
+    if route == "web":
+        return "run_web_task", _run_web_task
+    if route == "plan":
+        return "run_plan_workflow", _run_plan_workflow
+    raise ValueError(f"Route {route!r} does not have a specialist runner")
+
+
+def _extract_forwardable_answer(result: str) -> str:
+    """Return the answer portion of a specialist handoff when present."""
+    marker = "Forwardable answer:\n"
+    notes_marker = "\n\nOrchestrator notes:"
+    if marker not in result:
+        return result.strip()
+    answer = result.split(marker, 1)[1]
+    if notes_marker in answer:
+        answer = answer.split(notes_marker, 1)[0]
+    return answer.strip() or result.strip()
+
+
+async def _response_from_decision(
+    decision: OrchestratorDecision,
+) -> OrchestratorResponse:
+    """Execute a typed route decision and produce the user-facing response."""
+    if decision.route in {"direct", "clarify"}:
+        return OrchestratorResponse(
+            reply=(decision.reply or "").strip(),
+            session_title=decision.session_title,
+        )
+
+    objective = (decision.objective or "").strip()
+    tool_name, runner = _route_runner(decision.route)
+    result = await _call_specialist(
+        tool_name=tool_name,
+        objective=objective,
+        runner=runner,
+    )
+    return OrchestratorResponse(
+        reply=_extract_forwardable_answer(result),
+        session_title=decision.session_title,
+    )
+
+
+async def run_orchestrator_turn(
+    prompt: str,
+    *,
+    label: str = "orchestrator",
+    indent: int = 0,
+    message_history: Optional[list[ModelMessage]] = None,
+    metadata: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> OrchestratorRunResult:
+    """
+    Run the stateful orchestrator decision and execute one selected route.
+
+    This keeps semantic judgement in the LLM while removing the model-driven
+    tool loop that previously caused duplicate delegation and an extra
+    orchestrator response pass after specialist work.
+    """
+    decision_result = await observable_run(
+        orchestrator,
+        prompt,
+        label=label,
+        indent=indent,
+        message_history=message_history,
+        metadata=metadata,
+        **kwargs,
+    )
+    decision: OrchestratorDecision = decision_result.output
+    delegated = decision.route in {"fs", "web", "plan"}
+    reason = f" — {decision.routing_reason}" if decision.routing_reason else ""
+    _rt(f"[orchestrator] decision route={decision.route}{reason}", "yellow")
+    response = await _response_from_decision(decision)
+    return OrchestratorRunResult(
+        output=response,
+        messages=decision_result.all_messages(),
+        decision=decision,
+        delegated=delegated,
+    )

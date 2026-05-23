@@ -38,24 +38,9 @@ class PlanOutput(BaseModel):
     initial_answer: str | None = None  # empty tasks + answer skips research loop
 
 
-async def run_fs_planning_context(objective: str) -> str:
-    """Gather filesystem context needed to write better TaskSpecs."""
-    from .fs_agent import run_fs_task
-
-    return await run_fs_task(objective)
-
-
-async def run_web_planning_context(objective: str) -> str:
-    """Gather web context needed to write better TaskSpecs."""
-    from .web_agent import run_web_task
-
-    return await run_web_task(objective)
-
-
 plan_agent = Agent(
     model=model,
     output_type=PlanOutput,
-    tools=[run_fs_planning_context, run_web_planning_context],
 )
 
 @plan_agent.system_prompt
@@ -63,23 +48,10 @@ def _plan_prompt() -> str:
     return f"""
 You are a planning agent.
 
-You receive a research objective, resolved file paths, and optional file previews.
-You may call specialist tools while planning when missing context would make
-the task specs guessy or incomplete.
-
-Available tools:
-  - run_fs_planning_context: local path discovery, path validation, local
-    file summaries, repo/codebase inspection, skill/document context.
-  - run_web_planning_context: current docs, selected URLs, latest facts,
-    package/API changes, arXiv/DOI lookup, or web source context.
-
-Tool rules:
-  - Call tools only for planning context needed to write good TaskSpecs.
-  - Do not call tools for work that a TaskSpec worker can retrieve directly.
-  - Do not rediscover reliable paths/URLs already provided in the prompt.
-  - If a filesystem tool reports a terminal file access problem, return an
-    initial_answer explaining that problem and no tasks.
-  - After gathering enough context, return PlanOutput.
+You receive a research objective, resolved file paths, and optional file
+previews. Return PlanOutput directly. Do not perform retrieval while planning;
+workers retrieve evidence deterministically from TaskSpec after your plan is
+normalized.
 
 Available skills:
 {skills_prompt}
