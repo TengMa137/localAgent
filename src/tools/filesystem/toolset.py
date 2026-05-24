@@ -23,12 +23,14 @@ Example:
 """
 from __future__ import annotations
 
+import mimetypes
 import re
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 
+from pydantic_ai.messages import BinaryImage, ToolReturn
 from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
@@ -59,6 +61,13 @@ from .types import (
     DEFAULT_MAX_READ_CHARS,
 )
 from .text_ops import read_text_with_policy, write_text_with_policy
+
+_SUPPORTED_IMAGE_MEDIA_TYPES = {
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
 
 
 def _format_result_path(mount_point: str, rel: str | Path) -> str:
@@ -106,6 +115,22 @@ def _path_type(path: Path) -> str:
     if path.exists():
         return "other"
     return "missing"
+
+
+def _image_media_type(path: str, resolved: Path, data: bytes) -> str:
+    guessed, _ = mimetypes.guess_type(path or resolved.name)
+    media_type = (guessed or "").split(";", 1)[0].strip().lower()
+    if media_type.startswith("image/"):
+        return media_type
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return media_type or "application/octet-stream"
 
 
 def _collect_matching_files(
@@ -207,7 +232,7 @@ def make_filesystem_toolset(
             "Read a text file. "
             f"{read_path_hint} "
             "Do not use this on binary files (PDFs, images, etc) - "
-            "pass them as attachments instead."
+            "use read_image for supported images or stat_path/list_directory for metadata."
         )
     )
     async def read_file(
@@ -238,7 +263,8 @@ def make_filesystem_toolset(
         except UnicodeDecodeError:
             raise ValidationError(
                 f"Cannot read '{path}': file appears to be binary or not UTF-8 encoded.\n"
-                "This tool only reads text files. For binary files, pass them as attachments."
+                "This tool only reads text files. Use read_image for supported images "
+                "or stat_path/list_directory for binary metadata."
             )
         total_chars = len(text)
 
@@ -257,6 +283,65 @@ def make_filesystem_toolset(
             total_chars=total_chars,
             offset=offset,
             chars_read=len(text),
+        )
+
+    @toolset.tool(
+        description=(
+            "Read an image file and send the visual content to the model. "
+            "Use this for PNG, JPEG, GIF, or WebP files when the user asks about visual content. "
+            f"{read_path_hint} "
+            "Do not use this for PDFs, audio, videos, or text/code files."
+        )
+    )
+    async def read_image(
+        ctx: RunContext,
+        path: str,
+        detail: Literal["auto", "low", "high"] = "auto",
+    ) -> ToolReturn:
+        """Read a supported image file as multimodal model input."""
+        _, resolved, mount = filesystem_validator.get_path_config(path, op="read")
+
+        if not resolved.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        if not resolved.is_file():
+            raise IsADirectoryError(f"Not a file: {path}")
+
+        filesystem_validator.check_suffix(resolved, mount, virtual_path=path)
+        filesystem_validator.check_size(resolved, mount, virtual_path=path)
+
+        data = resolved.read_bytes()
+        media_type = _image_media_type(path, resolved, data)
+        if media_type == "image/svg+xml":
+            raise ValidationError(f"Cannot read '{path}' with read_image: SVG is text; use read_file instead.")
+        if media_type not in _SUPPORTED_IMAGE_MEDIA_TYPES:
+            supported = ", ".join(sorted(_SUPPORTED_IMAGE_MEDIA_TYPES))
+            raise ValidationError(
+                f"Cannot read '{path}' with read_image: unsupported image media type '{media_type}'.\n"
+                f"Supported image media types: {supported}"
+            )
+
+        return ToolReturn(
+            return_value={
+                "path": path,
+                "media_type": media_type,
+                "size_bytes": len(data),
+                "message": f"Image loaded for model inspection: {path}",
+            },
+            content=[
+                f"Image loaded from {path} ({media_type}, {len(data)} bytes):",
+                BinaryImage(
+                    data=data,
+                    media_type=media_type,
+                    identifier=path,
+                    vendor_metadata={"detail": detail},
+                ),
+            ],
+            metadata={
+                "path": path,
+                "media_type": media_type,
+                "size_bytes": len(data),
+                "detail": detail,
+            },
         )
 
     @toolset.tool(
@@ -392,7 +477,8 @@ def make_filesystem_toolset(
         except UnicodeDecodeError:
             raise ValidationError(
                 f"Cannot edit '{path}': file appears to be binary or not UTF-8 encoded.\n"
-                "This tool only edits text files. For binary files, pass them as attachments."
+                "This tool only edits text files. Use read_image for supported images "
+                "or stat_path/list_directory for binary metadata."
             )
 
         # Count occurrences

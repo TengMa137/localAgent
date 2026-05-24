@@ -1,4 +1,5 @@
 # test filessystem tool functionality, e.g. read_file, write_file, edit_file...
+from pydantic_ai.messages import BinaryImage, ToolReturn
 import pytest
 from tools.filesystem.types import ReadResult, WriteResult
 from tools.filesystem.errors import EditError, ValidationError
@@ -9,6 +10,7 @@ def test_filesystem_tools_are_registered(filesystem_toolset):
 
     expected = {
         "read_file",
+        "read_image",
         "write_file",
         "read_lines",
         "stat_path",
@@ -49,6 +51,49 @@ async def test_write_then_read_file(filesystem_toolset, tools_in_toolset, ctx, t
     assert isinstance(read_result, ReadResult)
     assert read_result.content == "hello"
     assert read_result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_read_image_returns_multimodal_content(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
+    png_bytes = b"\x89PNG\r\n\x1a\nfake"
+    (tmp_path / "screenshot.png").write_bytes(png_bytes)
+
+    result = await filesystem_toolset.call_tool(
+        "read_image",
+        {"path": "/data/screenshot.png", "detail": "high"},
+        ctx,
+        tools_in_toolset["read_image"],
+    )
+
+    assert isinstance(result, ToolReturn)
+    assert result.return_value == {
+        "path": "/data/screenshot.png",
+        "media_type": "image/png",
+        "size_bytes": len(png_bytes),
+        "message": "Image loaded for model inspection: /data/screenshot.png",
+    }
+    assert isinstance(result.content, list)
+    image = result.content[1]
+    assert isinstance(image, BinaryImage)
+    assert image.data == png_bytes
+    assert image.media_type == "image/png"
+    assert image.identifier == "/data/screenshot.png"
+    assert image.vendor_metadata == {"detail": "high"}
+
+
+@pytest.mark.asyncio
+async def test_read_image_rejects_non_image_file(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
+    (tmp_path / "notes.txt").write_text("not an image")
+
+    with pytest.raises(ValidationError) as exc:
+        await filesystem_toolset.call_tool(
+            "read_image",
+            {"path": "/data/notes.txt"},
+            ctx,
+            tools_in_toolset["read_image"],
+        )
+
+    assert "unsupported image media type" in str(exc.value)
 
 
 @pytest.mark.asyncio

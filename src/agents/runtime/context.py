@@ -2,10 +2,13 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from localagent_env import load_dotenv
 from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.toolsets import ApprovalRequiredToolset
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+
+load_dotenv()
 
 from rag import rag_service
 from tools.retrieval import make_rag_toolset, make_web_toolset

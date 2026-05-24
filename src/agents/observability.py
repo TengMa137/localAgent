@@ -3,21 +3,41 @@ Real-time observability for pydantic_ai agents.
 Drop-in replacement for agent.run() that streams events to stderr.
 """
 
+import json
 import os
 import sys
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, TypeVar
-from pydantic_ai import Agent
+
+from localagent_env import load_dotenv
+from pydantic_ai import Agent, PartDeltaEvent, PartStartEvent
+from pydantic_ai._agent_graph import End, UserPromptNode
 from pydantic_ai.messages import (
-    ToolCallPart, ToolReturnPart, TextPart, ModelResponse
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    ModelResponse,
+    TextPart,
+    TextPartDelta,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturnPart,
 )
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
 
 from pydantic import BaseModel, Field
 
+load_dotenv()
+
 T = TypeVar("T")
 ApprovalAction = Literal["approve", "deny", "suggest", "abort"]
+_trace_events: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "localagent_trace_events",
+    default=None,
+)
+_trace_sink: ContextVar[Any] = ContextVar("localagent_trace_sink", default=None)
 
 
 @dataclass(frozen=True)
@@ -47,6 +67,32 @@ def log_event(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(_c(f"[{ts}] ", "dim") + msg)
 
+
+def start_trace_collection(sink: Any = None) -> tuple[tuple[Any, Any], list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
+    token = _trace_events.set(events)
+    sink_token = _trace_sink.set(sink)
+    return (token, sink_token), events
+
+
+def stop_trace_collection(token: tuple[Any, Any]) -> None:
+    events_token, sink_token = token
+    _trace_sink.reset(sink_token)
+    _trace_events.reset(events_token)
+
+
+def _record_trace(event: dict[str, Any]) -> None:
+    events = _trace_events.get()
+    if events is None:
+        return
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        **event,
+    }
+    events.append(payload)
+    sink = _trace_sink.get()
+    if sink is not None:
+        sink(payload)
 
 
 async def observable_run(
@@ -80,8 +126,8 @@ async def observable_run(
         )
 
         async with agent.iter(current_prompt, **run_kwargs) as agent_run:
-            async for event in agent_run:
-                _handle_event(event, label=label, indent=indent)
+            async for node in agent_run:
+                await _handle_node(node, agent_run, label=label, indent=indent)
 
         result = agent_run.result
         if result is None:
@@ -119,12 +165,28 @@ def _handle_event(event: Any, label: str, indent: int) -> None:
     if isinstance(event, ToolCallPart):
         args_preview = _preview_args(event)
         _rt(f"[{label}] → tool_call  {_c(event.tool_name, 'yellow')}  {args_preview}", "dim", indent + 1)
+        _record_trace(
+            {
+                "kind": "tool_call",
+                "label": label,
+                "tool_name": event.tool_name,
+                "args": args_preview,
+            }
+        )
         return
 
     # A tool returned a result
     if isinstance(event, ToolReturnPart):
         result_preview = str(event.content)[:120].replace("\n", " ")
         _rt(f"[{label}] ← tool_return {_c(event.tool_name, 'yellow')}  {result_preview}", "dim", indent + 1)
+        _record_trace(
+            {
+                "kind": "tool_result",
+                "label": label,
+                "tool_name": event.tool_name,
+                "output": result_preview,
+            }
+        )
         return
 
     # Model emitted text
@@ -139,7 +201,200 @@ def _handle_event(event: Any, label: str, indent: int) -> None:
         if tool_calls:
             names = ", ".join(p.tool_name for p in tool_calls)
             _rt(f"[{label}] ⚙ model→tools  [{names}]", "blue", indent + 1)
+            _record_trace(
+                {
+                    "kind": "model_tools",
+                    "label": label,
+                    "tool_name": names,
+                }
+            )
         return
+
+
+async def _handle_node(node: Any, agent_run: Any, *, label: str, indent: int) -> None:
+    """Log graph nodes and stream tool events from pydantic-ai runs."""
+    if isinstance(node, UserPromptNode):
+        _rt(f"[{label}] user prompt", "dim", indent)
+        _record_trace({"kind": "status", "label": label, "message": "User prompt accepted"})
+        return
+
+    if Agent.is_model_request_node(node):
+        _rt(f"[{label}] ↻ model request", "dim", indent)
+        _record_trace({"kind": "model_request", "label": label})
+        await _stream_model_request_node(node, agent_run, label=label, indent=indent)
+        return
+
+    if Agent.is_call_tools_node(node):
+        tool_names = [
+            getattr(part, "tool_name", "")
+            for part in getattr(getattr(node, "model_response", None), "parts", [])
+            if getattr(part, "tool_name", "")
+        ]
+        if tool_names:
+            names = ", ".join(tool_names)
+            _rt(f"[{label}] ⚙ model→tools  [{names}]", "blue", indent + 1)
+            _record_trace({"kind": "model_tools", "label": label, "tool_name": names})
+        await _stream_call_tools_node(node, agent_run, label=label, indent=indent)
+        return
+
+    if isinstance(node, End):
+        _rt(f"[{label}] end node", "dim", indent)
+        _record_trace({"kind": "status", "label": label, "message": "Completed"})
+        return
+
+    _handle_event(node, label=label, indent=indent)
+
+
+async def _stream_model_request_node(node: Any, agent_run: Any, *, label: str, indent: int) -> None:
+    try:
+        async with node.stream(agent_run.ctx) as request_stream:
+            current_tool_name: str | None = None
+            async for event in request_stream:
+                if isinstance(event, PartStartEvent):
+                    current_tool_name = getattr(event.part, "tool_name", None)
+                    if current_tool_name:
+                        _rt(
+                            f"[{label}] → tool_call_start {_c(current_tool_name, 'yellow')}",
+                            "dim",
+                            indent + 1,
+                        )
+                        _record_trace(
+                            {
+                                "kind": "tool_call_start",
+                                "label": label,
+                                "tool_name": current_tool_name,
+                            }
+                        )
+                elif isinstance(event, PartDeltaEvent):
+                    if isinstance(event.delta, TextPartDelta):
+                        content_delta = getattr(event.delta, "content_delta", "")
+                        if content_delta:
+                            _record_trace(
+                                {
+                                    "kind": "text_delta",
+                                    "label": label,
+                                    "content": content_delta,
+                                }
+                            )
+                    elif isinstance(event.delta, ThinkingPartDelta):
+                        content_delta = getattr(event.delta, "content_delta", "")
+                        if content_delta:
+                            _record_trace(
+                                {
+                                    "kind": "thinking_delta",
+                                    "label": label,
+                                    "content": content_delta,
+                                }
+                            )
+                    elif isinstance(event.delta, ToolCallPartDelta):
+                        args_delta = getattr(event.delta, "args_delta", "")
+                        if args_delta:
+                            _record_trace(
+                                {
+                                    "kind": "tool_args_delta",
+                                    "label": label,
+                                    "tool_name": current_tool_name or "",
+                                    "args_delta": str(args_delta)[:500],
+                                }
+                            )
+    except Exception as exc:
+        _rt(f"[{label}] model stream unavailable: {exc}", "yellow", indent + 1)
+
+
+async def _stream_call_tools_node(node: Any, agent_run: Any, *, label: str, indent: int) -> None:
+    tool_names_by_id: dict[str, str] = {}
+    try:
+        async with node.stream(agent_run.ctx) as handle_stream:
+            async for event in handle_stream:
+                if isinstance(event, FunctionToolCallEvent):
+                    tool_name = event.part.tool_name
+                    tool_args = event.part.args
+                    tool_call_id = event.part.tool_call_id
+                    if tool_call_id:
+                        tool_names_by_id[tool_call_id] = tool_name
+                    args_preview = _preview_tool_args(tool_args)
+                    _rt(
+                        f"[{label}] → tool_call  {_c(tool_name, 'yellow')}  {args_preview}",
+                        "dim",
+                        indent + 1,
+                    )
+                    _record_trace(
+                        {
+                            "kind": "tool_call",
+                            "label": label,
+                            "tool_name": tool_name,
+                            "args": args_preview,
+                            "tool_call_id": tool_call_id,
+                        }
+                    )
+                elif isinstance(event, FunctionToolResultEvent):
+                    tool_call_id = getattr(event.result, "tool_call_id", "") or ""
+                    tool_name = tool_names_by_id.get(tool_call_id, "unknown")
+                    result_content = event.content if event.content is not None else getattr(event.result, "content", "")
+                    result_preview = _preview_tool_result(result_content)
+                    _rt(
+                        f"[{label}] ← tool_return {_c(tool_name, 'yellow')}  {result_preview[:160]}",
+                        "dim",
+                        indent + 1,
+                    )
+                    _record_trace(
+                        {
+                            "kind": "tool_result",
+                            "label": label,
+                            "tool_name": tool_name,
+                            "output": result_preview,
+                            "tool_call_id": tool_call_id,
+                        }
+                    )
+    except Exception as exc:
+        _rt(f"[{label}] tool stream unavailable: {exc}", "yellow", indent + 1)
+        raise
+
+
+def _preview_tool_result(value: Any) -> str:
+    try:
+        sanitized = _sanitize_tool_result(value)
+        raw = sanitized if isinstance(sanitized, str) else json.dumps(sanitized, ensure_ascii=False, default=str)
+        return raw[:1200].replace("\n", " ")
+    except Exception:
+        return ""
+
+
+def _sanitize_tool_result(value: Any, *, depth: int = 0) -> Any:
+    if depth > 4:
+        return f"<{type(value).__name__}>"
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<bytes {len(value)} bytes>"
+    if _is_binary_image(value):
+        data = getattr(value, "data", b"") or b""
+        media_type = getattr(value, "media_type", "") or "image"
+        identifier = getattr(value, "identifier", "") or ""
+        suffix = f" {identifier}" if identifier else ""
+        return f"<{media_type} {len(data)} bytes{suffix}>"
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_tool_result(item, depth=depth + 1)
+            for key, item in list(value.items())[:50]
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_tool_result(item, depth=depth + 1) for item in list(value)[:50]]
+    if all(hasattr(value, attr) for attr in ("return_value", "content", "metadata")):
+        return {
+            "return_value": _sanitize_tool_result(getattr(value, "return_value"), depth=depth + 1),
+            "content": _sanitize_tool_result(getattr(value, "content"), depth=depth + 1),
+            "metadata": _sanitize_tool_result(getattr(value, "metadata"), depth=depth + 1),
+        }
+    return str(value)
+
+
+def _is_binary_image(value: Any) -> bool:
+    return (
+        type(value).__name__ == "BinaryImage"
+        and hasattr(value, "data")
+        and hasattr(value, "media_type")
+    )
 
 
 def _preview_args(part: ToolCallPart) -> str:
@@ -149,6 +404,21 @@ def _preview_args(part: ToolCallPart) -> str:
             return ""
         raw = args.args_json() if hasattr(args, "args_json") else str(args)
         return raw[:120].replace("\n", " ")
+    except Exception:
+        return ""
+
+
+def _preview_tool_args(args: Any) -> str:
+    try:
+        if hasattr(args, "args_json"):
+            raw = args.args_json()
+        elif isinstance(args, (dict, list)):
+            import json
+
+            raw = json.dumps(args, ensure_ascii=False)
+        else:
+            raw = str(args)
+        return raw[:1200].replace("\n", " ")
     except Exception:
         return ""
 

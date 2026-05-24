@@ -31,17 +31,22 @@ SKILL_EDITING_POLICY_PATH = "/skills/skill_editing.md"
 KNOWN_FILE_SUFFIXES = {
     ".cfg",
     ".csv",
+    ".gif",
     ".html",
     ".ini",
+    ".jpeg",
+    ".jpg",
     ".json",
     ".lock",
     ".log",
     ".md",
     ".pdf",
+    ".png",
     ".py",
     ".rst",
     ".toml",
     ".txt",
+    ".webp",
     ".xml",
     ".yaml",
     ".yml",
@@ -49,7 +54,7 @@ KNOWN_FILE_SUFFIXES = {
 
 PATHLIKE_RE = re.compile(r"(?<!\S)(?:/|[A-Za-z0-9._-]+/)[A-Za-z0-9._~@%+=:,/-]+")
 KNOWN_SUFFIX_RE = re.compile(
-    r"(?<![/\w.-])([A-Za-z0-9._-]+\.(?:cfg|csv|html|ini|json|lock|log|md|pdf|py|rst|toml|txt|xml|ya?ml))(?![/\w.-])",
+    r"(?<![/\w.-])([A-Za-z0-9._-]+\.(?:cfg|csv|gif|html|ini|jpe?g|json|lock|log|md|pdf|png|py|rst|toml|txt|webp|xml|ya?ml))(?![/\w.-])",
     re.IGNORECASE,
 )
 
@@ -162,6 +167,8 @@ Rules:
     listed as resolved paths or possible write targets.
   - For directories, many files, or truncated reads, set needs_rag=true and
     include the relevant paths.
+  - For image files, use read_image to inspect visual content. Use read_file
+    only for text/code files.
   - For writes under /skills, follow the injected skill editing policy.
   - Put a practical user-facing answer in answer and durable facts in findings.
 """,

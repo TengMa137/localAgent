@@ -1,8 +1,11 @@
 import os
 from typing import Any, Protocol, runtime_checkable
 
+from localagent_env import load_dotenv
 from rag_lib.rag import RagService
 from rag_lib.types_doc import Document
+
+load_dotenv()
 
 
 @runtime_checkable
