@@ -1292,6 +1292,7 @@ select {
 }
 
 .composer-inner {
+  --composer-control-size: 34px;
   display: flex;
   align-items: flex-end;
   gap: 10px;
@@ -1311,10 +1312,11 @@ select {
 
 #message-input {
   flex: 1;
+  min-height: var(--composer-control-size);
   background: transparent;
   border: none;
   border-radius: 0;
-  padding: 2px 0;
+  padding: 6px 0;
   font-size: 14px;
   font-weight: 400;
   color: var(--text);
@@ -1334,9 +1336,10 @@ select {
   flex-shrink: 0;
 }
 
+.btn-composer-icon,
 .btn-composer-plus {
-  width: 34px;
-  height: 34px;
+  width: var(--composer-control-size);
+  height: var(--composer-control-size);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1349,14 +1352,42 @@ select {
   cursor: pointer;
   transition: color 0.15s, background 0.15s, border-color 0.15s, transform 0.1s;
 }
+
+.btn-composer-icon svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .btn-composer-plus:hover,
-.btn-composer-plus[aria-expanded="true"] {
+.btn-composer-plus[aria-expanded="true"],
+.btn-composer-icon:hover {
   color: var(--amber);
   background: var(--amber-dim);
   border-color: color-mix(in srgb, var(--amber) 36%, transparent);
 }
-.btn-composer-plus:active { transform: scale(0.95); }
+
+.btn-composer-mic.is-recording {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 42%, transparent);
+}
+
+.btn-composer-icon:disabled,
+.btn-composer-plus:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+}
+
+.btn-composer-plus:active,
+.btn-composer-icon:active { transform: scale(0.95); }
 .btn-composer-plus:focus-visible,
+.btn-composer-icon:focus-visible,
 .upload-menu-option:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--amber-dim);

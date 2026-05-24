@@ -27,6 +27,10 @@ from pydantic import TypeAdapter
 from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.usage import UsageLimits
 
+from localagent_env import load_dotenv
+
+load_dotenv()
+
 from rag import rag_service
 from agents.orchestrator_agent import OrchestratorResponse, run_orchestrator_turn
 from agents.observability import (

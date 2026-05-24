@@ -1,8 +1,8 @@
 # Local Research Agent
 
 A local-first autonomous research assistant built with [pydantic-ai](https://ai.pydantic.dev/).
-Runs in your terminal, works with any OpenAI-compatible API — including llama.cpp — and keeps
-all data on your machine.
+Runs in your terminal or the bundled web app, works with any OpenAI-compatible API including
+llama.cpp, and keeps all data on your machine.
 
 ---
 
@@ -12,23 +12,25 @@ The agent handles three kinds of requests from a single conversation loop:
 
 - **Direct** — answers immediately from the model's own knowledge (explanations, code, writing, maths).
 - **Clarify** — asks one focused question when a request is too ambiguous to act on safely.
-- **Delegated work** — routes local file tasks to `fs_agent`, web/current tasks to
-  `web_agent`, and complex multi-step tasks to the planning workflow.
+- **Routed work** — returns a typed route for local file tasks, web/current tasks,
+  or complex multi-step planning; Python then executes the matching route runner.
 
 The code is intentionally biased toward small local LLMs. Python owns the multi-step workflow,
-specialist execution, path validation, approval handling, deterministic RAG handoffs, and report
+route execution, path validation, approval handling, deterministic RAG handoffs, and report
 memory. LLM calls are kept narrow: choose a typed route, plan typed tasks, extract evidence,
 reflect only when needed, and synthesize.
 
 Current implementation highlights:
 
-- Validator-backed filesystem tools now cover read, line reads, grep, stat, shallow/deep listing,
-  directory creation, copy/move/delete, and single-file search/replace.
+- Validator-backed filesystem tools now cover text reads, image reads, line reads, grep, stat,
+  shallow/deep listing, directory creation, copy/move/delete, and single-file search/replace.
 - Filesystem writes can use local CLI approval via PydanticAI deferred-tool approval.
-- The orchestrator returns a typed semantic route decision; Python executes the selected specialist once.
+- The orchestrator cannot call specialist agents as tools; it returns one typed
+  semantic route decision, and Python executes the selected runner once.
 - `fs_agent` owns local path discovery/read/write/edit and uses deterministic RAG for large or multi-file reads.
 - `web_agent` owns search/query/URL selection/crawl and then uses deterministic RAG over fetched content.
-- Agents write concise per-session markdown reports under `chat_history/reports/<session-title>/`.
+- Agents write concise per-session markdown reports in the CLI history directory
+  or the web app state directory.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
 - Workers are mostly tool-free: Python retrieves evidence, workers extract findings.
 - Reflection is skipped when deterministic completion criteria are already met.
@@ -39,30 +41,32 @@ Current implementation highlights:
 
 ```
 .
-├── run_agents.py            # Entry point — interactive terminal chat
-├── rag.py                   # Rag service entry point, import from rag_lib
-├── agents/
-│   ├── orchestrator_agent.py # Conversation router for fs/web/plan tools
-│   ├── fs_agent.py           # Filesystem specialist agent
-│   ├── web_agent.py          # Web/search/crawl specialist agent
-│   ├── plan_agent.py         # Planning, plan normalization, worker loop
-│   ├── worker.py             # Stateless one-shot worker calls and retrieval
-│   ├── observability.py     # Real-time event streaming to stderr
-│   └── runtime/
-│       ├── context.py        # Model setup, validators, toolsets, skill loader
-│       ├── query_policy.py   # URL/arXiv extraction and task kind helpers
-│       ├── rag_helpers.py    # Deterministic RAG helper functions for agents
-│       ├── reports.py        # Per-session markdown report memory
-│       └── skills_context.py # Deterministic /skills prompt context
-│
-├── tools/
-│   ├── filesystem/          # Validator-backed read/write/list/grep/edit tools
-│   ├── retrieval/           # RAG tools and MCP web/arXiv interceptors
-│   └── skills/              # build_index, make_skills
-│
+├── .env.example             # Local configuration defaults
+├── docker-compose.yml       # Web app + MCP server local stack
+├── src/
+│   ├── server.py            # FastAPI backend and static web app
+│   ├── run_agents.py        # Interactive terminal chat entry point
+│   ├── rag.py               # RAG service entry point, imported from rag_lib
+│   ├── localagent_env.py    # .env loading for direct os.getenv users
+│   ├── server_app/          # Web chat persistence, schemas, upload classification
+│   ├── speech/              # CrispASR/Qwen3 ASR, TTS, and terminal voice helpers
+│   ├── agents/
+│   │   ├── orchestrator_agent.py # Typed conversation router for fs/web/plan runners
+│   │   ├── fs_agent.py           # Filesystem specialist agent
+│   │   ├── web_agent.py          # Web/search/crawl specialist agent
+│   │   ├── plan_agent.py         # Planning, plan normalization, worker loop
+│   │   ├── worker.py             # Stateless one-shot worker calls and retrieval
+│   │   ├── observability.py      # Real-time event streaming and compact tracing
+│   │   └── runtime/              # Model setup, validators, reports, skill context
+│   └── tools/
+│       ├── filesystem/      # Validator-backed read/write/list/grep/edit/image tools
+│       ├── retrieval/       # RAG tools and MCP web/arXiv interceptors
+│       └── skills/          # build_index, make_skills
+├── web/                     # Same-origin frontend assets
 ├── skills/                  # Skill markdown files loaded at runtime
-│
-└── chat_history/            # Per-session JSON logs and reports (auto-created)
+├── user_docs/               # Default local docs mount and web upload root
+├── chat_history/            # CLI JSON logs and reports (auto-created)
+└── localagent_state/        # Web DB, branch history, reports, and app state
 ```
 
 ---
@@ -105,7 +109,7 @@ Start an OpenAI-compatible model endpoint, for example llama.cpp:
 
 ```bash
 ./build/bin/llama-server \
-    --model ./models/qwen3-0.6b-q8_0.gguf \
+    --model ./models/qwen3.5-2b-q8_0.gguf \
     --port 8080 \
     --ctx-size 32768 \
     --n-predict 2048 \
@@ -119,7 +123,7 @@ Host defaults:
 ```text
 LOCALAGENT_MODEL_BASE_URL=http://localhost:8080/v1
 LOCALAGENT_MCP_URL=http://localhost:8000/sse
-LOCALAGENT_DOCS_DIR=user_docs
+LOCALAGENT_DOCS_DIR=./user_docs
 LOCALAGENT_SKILLS_DIR=skills
 ```
 
@@ -149,8 +153,12 @@ LOCALAGENT_ADMIN_PASSWORD=choose-a-long-random-password
 LOCALAGENT_COOKIE_SECURE=false
 ```
 
-The app reads `.env` automatically through Pydantic settings. Use `.env` for a
-single local machine; use real environment variables or your container/host
+Start from `.env.example` if you want a complete list of supported local
+configuration variables with defaults.
+
+The app loads `.env` automatically before reading `LOCALAGENT_*` settings, including
+the direct `os.getenv` config used by agent, RAG, ASR, and TTS modules. Use `.env`
+for a single local machine; use real environment variables or your container/host
 secret manager for deployment so secrets are not copied into the repo or image.
 
 Open `http://127.0.0.1:8088`. Browser auth uses server-side sessions with
@@ -159,13 +167,18 @@ Open `http://127.0.0.1:8088`. Browser auth uses server-side sessions with
 Admin users can list/create/disable users and view all users' chat history.
 Normal users can only access their own chat sessions.
 
+Web uploads are stored under `LOCALAGENT_DOCS_DIR/web_uploads/`. Text-like files are
+previewed in the chat context. PNG, JPEG, GIF, and WebP uploads are routed to `read_image`;
+other binary or unsupported image formats are described as binary attachments instead of
+being sent to image inspection.
+
 For Docker Compose:
 
 ```bash
-LOCALAGENT_ADMIN_USERNAME=admin \
-LOCALAGENT_ADMIN_PASSWORD='choose-a-long-password' \
 docker compose up --build
 ```
+
+Compose also reads the same `.env` file for `${LOCALAGENT_*}` substitutions.
 
 The Compose stack runs:
 
@@ -187,11 +200,11 @@ endpoint works without code changes.
 ```bash
 # OpenAI
 export OPENAI_API_KEY=sk-...
-# set model = "openai:gpt-4o" in agents/runtime/context.py
+# set model = "openai:gpt-4o" in src/agents/runtime/context.py
 
 # Anthropic
 export ANTHROPIC_API_KEY=sk-ant-...
-# set model = "anthropic:claude-sonnet-4-5" in agents/runtime/context.py
+# set model = "anthropic:claude-sonnet-4-5" in src/agents/runtime/context.py
 ```
 
 ### Local via llama.cpp
@@ -205,24 +218,24 @@ that works as a drop-in local backend.
 git clone https://github.com/ggerganov/llama.cpp
 cd llama.cpp && cmake -B build && cmake --build build --config Release -j
 
-# Download a GGUF model — Qwen3-0.6B is a good starting point
+# Download a GGUF model — Qwen3.5-2B is the current tested default
 ```
 
 **Step 2 — Start the server**
 
 ```bash
 ./build/bin/llama-server \
-    --model ./models/qwen3-0.6b-q8_0.gguf \
+    --model ./models/qwen3.5-2b-q8_0.gguf \
     --port 8080 \
     --ctx-size 32768 \
     --n-predict 2048 \
     --jinja \
     --cache-ram 2048 \
-    -np 4
+    -np 4 \
     -ctk q8_0 \
-    -ctv q8_0 
+    -ctv q8_0
 
-# adjust the parameter as needed, mind for the RAM/VRAM consumption.
+# Adjust the parameters as needed for RAM/VRAM consumption.
 ```
 
 **Step 3 — Point the agent at the local server**
@@ -238,10 +251,13 @@ No other changes needed — the rest of the agent stack is model-agnostic.
 
 ### Local speech via CrispASR Qwen3 ASR/TTS
 
-The speech integration keeps the agent core text-only. A local frontend can send
-microphone audio to `voice_api.py`; the API transcribes with CrispASR's Qwen3
-ASR backend and then passes the transcript into the existing `handle_turn(...)`
-path. TTS calls a second CrispASR server loaded with the Qwen3-TTS 0.6B
+The speech integration keeps voice input as text before it reaches the agent. The web app records
+microphone audio in the browser, sends it to the authenticated FastAPI endpoint
+`POST /api/speech/asr`, and inserts the transcript into the chat composer.
+Web voice input omits a browser language override by default. The backend uses
+`LOCALAGENT_ASR_LANGUAGE` when set, otherwise it falls back to English so CrispASR
+does not need to run its Whisper-based language-identification step.
+Terminal TTS calls a second CrispASR server loaded with the Qwen3-TTS 0.6B
 CustomVoice backend.
 
 Build or install `crispasr` from <https://github.com/CrispStrobe/CrispASR>, then
@@ -283,7 +299,7 @@ crispasr --server \
 For the CustomVoice TTS model, `vivian` is one of the baked speaker names, so no
 reference WAV or `--voice-dir` is required.
 
-Then start the local voice API:
+Then configure the web server process:
 
 ```bash
 export LOCALAGENT_ASR_BASE_URL=http://localhost:8081/v1
@@ -295,8 +311,6 @@ export LOCALAGENT_TTS_BACKEND=qwen3-tts-customvoice
 export LOCALAGENT_TTS_MODEL=./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf
 export LOCALAGENT_TTS_CODEC_MODEL=./models/qwen3-tts-tokenizer-12hz.gguf
 export LOCALAGENT_TTS_VOICE=vivian
-
-uv run python src/voice_api.py --host 127.0.0.1 --port 8090
 ```
 
 `LOCALAGENT_*_MODEL` is retained in requests and diagnostics. In server mode,
@@ -325,15 +339,11 @@ CrispASR's TTS endpoint returns a normal audio response. The terminal runner
 can still provide near-real-time speech by splitting assistant replies into
 sentence-sized chunks, synthesizing each chunk, and playing them in order.
 
-Useful endpoints:
+Useful web endpoint:
 
 | Endpoint | Body | Result |
 |---|---|---|
-| `GET /health` | none | API health check |
-| `GET /speech/models` | none | Configured local speech models |
-| `POST /speech/asr` | `{"audio_base64": "...", "mime_type": "audio/wav"}` | Transcript only |
-| `POST /speech/tts` | `{"text": "...", "voice": "vivian", "instructions": "optional", "speed": 1.0}` | WAV audio as base64 |
-| `POST /agent/voice-turn` | `{"audio_base64": "...", "mime_type": "audio/wav", "session_id": "optional", "tts": false}` | Transcript plus agent reply, optionally with reply audio |
+| `POST /api/speech/asr` | multipart `file` audio upload, optional `language` | Transcript text, language, and provider |
 
 You can also test ASR/TTS directly from the command line without running the
 agent:
@@ -377,11 +387,11 @@ Useful TTS playback environment variables:
 | Variable | Default | Purpose |
 |---|---|---|
 | `LOCALAGENT_TTS_PLAYER` | auto-detect | Playback command that accepts an audio file path as its last argument |
-| `LOCALAGENT_TTS_MIN_CHARS` | `80` | Minimum text chunk size before sentence-boundary playback |
-| `LOCALAGENT_TTS_MAX_CHARS` | `260` | Maximum text chunk size before splitting at a word boundary |
-| `LOCALAGENT_TTS_MIN_SENTENCE_CHARS` | `1` | Minimum complete sentence size allowed to play immediately |
-| `LOCALAGENT_TTS_INITIAL_MAX_CHARS` | Qwen3 profile | Shorter first chunk target for faster time-to-first-audio |
-| `LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS` | Qwen3 profile | Split long sentences at commas/semicolons after this many chars |
+| `LOCALAGENT_TTS_MIN_CHARS` | `50` | Minimum text chunk size before sentence-boundary playback |
+| `LOCALAGENT_TTS_MAX_CHARS` | `180` | Maximum text chunk size before splitting at a word boundary |
+| `LOCALAGENT_TTS_MIN_SENTENCE_CHARS` | `24` | Minimum complete sentence size allowed to play immediately |
+| `LOCALAGENT_TTS_INITIAL_MAX_CHARS` | `120` | Shorter first chunk target for faster time-to-first-audio |
+| `LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS` | `90` | Split long sentences at commas/semicolons after this many chars |
 
 For terminal voice input, install the local microphone dependency:
 
@@ -417,15 +427,15 @@ text.
 
 | Model | Backend | Works for |
 |---|---|---|
-| Qwen3-0.6B | llama.cpp (local) | Q&A over local files, web search, URL crawling |
-| Qwen3-8B | llama.cpp (local) | Multi-step research, planning, reflection |
-...
+| Qwen3.5-2B | llama.cpp (local) | Default local model for web chat, local files, URL crawling, and multi-step planning |
+| Qwen3.5-0.8B | llama.cpp (local) | Lightweight local model for simple file Q&A, short web lookups, and direct chat |
 
-**Notes on small models (≤ 1B):** Qwen3-0.6B handles simple single-turn tasks well: fetching
-a web page, answering a question from a local file, or doing a straightforward search.
-The agent avoids asking tiny models to manage broad tool loops. The orchestrator routes to
-specialist fs/web agents, and Python performs deterministic RAG handoffs when content is
-large, multi-file, or fetched from the web.
+**Notes on small models (≤ 1B):** Qwen3.5-0.8B is useful for simple single-turn
+tasks: fetching a web page, answering from a local file, or doing a straightforward
+search. The agent avoids asking small models to manage broad tool loops. The
+orchestrator emits a typed route decision only; Python executes the selected
+runner and performs deterministic RAG handoffs when content is large, multi-file,
+or fetched from the web.
 
 ---
 
@@ -434,31 +444,32 @@ large, multi-file, or fetched from the web.
 ### Orchestrator
 
 The orchestrator is the long-lived conversational agent. It accumulates `message_history`
-across turns and classifies each turn as direct, clarify, filesystem, web, or complex plan. A
-`history_processor` compresses old turns once history exceeds a configurable threshold,
-keeping the context window bounded without losing important decisions.
+across turns and classifies each turn as direct, clarify, filesystem, web, or complex plan.
 
-Before each turn, the CLI loads any per-session agent reports and injects them as context.
-It also refreshes and injects a deterministic `/skills` scan, so newly created or edited
-skills are visible on the next run. If chat/report/skill context is sufficient, the
-orchestrator answers directly. Otherwise it returns a typed route decision and Python executes
-the selected specialist once:
+Before each turn, the shared runtime loads any per-session agent reports and injects them
+as context. It also refreshes and injects a deterministic `/skills` scan, so newly created
+or edited skills are visible on the next run. If chat/report/skill context is sufficient,
+the orchestrator answers directly. Otherwise it returns a typed route decision and Python
+executes the selected route runner once. The specialist agents are not exposed as
+orchestrator tools.
 
-| Route | Tool |
+| Route | Python runner |
 |---|---|
 | local files, edits, local grep/read/write | `run_fs_task` |
 | current info, web search, URL crawl, arXiv lookup | `run_web_task` |
 | complex multi-step work | `run_plan_workflow` |
 
-The orchestrator does not receive raw filesystem, web, or RAG toolsets. It never reads files or
-web pages directly, and it does not run a model-driven tool loop after choosing a route.
+The orchestrator does not receive raw filesystem, web, RAG, or specialist toolsets. It never
+reads files or web pages directly, and it does not run a model-driven tool loop after choosing
+a route.
 
 ### fs_agent
 
 `fs_agent` has the approval-wrapped filesystem toolset. It discovers paths by listing,
 statting, grepping, and reading; it does not use a keyword path resolver. Small UTF-8 text
-files can be read directly. Directories, multiple files, truncated reads, and files larger
-than the direct read limit trigger deterministic RAG over the discovered paths.
+files can be read directly, and PNG/JPEG/GIF/WebP images can be loaded with `read_image`.
+Directories, multiple files, truncated reads, and files larger than the direct read limit
+trigger deterministic RAG over the discovered paths.
 
 Before each fs task, the agent receives the current deterministic `/skills` catalog plus a
 readable file index. This prevents skill-related requests from depending on guessed paths.
@@ -496,8 +507,8 @@ After the model returns, Python normalizes the plan:
 ### Worker steps
 
 Worker steps are stateless and single-shot. The same worker module handles evidence
-extraction, web-query review, history compression, reflection, and synthesis with different
-system prompts and typed output schemas. For extraction, each worker receives one `TaskSpec`,
+extraction, web-query review, reflection, and synthesis with different system prompts and
+typed output schemas. For extraction, each worker receives one `TaskSpec`,
 but it no longer chooses retrieval tools itself for the normal paths. Python executes retrieval from
 `TaskSpec.kind`:
 
@@ -525,18 +536,21 @@ time-sensitive.
 
 ### Agent reports
 
-Specialist agents write concise markdown reports in:
+Specialist agents write concise markdown reports in the active session report directory:
 
 ```text
-chat_history/reports/<session-title>/
+CLI:  chat_history/reports/<session-title>/
+Web:  localagent_state/reports/<user-id>/<session-id>/<branch-id>/
+Files:
 ├── fs-report.md
 ├── web-report.md
 └── plan-report.md
 ```
 
 Reports are overwritten with the latest durable state for that agent: objective, summary,
-paths/sources, findings, and uncertainties. On the next turn, `run_agents.py` loads all
-`*-report.md` files for the session and injects them before the user request.
+paths/sources, findings, and uncertainties. On the next turn, the shared `run_turn`
+runtime loads all `*-report.md` files for the session and injects them before the user
+request.
 
 ### Shared RAG knowledge base
 
@@ -575,6 +589,7 @@ Available filesystem tools include:
 | Tool | Purpose |
 |---|---|
 | `read_file` | Read a text file by character range |
+| `read_image` | Load a PNG, JPEG, GIF, or WebP image for model inspection |
 | `read_lines` | Read a numbered line range |
 | `write_file` | Write a text file and create parent directories |
 | `edit_file` | Replace one exact unique text occurrence |
@@ -627,8 +642,8 @@ returns:
 
 - `skills_prompt` — a compact listing injected into the system prompt so the model knows
   what skills are available without loading all of them upfront.
-- `load_skill` — a tool the agent calls to read a specific skill on demand, keeping the
-  initial context small.
+- `load_skill` — a helper factory kept with the skills toolset for agents that explicitly
+  register it; the current normal routes rely on deterministic skill scans instead.
 
 At runtime, `scan_skills_context()` refreshes this index before each orchestrator turn and
 before each filesystem task. The scanner injects exact skill paths such as
@@ -638,7 +653,7 @@ paths over invented names.
 When a filesystem task appears to create, edit, move, copy, or delete skill files, `fs_agent`
 deterministically loads `/skills/skill_editing.md` into the task prompt. This is a Python
 hook, not an orchestrator choice, so skill edits receive the editing policy even when the
-model would otherwise forget to call a skill-loading tool.
+model would otherwise miss the policy.
 
 ### RAG toolset
 
@@ -665,18 +680,37 @@ ingested once.
 counts. This keeps chunks semantically coherent and reduces noise at boundaries.
 
 The pipeline is fully local. Embeddings and retrieval run on your machine. No data leaves
-the host unless a worker explicitly calls a web search or crawl tool.
+the host unless a web route or worker task kind performs search, URL crawl, or arXiv lookup.
 
 ---
 
 ## Configuration
 
-Runtime environment variables:
+Runtime environment variables are loaded from `.env` automatically. Start from
+`.env.example`; real environment variables still take precedence.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `LOCALAGENT_STATE_DIR` | `./localagent_state` | Web app state directory for SQLite, branch history, reports, and app files |
+| `LOCALAGENT_DB_PATH` | unset | Optional explicit SQLite database path; defaults under `LOCALAGENT_STATE_DIR` |
+| `LOCALAGENT_WEB_DIR` | `web` | Static frontend directory served by FastAPI |
+| `LOCALAGENT_DOCS_DIR` | `./user_docs` | Host directory mounted into the agent as `/docs`; web uploads are stored under `web_uploads/` inside it |
+| `LOCALAGENT_MAX_UPLOAD_BYTES` | `26214400` | Maximum uploaded file size for chat attachments |
+| `LOCALAGENT_SESSION_COOKIE` | `localagent_session` | Browser session cookie name |
+| `LOCALAGENT_COOKIE_SECURE` | `false` | Set true when serving HTTPS so auth cookies require TLS |
+| `LOCALAGENT_SESSION_TTL_SECONDS` | `604800` | Browser session lifetime |
+| `LOCALAGENT_ADMIN_USERNAME` | unset | Optional initial admin username |
+| `LOCALAGENT_ADMIN_PASSWORD` | unset | Optional initial admin password |
+| `LOCALAGENT_MAX_VOICE_AUDIO_BYTES` | `10485760` | Maximum browser voice recording upload size |
+| `LOCALAGENT_BIND` | `127.0.0.1` | Docker Compose host bind address |
+| `LOCALAGENT_PORT` | `8088` | Docker Compose published web port |
 | `LOCALAGENT_MODEL_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible model endpoint used by pydantic-ai and `rag_lib` |
 | `LOCALAGENT_MODEL_API_KEY` | `no-key` | API key sent to the model endpoint |
+| `LOCALAGENT_MCP_URL` | `http://localhost:8000/sse` | MCP web server SSE endpoint |
+| `LOCALAGENT_SKILLS_DIR` | `skills` | Host directory mounted into the agent as `/skills` |
+| `LOCALAGENT_SKILLS_MODE` | `rw` | Access mode for `/skills`; use `ro` to prevent skill writes |
+| `LOCALAGENT_APPROVE_TOOLS` | unset | `always` auto-approves deferred filesystem writes; `never` auto-denies |
+| `LOCALAGENT_MAX_APPROVAL_ROUNDS` | `3` | Maximum approval cycles before stopping the current agent run |
 | `LOCALAGENT_SPEECH_CLI` | `crispasr` | CrispASR executable used only when a speech base URL is set empty for CLI fallback |
 | `LOCALAGENT_ASR_BASE_URL` | `http://localhost:8081/v1` | OpenAI-compatible CrispASR ASR endpoint; set empty to use CLI mode |
 | `LOCALAGENT_ASR_BACKEND` | `qwen3` | CrispASR ASR backend |
@@ -684,74 +718,73 @@ Runtime environment variables:
 | `LOCALAGENT_ASR_API_KEY` | `no-key` | API key sent to the ASR endpoint |
 | `LOCALAGENT_ASR_TIMEOUT_SECONDS` | `300` | ASR request/subprocess timeout |
 | `LOCALAGENT_ASR_MAX_TOKENS` | `512` | Maximum generated ASR tokens |
+| `LOCALAGENT_ASR_TEMPERATURE` | `0` | Optional ASR sampling temperature |
 | `LOCALAGENT_ASR_RESPONSE_FORMAT` | `json` | CrispASR server response format |
 | `LOCALAGENT_ASR_LANGUAGE` | unset | Optional language passed to CrispASR with `-l`/`language` |
 | `LOCALAGENT_ASR_THREADS` | unset | Optional CrispASR ASR thread count |
 | `LOCALAGENT_ASR_VAD` | unset | Set true to pass `--vad` in ASR CLI mode |
+| `LOCALAGENT_ASR_OUTPUT_JSON` | `1` | Use JSON output for ASR CLI fallback |
 | `LOCALAGENT_TTS_BASE_URL` | `http://localhost:8082/v1` | OpenAI-compatible CrispASR TTS endpoint; set empty to use CLI mode |
 | `LOCALAGENT_TTS_CLI` | `crispasr` | CrispASR executable for TTS CLI fallback |
 | `LOCALAGENT_TTS_BACKEND` | `qwen3-tts-customvoice` | CrispASR TTS backend |
 | `LOCALAGENT_TTS_MODEL` | `./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf` | Preferred TTS model path sent in requests/metadata; server uses its loaded model |
+| `LOCALAGENT_TTS_API_KEY` | `no-key` | API key sent to the TTS endpoint |
 | `LOCALAGENT_TTS_TIMEOUT_SECONDS` | `600` | TTS request/subprocess timeout |
 | `LOCALAGENT_TTS_VOICE` | `vivian` | CrispASR CustomVoice baked speaker name |
+| `LOCALAGENT_TTS_VOICE_DIR` | unset | Optional voice directory for TTS CLI/server modes that need it |
 | `LOCALAGENT_TTS_REF_TEXT` | unset | Reference text for Qwen3-TTS WAV voice cloning in CLI mode |
 | `LOCALAGENT_TTS_CODEC_MODEL` | `./models/qwen3-tts-tokenizer-12hz.gguf` | Qwen3-TTS codec GGUF path for server startup/CLI fallback |
+| `LOCALAGENT_TTS_LANGUAGE` | unset | Optional TTS language hint |
+| `LOCALAGENT_TTS_INSTRUCTIONS` | unset | Optional TTS instruction text |
+| `LOCALAGENT_TTS_RESPONSE_FORMAT` | `wav` | TTS output format |
 | `LOCALAGENT_TTS_TEMPERATURE` | unset | Optional CrispASR TTS sampling temperature |
 | `LOCALAGENT_TTS_SPEED` | unset | Optional CrispASR TTS server speed multiplier |
 | `LOCALAGENT_TTS_THREADS` | unset | Optional CrispASR TTS thread count |
 | `LOCALAGENT_TTS_PLAYER` | auto-detect | Terminal playback command used by `run_agents.py --tts` |
-| `LOCALAGENT_TTS_MIN_CHARS` | `80` | Minimum chunk size for terminal TTS playback |
-| `LOCALAGENT_TTS_MAX_CHARS` | `260` | Maximum chunk size for terminal TTS playback |
-| `LOCALAGENT_TTS_MIN_SENTENCE_CHARS` | `1` | Minimum complete sentence size allowed to play immediately |
-| `LOCALAGENT_TTS_INITIAL_MAX_CHARS` | Qwen3 profile | Shorter first chunk target for faster time-to-first-audio |
-| `LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS` | Qwen3 profile | Split long sentences at commas/semicolons after this many chars |
-| `LOCALAGENT_MCP_URL` | `http://localhost:8000/sse` | MCP web server SSE endpoint |
-| `LOCALAGENT_DOCS_DIR` | `user_docs` | Host directory mounted into the agent as `/docs` |
-| `LOCALAGENT_SKILLS_DIR` | `skills` | Host directory mounted into the agent as `/skills` |
-| `LOCALAGENT_SKILLS_MODE` | `rw` | Access mode for `/skills`; use `ro` to prevent skill writes |
-| `LOCALAGENT_APPROVE_TOOLS` | unset | `always` auto-approves deferred filesystem writes; `never` auto-denies |
-| `LOCALAGENT_MAX_APPROVAL_ROUNDS` | `3` | Maximum approval cycles before stopping the current agent run |
+| `LOCALAGENT_TTS_MIN_CHARS` | `50` | Minimum chunk size for terminal TTS playback |
+| `LOCALAGENT_TTS_MAX_CHARS` | `180` | Maximum chunk size before splitting at a word boundary |
+| `LOCALAGENT_TTS_MIN_SENTENCE_CHARS` | `24` | Minimum complete sentence size allowed to play immediately |
+| `LOCALAGENT_TTS_INITIAL_MAX_CHARS` | `120` | Shorter first chunk target for faster time-to-first-audio |
+| `LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS` | `90` | Split long sentences at commas/semicolons after this many chars |
+| `OPENAI_API_KEY` | unset | Optional cloud OpenAI key if switching away from local llama.cpp |
+| `ANTHROPIC_API_KEY` | unset | Optional Anthropic key if switching providers |
 
-Key constants in *_agents.py respectively:
+Key runtime constants:
 
 | Constant | Effect |
 |---|---|
 | `MAX_PARALLEL_TASKS` | Worker concurrency per batch |
 | `MAX_ITERATIONS`  | Reflect → worker loop limit |
 | `MAX_TASKS_PER_PLAN`  | Tasks plan_agent can generate |
-| `COMPRESS_AFTER`  | Message count that triggers history compression |
-| `KEEP_RECENT`  | Messages kept verbatim after compression |
 
 ---
 
-## Docker Direction
+## Docker Compose
 
-For now, host development with `uv` is the clean path. Later, it makes sense to run the full
-runtime stack with Docker Compose:
+Host development with `uv` remains the simplest path, and the included Compose stack runs the
+web app plus the local MCP web server:
 
-- one application container containing both `localAgent` and `rag_lib`
-- the MCP server container from `~/codespace/mcp_server_local`
-- Redis
-- a SQL database container
-- optionally a model server, if the model is not running directly on the host
+- `agent-app`: FastAPI backend, static frontend, agent runtime, and in-process `rag_lib`
+- `mcp-server`: web search, URL crawling, and arXiv lookup inside the Compose network
+- `agent_state`: persistent volume for the web app SQLite database, branch history, and reports
 
-In that Compose network, service DNS names should replace host-only URLs. For example:
+In the Compose network, internal service DNS names replace host-only URLs. For example:
 
 ```text
-LOCALAGENT_MODEL_BASE_URL=http://model:8080/v1
 LOCALAGENT_MCP_URL=http://mcp-server:8000/sse
 ```
 
 Use `host.docker.internal` only when code running inside a container must reach a service
-running directly on the host. It should not be the default for host development.
+running directly on the host, such as a llama.cpp server published on the host machine.
 
 ---
 
 ## Chat history
 
-Each session is saved to `./chat_history/chats/<session-title>.json` after every turn, where
-`session-title` is a kebab-case slug derived from the first user turn
-(e.g. `compare-llm-pricing.json`). Change the base path at `CHAT_HISTORY_DIR` in `run_agents.py`.
+The terminal runner saves each session to `./chat_history/chats/<session-title>.json` after
+every turn, where `session-title` is a kebab-case slug derived from the first user turn
+(e.g. `compare-llm-pricing.json`). Change the base path at `CHAT_HISTORY_DIR` in
+`run_agents.py`.
 
 The file stores the full `List[ModelMessage]` serialised via pydantic-ai's `TypeAdapter`,
 so it is round-trippable back into a live session. It also stores the report directory used
@@ -770,6 +803,15 @@ Agent reports are saved next to chat history under:
 
 ```text
 chat_history/reports/<session-title>/
+```
+
+The web app stores users, messages, branches, uploaded-file metadata, and audit events in
+SQLite under `LOCALAGENT_STATE_DIR` by default. It also writes branch-specific model-history
+snapshots and reports under:
+
+```text
+localagent_state/history/<user-id>/<session-id>-<branch-id>.json
+localagent_state/reports/<user-id>/<session-id>/<branch-id>/
 ```
 
 Current report filenames are `fs-report.md`, `web-report.md`, and `plan-report.md`.

@@ -47,9 +47,15 @@ const state = {
   theme: storageGet("localagent_theme", "dark"),
   sidebarCollapsed: storageGet("localagent_sidebar_collapsed") === "1",
   runningPollTimer: null,
-  activeGenerationPollTimer: null,
   settingsChatUserId: null,
   busy: false,
+  voiceRecorder: null,
+  voiceStream: null,
+  voiceRecording: false,
+  voiceSupported: typeof navigator !== "undefined"
+    && Boolean(navigator.mediaDevices?.getUserMedia)
+    && typeof window !== "undefined"
+    && Boolean(window.AudioContext || window.webkitAudioContext),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -690,35 +696,55 @@ async function forkFromUserMessage(messageId, content) {
 }
 
 function renderActivity(row, metadata) {
-  const old = row.querySelector(".activity");
-  const wasOpen = old?.open ?? metadata.status === "running";
-  if (old) old.remove();
   const logs = metadata.turn_logs || [];
   const traceEvents = metadata.trace_events || [];
   const visibleLogs = logs.filter((log) => log.objective || log.summary || log.error);
   const visibleTrace = traceEvents.filter((event) => {
     return ["model_request", "model_tools", "tool_call", "tool_result", "tool_call_start"].includes(event.kind);
   });
-  if (!visibleLogs.length && !visibleTrace.length) return;
 
-  const details = document.createElement("details");
-  details.className = "activity";
-  details.open = wasOpen;
-  const summary = document.createElement("summary");
-  const done = visibleLogs.filter((log) => log.status === "done").length;
-  const toolCalls = visibleTrace.filter((event) => event.kind === "tool_call").length;
-  summary.textContent = `Activity: ${toolCalls} tool call${toolCalls === 1 ? "" : "s"}${visibleLogs.length ? `, ${done}/${visibleLogs.length} tasks` : ""}`;
-  details.appendChild(summary);
-
-  if (visibleTrace.length) {
-    const trace = document.createElement("div");
-    trace.className = "tool-trace";
-    for (const event of visibleTrace) {
-      trace.appendChild(createTraceEventElement(event));
-    }
-    details.appendChild(trace);
+  if (!row.__activityTraceEvents) row.__activityTraceEvents = new Map();
+  const traceMap = row.__activityTraceEvents;
+  for (const event of visibleTrace) {
+    traceMap.set(traceEventKey(event), event);
   }
 
+  const existing = row.querySelector(".activity");
+  if (!visibleLogs.length && !traceMap.size) {
+    if (existing) existing.remove();
+    return;
+  }
+
+  let details = existing;
+  if (!details) {
+    details = document.createElement("details");
+    details.className = "activity";
+    details.open = metadata.status === "running";
+    const summary = document.createElement("summary");
+    const trace = document.createElement("div");
+    trace.className = "tool-trace";
+    const logList = document.createElement("div");
+    logList.className = "activity-logs";
+    details.append(summary, trace, logList);
+    row.appendChild(details);
+  }
+
+  const summary = details.querySelector("summary");
+  const done = visibleLogs.filter((log) => log.status === "done").length;
+  const toolCalls = [...traceMap.values()].filter((event) => event.kind === "tool_call").length;
+  summary.textContent = `Activity: ${toolCalls} tool call${toolCalls === 1 ? "" : "s"}${visibleLogs.length ? `, ${done}/${visibleLogs.length} tasks` : ""}`;
+
+  const trace = details.querySelector(".tool-trace");
+  trace.hidden = traceMap.size === 0;
+  for (const [key, event] of traceMap.entries()) {
+    if (!trace.querySelector(`[data-trace-key="${cssEscape(key)}"]`)) {
+      trace.appendChild(createTraceEventElement(event, key));
+    }
+  }
+
+  const logList = details.querySelector(".activity-logs");
+  logList.textContent = "";
+  logList.hidden = visibleLogs.length === 0;
   for (const log of visibleLogs) {
     const item = document.createElement("div");
     item.className = `activity-item ${log.status === "done" ? "done" : "failed"}`;
@@ -727,14 +753,31 @@ function renderActivity(row, metadata) {
     const body = document.createElement("p");
     body.textContent = log.error || log.summary || "";
     item.append(title, body);
-    details.appendChild(item);
+    logList.appendChild(item);
   }
-  row.appendChild(details);
 }
 
-function createTraceEventElement(event) {
+function traceEventKey(event) {
+  return [
+    event.ts || "",
+    event.kind || "",
+    event.label || "",
+    event.tool_call_id || "",
+    event.tool_name || "",
+    event.args || "",
+    event.output || "",
+  ].join("|");
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return window.CSS.escape(value);
+  return String(value).replace(/["\\]/g, "\\$&");
+}
+
+function createTraceEventElement(event, key = "") {
   const item = document.createElement("div");
   item.className = `trace-event ${event.kind}`;
+  if (key) item.dataset.traceKey = key;
 
   const label = document.createElement("span");
   label.className = "trace-label";
@@ -759,6 +802,16 @@ function createTraceEventElement(event) {
   return item;
 }
 
+function mergeTraceEvents(...lists) {
+  const merged = new Map();
+  for (const list of lists) {
+    for (const event of list || []) {
+      merged.set(traceEventKey(event), event);
+    }
+  }
+  return [...merged.values()];
+}
+
 function renderMessages(messages) {
   state.messages = messages;
   const el = $("messages");
@@ -778,6 +831,24 @@ function renderMessages(messages) {
   updateRunningPoll(messages);
 }
 
+function updateMessagesInPlace(messages) {
+  const el = $("messages");
+  const rows = [...el.querySelectorAll(".message[data-message-id]")];
+  const rowsById = new Map(rows.map((row) => [row.dataset.messageId, row]));
+  const canPatch = messages.length === rows.length
+    && messages.every((message) => message.id && rowsById.has(String(message.id)));
+  if (!canPatch) {
+    renderMessages(messages);
+    return;
+  }
+
+  state.messages = messages;
+  for (const message of messages) {
+    updateMessageElement(rowsById.get(String(message.id)), message);
+  }
+  updateRunningPoll(messages);
+}
+
 function updateRunningPoll(messages = []) {
   const hasRunning = messages.some((message) => message.role === "assistant" && message.metadata?.status === "running");
   if (!hasRunning) {
@@ -792,7 +863,7 @@ function updateRunningPoll(messages = []) {
     if (!state.activeSessionId) return;
     try {
       const data = await api(`/api/chat/sessions/${encodeURIComponent(state.activeSessionId)}`);
-      renderMessages(data.messages);
+      updateMessagesInPlace(data.messages);
       const stillRunning = data.messages.some((message) => message.role === "assistant" && message.metadata?.status === "running");
       if (!stillRunning && state.runningPollTimer) {
         clearInterval(state.runningPollTimer);
@@ -829,44 +900,6 @@ function updateMessageElement(row, message) {
   renderActivity(row, message.metadata || {});
 }
 
-function latestAssistantMessage(messages, afterId = 0) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === "assistant" && Number(messages[index].id || 0) > afterId) return messages[index];
-  }
-  return null;
-}
-
-function stopActiveGenerationPoll() {
-  if (state.activeGenerationPollTimer) {
-    clearInterval(state.activeGenerationPollTimer);
-    state.activeGenerationPollTimer = null;
-  }
-}
-
-function startActiveGenerationPoll(pendingRow, afterAssistantId = 0) {
-  stopActiveGenerationPoll();
-  state.activeGenerationPollTimer = setInterval(async () => {
-    if (!state.activeSessionId || !document.body.contains(pendingRow)) {
-      stopActiveGenerationPoll();
-      return;
-    }
-    try {
-      const data = await api(`/api/chat/sessions/${encodeURIComponent(state.activeSessionId)}`);
-      const latest = latestAssistantMessage(data.messages, afterAssistantId);
-      if (!latest) return;
-      updateMessageElement(pendingRow, latest);
-      $("messages").scrollTop = $("messages").scrollHeight;
-      if (latest.metadata?.status !== "running") {
-        stopActiveGenerationPoll();
-        await refreshSessions();
-        await refreshFiles();
-      }
-    } catch (_) {
-      stopActiveGenerationPoll();
-    }
-  }, 1000);
-}
-
 async function refreshSessions() {
   const data = await api("/api/chat/sessions");
   state.sessions = data.sessions;
@@ -898,6 +931,7 @@ function setBusy(value) {
   const sendButton = $("send-message");
   if (sendButton) sendButton.disabled = value;
   $("message-input").disabled = value;
+  $("voice-input").disabled = (value && !state.voiceRecording) || !state.voiceSupported;
 }
 
 function closeUploadMenu() {
@@ -916,12 +950,6 @@ async function sendMessage(content) {
   if (!state.activeSessionId) {
     await createSession();
   }
-  const previousAssistantId = Math.max(
-    0,
-    ...state.messages
-      .filter((message) => message.role === "assistant")
-      .map((message) => Number(message.id || 0))
-  );
   const attachments = getCurrentUploadAttachments();
   appendLocalMessage("user", content, attachments);
   state.pendingAttachments = [];
@@ -933,7 +961,6 @@ async function sendMessage(content) {
   pendingBubble.textContent = "Working...";
   const pendingMetadata = { trace_events: [] };
   let streamedContent = "";
-  startActiveGenerationPoll(pending, previousAssistantId);
   setBusy(true);
   try {
     const data = await streamApi(
@@ -959,12 +986,18 @@ async function sendMessage(content) {
       }
     );
     if (data?.message) {
+      data.message.metadata = {
+        ...(data.message.metadata || {}),
+        trace_events: mergeTraceEvents(
+          pendingMetadata.trace_events,
+          data.message.metadata?.trace_events || []
+        ),
+      };
       const replacement = createMessageElement(data.message);
       pending.replaceWith(replacement);
     } else {
       await loadSession(state.activeSessionId);
     }
-    stopActiveGenerationPoll();
     await refreshSessions();
     await refreshFiles();
   } catch (error) {
@@ -972,7 +1005,6 @@ async function sendMessage(content) {
       const bubble = pending.querySelector(".bubble");
       bubble.textContent = error.message;
     });
-    startActiveGenerationPoll(pending, previousAssistantId);
   } finally {
     setBusy(false);
   }
@@ -1073,6 +1105,195 @@ async function uploadSelectedFile(file) {
     status.textContent = error.message;
   } finally {
     $("file-input").value = "";
+  }
+}
+
+async function uploadSelectedFiles(files) {
+  for (const file of files) {
+    await uploadSelectedFile(file);
+  }
+}
+
+function filesFromTransfer(fileList) {
+  return [...(fileList || [])].filter((file) => file && file.size > 0);
+}
+
+function setVoiceRecording(value) {
+  state.voiceRecording = value;
+  const button = $("voice-input");
+  button.classList.toggle("is-recording", value);
+  button.setAttribute("aria-label", value ? "Stop voice input" : "Start voice input");
+  button.title = value ? "Stop voice input" : "Start voice input";
+  button.disabled = !state.voiceSupported || (state.busy && !value);
+}
+
+function stopVoiceStream() {
+  if (!state.voiceStream) return;
+  state.voiceStream.getTracks().forEach((track) => track.stop());
+  state.voiceStream = null;
+}
+
+function audioContextConstructor() {
+  return window.AudioContext || window.webkitAudioContext;
+}
+
+function createWavVoiceRecorder(stream) {
+  const AudioContextClass = audioContextConstructor();
+  if (!AudioContextClass) {
+    throw new Error("Voice input is not available in this browser.");
+  }
+
+  const audioContext = new AudioContextClass();
+  const source = audioContext.createMediaStreamSource(stream);
+  const processor = audioContext.createScriptProcessor(4096, 1, 1);
+  const silentGain = audioContext.createGain();
+  const chunks = [];
+  silentGain.gain.value = 0;
+
+  processor.onaudioprocess = (event) => {
+    chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+  };
+  source.connect(processor);
+  processor.connect(silentGain);
+  silentGain.connect(audioContext.destination);
+  audioContext.resume?.().catch(() => {});
+
+  return {
+    async stop() {
+      const sampleRate = audioContext.sampleRate;
+      processor.onaudioprocess = null;
+      source.disconnect();
+      processor.disconnect();
+      silentGain.disconnect();
+      await audioContext.close().catch(() => {});
+      return encodeWavBlob(chunks, sampleRate);
+    },
+  };
+}
+
+function mergeAudioChunks(chunks) {
+  const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const merged = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+function writeAscii(view, offset, value) {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index));
+  }
+}
+
+function encodeWavBlob(chunks, sampleRate) {
+  const samples = mergeAudioChunks(chunks);
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (const sample of samples) {
+    const clamped = Math.max(-1, Math.min(1, sample));
+    view.setInt16(offset, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+    offset += 2;
+  }
+
+  return new Blob([view], { type: "audio/wav" });
+}
+
+function resizeMessageInput() {
+  const input = $("message-input");
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+}
+
+function insertVoiceTranscript(text) {
+  const transcript = String(text || "").trim();
+  if (!transcript) return;
+  const input = $("message-input");
+  const existing = input.value;
+  const joiner = existing.trim() && !/\s$/.test(existing) ? " " : "";
+  input.value = `${existing}${joiner}${transcript}`;
+  resizeMessageInput();
+  input.focus();
+}
+
+async function transcribeVoiceBlob(blob) {
+  const status = $("upload-status");
+  if (!blob.size) {
+    status.textContent = "No audio recorded.";
+    return;
+  }
+  status.textContent = "Transcribing voice...";
+  const formData = new FormData();
+  formData.append("file", blob, "voice-input.wav");
+  try {
+    const data = await api("/api/speech/asr", {
+      method: "POST",
+      body: formData,
+    });
+    insertVoiceTranscript(data.text);
+    status.textContent = data.text ? "" : "No speech detected.";
+  } catch (error) {
+    status.textContent = error.message;
+  }
+}
+
+async function startVoiceInput() {
+  if (!state.voiceSupported) {
+    $("upload-status").textContent = "Voice input is not available in this browser.";
+    return;
+  }
+  if (state.busy || state.voiceRecording) return;
+  closeUploadMenu();
+  $("upload-status").textContent = "Recording...";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const recorder = createWavVoiceRecorder(stream);
+    state.voiceStream = stream;
+    state.voiceRecorder = recorder;
+    setVoiceRecording(true);
+  } catch (error) {
+    stopVoiceStream();
+    state.voiceRecorder = null;
+    setVoiceRecording(false);
+    $("upload-status").textContent = error?.message || "Could not start voice input.";
+  }
+}
+
+async function stopVoiceInput() {
+  const recorder = state.voiceRecorder;
+  if (!recorder) {
+    setVoiceRecording(false);
+    stopVoiceStream();
+    return;
+  }
+  $("upload-status").textContent = "Transcribing voice...";
+  state.voiceRecorder = null;
+  try {
+    const blob = await recorder.stop();
+    await transcribeVoiceBlob(blob);
+  } catch (error) {
+    $("upload-status").textContent = error?.message || "Could not transcribe voice input.";
+  } finally {
+    stopVoiceStream();
+    setVoiceRecording(false);
   }
 }
 
@@ -1261,6 +1482,7 @@ function applyTheme(theme) {
   const toggle = $("theme-toggle");
   if (toggle) {
     toggle.setAttribute("aria-label", state.theme === "light" ? "Switch to dark theme" : "Switch to light theme");
+    toggle.title = "Switch dark / light theme";
   }
 }
 
@@ -1273,6 +1495,7 @@ function applySidebarCollapsed(collapsed) {
   const button = $("sidebar-collapse");
   if (button) {
     button.setAttribute("aria-label", "Collapse sidebar");
+    button.title = "Collapse sidebar";
   }
   const logoButton = $("sidebar-logo-trigger");
   if (logoButton) {
@@ -1557,7 +1780,7 @@ $("composer").addEventListener("submit", async (event) => {
   const content = input.value.trim();
   if (!content || state.busy) return;
   input.value = "";
-  input.style.height = "auto";
+  resizeMessageInput();
   await sendMessage(content);
 });
 
@@ -1569,13 +1792,30 @@ $("message-input").addEventListener("keydown", (event) => {
 });
 
 $("message-input").addEventListener("input", () => {
-  const input = $("message-input");
-  input.style.height = "auto";
-  input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+  resizeMessageInput();
 });
 
 $("file-input").addEventListener("change", (event) => {
-  uploadSelectedFile(event.target.files[0]);
+  uploadSelectedFiles(filesFromTransfer(event.target.files));
+});
+
+$("message-input").addEventListener("paste", (event) => {
+  const files = filesFromTransfer(event.clipboardData?.files);
+  if (!files.length) return;
+  event.preventDefault();
+  uploadSelectedFiles(files);
+});
+
+$("composer").addEventListener("dragover", (event) => {
+  if (!event.dataTransfer?.types?.includes("Files")) return;
+  event.preventDefault();
+});
+
+$("composer").addEventListener("drop", (event) => {
+  const files = filesFromTransfer(event.dataTransfer?.files);
+  if (!files.length) return;
+  event.preventDefault();
+  uploadSelectedFiles(files);
 });
 
 $("upload-menu-trigger").addEventListener("click", (event) => {
@@ -1586,6 +1826,14 @@ $("upload-menu-trigger").addEventListener("click", (event) => {
 $("add-local-file").addEventListener("click", () => {
   closeUploadMenu();
   $("file-input").click();
+});
+
+$("voice-input").addEventListener("click", () => {
+  if (state.voiceRecording) {
+    stopVoiceInput();
+    return;
+  }
+  startVoiceInput();
 });
 
 $("file-preview-close").addEventListener("click", closeAttachmentPreview);
@@ -1624,4 +1872,5 @@ document.addEventListener("keydown", (event) => {
 });
 
 setupSidebarState();
+setVoiceRecording(false);
 boot();

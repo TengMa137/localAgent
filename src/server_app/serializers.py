@@ -91,17 +91,23 @@ def compact_turn_logs(turn_logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def compact_trace_events(trace_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     compact: list[dict[str, Any]] = []
-    for item in trace_events[:80]:
+    ignored_kinds = {"text_delta", "thinking_delta", "tool_args_delta"}
+    for item in trace_events:
+        if item.get("kind") in ignored_kinds:
+            continue
         compact.append(
             {
                 "ts": item.get("ts"),
                 "kind": item.get("kind") or "status",
                 "label": item.get("label") or "agent",
                 "tool_name": item.get("tool_name") or "",
+                "tool_call_id": item.get("tool_call_id") or "",
                 "args": item.get("args") or item.get("args_delta") or "",
                 "output": item.get("output") or item.get("message") or item.get("content") or "",
             }
         )
+        if len(compact) >= 80:
+            break
     return compact
 
 

@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -157,6 +158,184 @@ def test_blank_normalized_fields_are_rejected(monkeypatch, tmp_path):
             headers={"X-CSRF-Token": csrf},
             json={"content": "   "},
         ).status_code == 422
+
+
+def test_user_can_transcribe_voice_input(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeASRProvider:
+        async def transcribe_bytes(self, audio_bytes, *, filename, mime_type, language=None):
+            captured["audio_bytes"] = audio_bytes
+            captured["filename"] = filename
+            captured["mime_type"] = mime_type
+            captured["language"] = language
+            return SimpleNamespace(text="hello from voice", language="en", provider="fake-asr")
+
+    monkeypatch.setattr(server, "Qwen3ASRProvider", FakeASRProvider)
+
+    with TestClient(server.app) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "admin-password"},
+        ).status_code == 200
+        response = client.post(
+            "/api/speech/asr",
+            headers={"X-CSRF-Token": _csrf(client)},
+            files={"file": ("recording.webm", b"webm bytes", "audio/webm")},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "text": "hello from voice",
+        "language": "en",
+        "provider": "fake-asr",
+    }
+    assert captured == {
+        "audio_bytes": b"webm bytes",
+        "filename": "recording.webm",
+        "mime_type": "audio/webm",
+        "language": "English",
+    }
+
+
+def test_voice_input_uses_provider_language_when_client_omits_field(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeASRProvider:
+        config = SimpleNamespace(language="Swedish")
+
+        async def transcribe_bytes(self, audio_bytes, *, filename, mime_type, language=None):
+            captured["language"] = language
+            return SimpleNamespace(text="hej", language="sv", provider="fake-asr")
+
+    monkeypatch.setattr(server, "Qwen3ASRProvider", FakeASRProvider)
+
+    with TestClient(server.app) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "admin-password"},
+        ).status_code == 200
+        response = client.post(
+            "/api/speech/asr",
+            headers={"X-CSRF-Token": _csrf(client)},
+            files={"file": ("recording.webm", b"webm bytes", "audio/webm")},
+        )
+
+    assert response.status_code == 200
+    assert captured["language"] == "Swedish"
+
+
+def test_image_upload_context_tells_agent_to_use_read_image(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeResponse:
+        reply = "ok"
+
+    async def fake_run_turn(user_text, session, debug=False, trace_sink=None):
+        captured["prompt"] = user_text
+        return (
+            FakeResponse(),
+            [
+                *session.message_history,
+                server.ModelRequest.user_text_prompt(user_text),
+                server.ModelResponse(parts=[server.TextPart(content="ok")]),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+
+    with TestClient(server.app) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "admin-password"},
+        ).status_code == 200
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "image context"},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+        upload = client.post(
+            f"/api/chat/sessions/{chat_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files={"file": ("screenshot.png", b"\x89PNG\r\n\x1a\nfake", "image/png")},
+        )
+        assert upload.status_code == 200
+
+        response = client.post(
+            f"/api/chat/sessions/{chat_id}/messages",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "describe the screenshot"},
+        )
+        assert response.status_code == 200
+
+    assert "screenshot.png [image, image/png" in captured["prompt"]
+    assert "(image; use read_image to inspect visual content)" in captured["prompt"]
+    assert "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_image." in captured["prompt"]
+    assert "call read_image for supported image paths" in captured["prompt"]
+
+
+def test_unsupported_image_upload_context_is_not_routed_to_read_image(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeResponse:
+        reply = "ok"
+
+    async def fake_run_turn(user_text, session, debug=False, trace_sink=None):
+        captured["prompt"] = user_text
+        return (
+            FakeResponse(),
+            [
+                *session.message_history,
+                server.ModelRequest.user_text_prompt(user_text),
+                server.ModelResponse(parts=[server.TextPart(content="ok")]),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+
+    with TestClient(server.app) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "admin-password"},
+        ).status_code == 200
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "unsupported image context"},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+        upload = client.post(
+            f"/api/chat/sessions/{chat_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files={"file": ("photo.heic", b"heic bytes", "image/heic")},
+        )
+        assert upload.status_code == 200
+
+        response = client.post(
+            f"/api/chat/sessions/{chat_id}/messages",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "describe the uploaded photo"},
+        )
+        assert response.status_code == 200
+
+    assert "photo.heic [binary, image/heic" in captured["prompt"]
+    assert "(unsupported image for read_image; stored binary)" in captured["prompt"]
+    assert "photo.heic [image, image/heic" not in captured["prompt"]
 
 
 def test_register_is_blocked_until_backend_admin_is_initialized(monkeypatch, tmp_path):

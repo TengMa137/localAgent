@@ -9,7 +9,6 @@
     <link rel="stylesheet" href="assets/styles.css?v=admin-role-filter-removed-20260518">
   </head>
   <body>
-
     <!-- LOGIN -->
     <main id="login-view" class="login-shell" hidden="">
       <div class="login-backdrop"></div>
@@ -57,7 +56,7 @@
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
               <path d="M7 1v12M1 7h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path>
             </svg>
-            New chat
+            <span>New chat</span>
           </button>
         </div>
 
@@ -81,13 +80,13 @@
                 <path d="M1 12c0-2.2 1.8-4 4-4s4 1.8 4 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"></path>
                 <path d="M10 6.5l1 1 2.5-2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"></path>
               </svg>
-              Settings
+              <span>Settings</span>
             </button>
             <button id="logout" class="btn-icon" title="Sign out">
               <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
                 <path d="M5 2H2a1 1 0 00-1 1v8a1 1 0 001 1h3M9 10l3-3-3-3M13 7H5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"></path>
               </svg>
-              Logout
+              <span>Logout</span>
             </button>
           </div>
         </div>
@@ -112,9 +111,17 @@
                   Add file/image from local
                 </button>
               </div>
-              <input id="file-input" type="file" hidden="">
+              <input id="file-input" type="file" hidden="" multiple="">
             </div>
-            <textarea id="message-input" rows="1" placeholder="Message Local Agent…" required=""></textarea>
+            <textarea id="message-input" rows="1" placeholder="Message Local Agent..." required=""></textarea>
+            <button id="voice-input" class="btn-composer-icon btn-composer-mic" type="button" aria-label="Start voice input" title="Start voice input">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"></path>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                <path d="M12 19v3"></path>
+                <path d="M8 22h8"></path>
+              </svg>
+            </button>
           </div>
         </form>
       </section>
@@ -127,7 +134,7 @@
               <h2>Settings</h2>
               <p id="settings-owner"></p>
             </div>
-            <button id="close-admin" class="btn-ghost-sm">✕ Close</button>
+            <button id="close-admin" class="btn-ghost-sm">✕ <span>Close</span></button>
           </header>
 
           <section id="profile-password-section" class="settings-section">

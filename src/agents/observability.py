@@ -3,12 +3,15 @@ Real-time observability for pydantic_ai agents.
 Drop-in replacement for agent.run() that streams events to stderr.
 """
 
+import json
 import os
 import sys
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, TypeVar
+
+from localagent_env import load_dotenv
 from pydantic_ai import Agent, PartDeltaEvent, PartStartEvent
 from pydantic_ai._agent_graph import End, UserPromptNode
 from pydantic_ai.messages import (
@@ -25,6 +28,8 @@ from pydantic_ai.messages import (
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
 
 from pydantic import BaseModel, Field
+
+load_dotenv()
 
 T = TypeVar("T")
 ApprovalAction = Literal["approve", "deny", "suggest", "abort"]
@@ -326,7 +331,7 @@ async def _stream_call_tools_node(node: Any, agent_run: Any, *, label: str, inde
                     tool_call_id = getattr(event.result, "tool_call_id", "") or ""
                     tool_name = tool_names_by_id.get(tool_call_id, "unknown")
                     result_content = event.content if event.content is not None else getattr(event.result, "content", "")
-                    result_preview = str(result_content)[:1200].replace("\n", " ")
+                    result_preview = _preview_tool_result(result_content)
                     _rt(
                         f"[{label}] ← tool_return {_c(tool_name, 'yellow')}  {result_preview[:160]}",
                         "dim",
@@ -343,6 +348,53 @@ async def _stream_call_tools_node(node: Any, agent_run: Any, *, label: str, inde
                     )
     except Exception as exc:
         _rt(f"[{label}] tool stream unavailable: {exc}", "yellow", indent + 1)
+        raise
+
+
+def _preview_tool_result(value: Any) -> str:
+    try:
+        sanitized = _sanitize_tool_result(value)
+        raw = sanitized if isinstance(sanitized, str) else json.dumps(sanitized, ensure_ascii=False, default=str)
+        return raw[:1200].replace("\n", " ")
+    except Exception:
+        return ""
+
+
+def _sanitize_tool_result(value: Any, *, depth: int = 0) -> Any:
+    if depth > 4:
+        return f"<{type(value).__name__}>"
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<bytes {len(value)} bytes>"
+    if _is_binary_image(value):
+        data = getattr(value, "data", b"") or b""
+        media_type = getattr(value, "media_type", "") or "image"
+        identifier = getattr(value, "identifier", "") or ""
+        suffix = f" {identifier}" if identifier else ""
+        return f"<{media_type} {len(data)} bytes{suffix}>"
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_tool_result(item, depth=depth + 1)
+            for key, item in list(value.items())[:50]
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_tool_result(item, depth=depth + 1) for item in list(value)[:50]]
+    if all(hasattr(value, attr) for attr in ("return_value", "content", "metadata")):
+        return {
+            "return_value": _sanitize_tool_result(getattr(value, "return_value"), depth=depth + 1),
+            "content": _sanitize_tool_result(getattr(value, "content"), depth=depth + 1),
+            "metadata": _sanitize_tool_result(getattr(value, "metadata"), depth=depth + 1),
+        }
+    return str(value)
+
+
+def _is_binary_image(value: Any) -> bool:
+    return (
+        type(value).__name__ == "BinaryImage"
+        and hasattr(value, "data")
+        and hasattr(value, "media_type")
+    )
 
 
 def _preview_args(part: ToolCallPart) -> str:

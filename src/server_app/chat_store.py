@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart
 
 from run_agents import _MSG_ADAPTER
+from server_app.file_loaders import normalize_upload_content_type, upload_context_kind
 from server_app.serializers import message_metadata, public_branch_variant
 from server_app.utils import json_dumps, json_loads_dict, sqlite_lastrowid
 
@@ -234,14 +235,14 @@ def insert_assistant_placeholder(
 def session_upload_context(conn: sqlite3.Connection, session_id: str, user_id: int) -> list[str]:
     rows = conn.execute(
         """
-        SELECT filename, virtual_path
+        SELECT filename, virtual_path, size_bytes, content_type
         FROM chat_files
         WHERE session_id = ? AND user_id = ?
         ORDER BY id
         """,
         (session_id, user_id),
     ).fetchall()
-    return [f"{row['filename']}: {row['virtual_path']}" for row in rows]
+    return [_format_upload_context(row) for row in rows]
 
 
 def prompt_with_session_context(user_text: str, uploads: list[str]) -> str:
@@ -250,10 +251,36 @@ def prompt_with_session_context(user_text: str, uploads: list[str]) -> str:
     upload_lines = "\n".join(f"- {item}" for item in uploads)
     return (
         f"{user_text}\n\n"
-        "Session uploads available to filesystem and RAG tools under /docs:\n"
+        "Session uploads available under /docs:\n"
         f"{upload_lines}\n"
-        "Use these paths when the request refers to uploaded files or local context."
+        "Text/code uploads can be read with filesystem and RAG tools. "
+        "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_image. "
+        "Other binary uploads are stored files only. "
+        "Do not call read_file, read_lines, or grep_files on image or binary paths; "
+        "call read_image for supported image paths, or use stat_path/list_directory for metadata."
     )
+
+
+def _format_upload_context(row: sqlite3.Row) -> str:
+    filename = row["filename"]
+    content_type = _normalized_upload_content_type(filename, row["content_type"])
+    kind = _upload_context_kind(filename, content_type)
+    details = f"{filename} [{kind}, {content_type}, {row['size_bytes']} bytes]: {row['virtual_path']}"
+    if kind == "text":
+        return details
+    if kind == "image":
+        return f"{details} (image; use read_image to inspect visual content)"
+    if content_type.startswith("image/"):
+        return f"{details} (unsupported image for read_image; stored binary)"
+    return f"{details} (stored binary; do not read with read_file/read_lines/grep_files)"
+
+
+def _normalized_upload_content_type(filename: str, content_type: str | None) -> str:
+    return normalize_upload_content_type(filename, content_type)
+
+
+def _upload_context_kind(filename: str, content_type: str) -> str:
+    return upload_context_kind(filename, content_type)
 
 
 def _ensure_main_branch(conn: sqlite3.Connection, session: sqlite3.Row) -> sqlite3.Row:

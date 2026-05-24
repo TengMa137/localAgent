@@ -10,5 +10,6 @@ mkdocs.yml
 Makefile
 chat_history/
 localagent_state/
+user_docs/web_uploads/
 *.egg-info/
 *.od*

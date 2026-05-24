@@ -3,7 +3,7 @@ Filesystem toolset for PydanticAI agents with LLM-friendly errors.
 
 This package provides a guarded filesystem for PydanticAI agents with:
 - FilesystemValidator: Security boundary for permission checking and path resolution
-- FileSystemToolset: File I/O tools (read, write, edit, list, grep)
+- FileSystemToolset: File I/O tools (text reads, image reads, write, edit, list, grep)
 - make_filesystem_toolset: Modern FunctionToolset-based implementation
 - LLM-friendly error messages that guide correction
 

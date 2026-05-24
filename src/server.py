@@ -13,14 +13,20 @@ from typing import Any, Iterator
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from pydantic_ai.messages import ModelRequest as ModelRequest, ModelResponse as ModelResponse, TextPart as TextPart
 
+from localagent_env import load_dotenv
+
+load_dotenv()
+
 from run_agents import ChatSession, run_turn
+from speech.qwen3 import Qwen3ASRProvider
+from server_app.file_loaders import normalize_upload_content_type
 from server_app.chat_store import (
     active_branch,
     agent_lock_key,
@@ -80,6 +86,7 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 7 * 24 * 3600
     admin_username: str = ""
     admin_password: str = ""
+    max_voice_audio_bytes: int = 10 * 1024 * 1024
 
     model_config = SettingsConfigDict(
         env_prefix="LOCALAGENT_",
@@ -102,6 +109,7 @@ SESSION_TTL_SECONDS = settings.session_ttl_seconds
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_ATTEMPTS = 8
 TEXT_PREVIEW_LIMIT = 1_000_000
+DEFAULT_VOICE_MIME_TYPE = "audio/webm"
 
 ph = PasswordHasher()
 _login_attempts: dict[str, list[float]] = {}
@@ -123,6 +131,18 @@ def _upload_virtual_path(user_id: int, session_id: str, stored_name: str) -> str
 
 def _upload_host_path(user_id: int, session_id: str, stored_name: str) -> Path:
     return WEB_UPLOAD_ROOT / str(user_id) / session_id / stored_name
+
+
+def _normalized_mime_type(content_type: str | None, fallback: str) -> str:
+    mime_type = (content_type or fallback).split(";", 1)[0].strip().lower()
+    return mime_type or fallback
+
+
+def _audio_upload_filename(filename: str | None, mime_type: str) -> str:
+    name = clean_filename(filename or "recording")
+    if Path(name).suffix:
+        return name
+    return f"{name}{mimetypes.guess_extension(mime_type) or '.webm'}"
 
 
 def _client_key(request: Request, username: str) -> str:
@@ -518,6 +538,43 @@ def me(user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
     return {"user": public_user(user)}
 
 
+@app.post("/api/speech/asr")
+async def transcribe_speech(
+    file: UploadFile = File(...),  # noqa: B008
+    language: str | None = Form(default=None),  # noqa: B008
+    _user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    content = await file.read(settings.max_voice_audio_bytes + 1)
+    if len(content) > settings.max_voice_audio_bytes:
+        raise HTTPException(status_code=413, detail="Voice recording is too large.")
+    if not content:
+        raise HTTPException(status_code=400, detail="Voice recording is empty.")
+
+    mime_type = _normalized_mime_type(file.content_type, DEFAULT_VOICE_MIME_TYPE)
+    if not (mime_type.startswith("audio/") or mime_type == "application/octet-stream"):
+        raise HTTPException(status_code=415, detail="Voice recording must be an audio file.")
+
+    filename = _audio_upload_filename(file.filename, mime_type)
+    provider = Qwen3ASRProvider()
+    configured_language = getattr(getattr(provider, "config", None), "language", "")
+    request_language = (language or configured_language or "English").strip() or None
+    try:
+        result = await provider.transcribe_bytes(
+            content,
+            filename=filename,
+            mime_type=mime_type,
+            language=request_language,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Speech transcription failed: {exc}") from exc
+
+    return {
+        "text": result.text,
+        "language": result.language,
+        "provider": result.provider,
+    }
+
+
 @app.patch("/api/me/password")
 def change_my_password(
     body: ChangePasswordRequest,
@@ -727,6 +784,7 @@ async def upload_chat_file(
         raise HTTPException(status_code=413, detail="Upload is too large.")
 
     filename = clean_filename(file.filename)
+    content_type = normalize_upload_content_type(filename, file.content_type, content)
     stored_name = f"{int(time.time())}-{secrets.token_hex(4)}-{filename}"
     host_path = _upload_host_path(user["id"], session_id, stored_name)
     virtual_path = _upload_virtual_path(user["id"], session_id, stored_name)
@@ -751,7 +809,7 @@ async def upload_chat_file(
                 stored_name,
                 virtual_path,
                 len(content),
-                file.content_type,
+                content_type,
                 now,
             ),
         )

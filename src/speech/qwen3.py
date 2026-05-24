@@ -19,6 +19,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from localagent_env import load_dotenv
+
+load_dotenv()
+
 
 _ASR_TEXT_TAG = "<asr_text>"
 _LANG_PREFIX = "language "
@@ -163,6 +167,21 @@ class Qwen3ASRProvider:
     ) -> ASRResult:
         audio_base64 = _strip_data_url_prefix(audio_base64)
         audio_bytes = base64.b64decode(audio_base64)
+        return await self.transcribe_bytes(
+            audio_bytes,
+            filename=f"audio{mimetypes.guess_extension(mime_type) or '.wav'}",
+            mime_type=mime_type,
+            language=language,
+        )
+
+    async def transcribe_bytes(
+        self,
+        audio_bytes: bytes,
+        *,
+        filename: str = "audio.wav",
+        mime_type: str = "audio/wav",
+        language: str | None = None,
+    ) -> ASRResult:
         if not self.config.base_url.strip():
             suffix = mimetypes.guess_extension(mime_type) or ".wav"
             temp_path: Path | None = None
@@ -182,7 +201,7 @@ class Qwen3ASRProvider:
         return await asyncio.to_thread(
             self._transcribe_bytes_sync,
             audio_bytes,
-            "audio.wav",
+            filename,
             mime_type,
             language,
         )

@@ -42,7 +42,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
+from localagent_env import load_dotenv
 from .qwen3 import Qwen3TTSProvider
+
+load_dotenv()
 
 
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n{2,}")
