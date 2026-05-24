@@ -41,7 +41,9 @@ class PlanOutput(BaseModel):
 plan_agent = Agent(
     model=model,
     output_type=PlanOutput,
+    output_retries=2,
 )
+
 
 @plan_agent.system_prompt
 def _plan_prompt() -> str:
@@ -110,13 +112,13 @@ Bad task examples:
 
 
 class SessionState(BaseModel):
-    user_query:      str
+    user_query: str
     completed_tasks: list[str] = Field(default_factory=list)
-    findings:        list[str] = Field(default_factory=list)
-    uncertainties:   list[str] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)
+    uncertainties: list[str] = Field(default_factory=list)
     suggested_next_steps: list[str] = Field(default_factory=list)
-    sources:         list[str] = Field(default_factory=list)
-    confidence:      str       = "unknown"
+    sources: list[str] = Field(default_factory=list)
+    confidence: str = "unknown"
 
 
 def _dedupe(items: Iterable[str]) -> list[str]:
@@ -125,8 +127,8 @@ def _dedupe(items: Iterable[str]) -> list[str]:
 
 
 def _update_state(
-    state:   SessionState,
-    tasks:   list[TaskSpec],
+    state: SessionState,
+    tasks: list[TaskSpec],
     results: list[dict[str, Any]],
 ) -> None:
     for t, r in zip(tasks, results):
@@ -139,16 +141,16 @@ def _update_state(
         state.uncertainties.extend(r.get("uncertainties", []))
         state.suggested_next_steps.extend(r.get("suggested_next_steps", []))
         state.sources.extend(r.get("cited_node_ids", []))
-    state.findings      = _dedupe(state.findings)
+    state.findings = _dedupe(state.findings)
     state.uncertainties = _dedupe(state.uncertainties)
     state.suggested_next_steps = _dedupe(state.suggested_next_steps)
-    state.sources       = _dedupe(state.sources)
+    state.sources = _dedupe(state.sources)
 
 
 def _limit_tasks(
-    tasks:     list[TaskSpec],
+    tasks: list[TaskSpec],
     completed: list[str],
-    k:         int,
+    k: int,
 ) -> list[TaskSpec]:
     done = set(completed)
     return [t for t in tasks if t.objective not in done][:k]
@@ -236,7 +238,9 @@ def _readable_file_paths() -> list[str]:
     files: set[str] = set()
     for root_virtual in validator.readable_roots:
         try:
-            mount_point, resolved, _ = validator.get_path_config(root_virtual, op="read")
+            mount_point, resolved, _ = validator.get_path_config(
+                root_virtual, op="read"
+            )
             mount_root = validator.get_mount_root(mount_point)
         except Exception:
             continue
@@ -565,7 +569,10 @@ async def _run_research_loop(
             task.requires_current_info for task in batch
         )
 
-        _rt(f"[loop iter={iteration+1}] running {len(batch)} workers in parallel", "cyan")
+        _rt(
+            f"[loop iter={iteration + 1}] running {len(batch)} workers in parallel",
+            "cyan",
+        )
         results = await _run_workers_limited(batch)
         _update_state(state, batch, results)
 
@@ -581,7 +588,7 @@ async def _run_research_loop(
         reflect = await run_reflect_worker(
             objective=objective,
             state_summary=_state_summary(state),
-            label=f"reflect:iter{iteration+1}",
+            label=f"reflect:iter{iteration + 1}",
             indent=1,
         )
         state.confidence = reflect.confidence
@@ -595,7 +602,10 @@ async def _run_research_loop(
             _rt("[reflect] objective complete — moving to synthesis", "green")
             break
         if reflect.objective_complete and not state.findings:
-            _rt("[reflect] ignored complete=true because no findings were collected", "yellow")
+            _rt(
+                "[reflect] ignored complete=true because no findings were collected",
+                "yellow",
+            )
         if not confident:
             _rt(
                 f"[reflect] confidence {reflect.confidence} — looking for follow-up work",
@@ -648,8 +658,7 @@ def _failed_research_report(state: SessionState) -> str:
     """Explain that all retrieval or extraction work failed."""
     attempted = "\n".join(f"- {task}" for task in state.completed_tasks) or "- none"
     uncertainties = (
-        "\n".join(f"- {u}" for u in state.uncertainties)
-        or "- no evidence retrieved"
+        "\n".join(f"- {u}" for u in state.uncertainties) or "- no evidence retrieved"
     )
     return (
         "I couldn't produce a grounded summary because every retrieval/extraction task failed "
@@ -722,7 +731,9 @@ async def run_plan_workflow(objective: str) -> str:
             f"{report_memory}\n\n"
             f"Objective: {objective}"
         )
-    report = await _run_plan_workflow_internal(objective=workflow_objective, matched_files=[])
+    report = await _run_plan_workflow_internal(
+        objective=workflow_objective, matched_files=[]
+    )
     write_agent_report(
         "plan",
         objective=objective,

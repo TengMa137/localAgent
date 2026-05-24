@@ -62,7 +62,7 @@ from .web_agent import run_web_task as _run_web_task
 
 
 class OrchestratorResponse(BaseModel):
-    reply:         str
+    reply: str
     session_title: Optional[str] = None  # kebab-case slug, first turn only
 
 
@@ -125,6 +125,7 @@ async def _call_specialist(
 orchestrator = Agent(
     model=model,
     output_type=OrchestratorDecision,
+    output_retries=2,
 )
 
 
@@ -146,15 +147,23 @@ Your job is to choose exactly one route:
 You cannot call tools. For delegated routes, Python executes the selected
 specialist after your decision. Base the route on the user's meaning,
 conversation history, and injected reports; do not perform keyword matching.
+You are not required to delegate. direct is a normal first-class route and is
+preferred whenever the answer is already available from general reasoning,
+conversation history, or injected session reports.
+If the prompt includes deterministic routing preflight hints, treat strong
+fs/web/plan hints as trusted unless the user is clearly asking a conceptual
+question about the system rather than requesting retrieval.
 
 Intent classification:
 
   direct — answer immediately in reply.
-    Use ONLY for: greetings, opinions, math, coding help, writing tasks,
-    or follow-up questions fully answerable from conversation history and
-    injected session reports.
-    Rule: if the answer could have changed since your training cutoff,
-    or requires reading any file or URL, do NOT choose direct.
+    Use for: greetings, opinions, math, coding help, writing tasks,
+    architecture/design questions, log/tool-behavior explanations, prompt
+    tuning advice, and follow-up questions fully answerable from conversation
+    history or injected session reports.
+    Do not delegate just because fs/web tools exist, because extra verification
+    might be nice, or because the user mentions code, tools, logs, web, files,
+    or agents in a conceptual question.
 
   clarify — the request is genuinely ambiguous in a way that would produce
     a wrong route or objective. Ask exactly one focused question in reply.
@@ -162,15 +171,17 @@ Intent classification:
 
   fs — use when satisfying the request requires interacting with local
     validator files: finding, reading, reviewing, editing, writing, validating
-    paths, or reasoning over the user's repo/codebase/docs/skills. The user may
-    mean local files even without naming an exact path; judge from the full
-    request and conversation context.
+    paths, or reasoning over repo/codebase/docs/skills content that is not
+    already available from history or reports. The user may mean local files
+    even without naming an exact path; judge from the full request and
+    conversation context. Do not choose fs for general coding guidance or an
+    explanation that does not depend on fresh local file contents.
 
   web — use when answering correctly requires network/current/web access:
     current facts, recent changes, user-provided URLs, web search/crawl,
-    arXiv/DOI/paper lookup, or modern entities/events whose answer may have
-    changed. Be more conservative with web than fs: do not search the web merely
-    because outside information might be helpful.
+    arXiv/DOI/paper lookup, or mutable modern facts whose current value matters
+    to the answer. Be conservative with web: do not search merely because
+    outside information might be helpful or the topic exists on the internet.
 
   plan — use when the objective is complex enough to need decomposition:
     multiple independent subtasks, local+web synthesis, comparisons, reports,

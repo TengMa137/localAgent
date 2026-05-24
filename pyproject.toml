@@ -25,7 +25,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.uv.sources]
-rag-lib = { path = "../../rag_lib", editable = true }
+rag-lib = { path = "../rag_lib", editable = true }
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

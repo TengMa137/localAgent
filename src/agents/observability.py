@@ -38,6 +38,7 @@ _trace_events: ContextVar[list[dict[str, Any]] | None] = ContextVar(
     default=None,
 )
 _trace_sink: ContextVar[Any] = ContextVar("localagent_trace_sink", default=None)
+_SYNTHETIC_OUTPUT_TOOLS = {"final_result"}
 
 
 @dataclass(frozen=True)
@@ -45,30 +46,64 @@ class ApprovalDecision:
     action: ApprovalAction
     message: str = ""
 
+
 COLORS = {
-    "dim":    "\033[90m",
-    "cyan":   "\033[96m",
-    "green":  "\033[92m",
+    "dim": "\033[90m",
+    "cyan": "\033[96m",
+    "green": "\033[92m",
     "yellow": "\033[93m",
-    "red":    "\033[91m",
-    "blue":   "\033[94m",
-    "reset":  "\033[0m",
+    "red": "\033[91m",
+    "blue": "\033[94m",
+    "reset": "\033[0m",
 }
+
 
 def _c(text: str, color: str) -> str:
     return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
 
+
 def _rt(msg: str, color: str = "dim", indent: int = 0) -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     prefix = "  " * indent
-    print(f"{_c(f'[{ts}]', 'dim')} {prefix}{_c(msg, color)}", file=sys.stderr, flush=True)
+    print(
+        f"{_c(f'[{ts}]', 'dim')} {prefix}{_c(msg, color)}", file=sys.stderr, flush=True
+    )
+
+
+def _verbose_trace_logs() -> bool:
+    level = os.getenv("LOCALAGENT_LOG_LEVEL", "").strip().lower()
+    trace = os.getenv("LOCALAGENT_TRACE", "").strip().lower()
+    return level in {"debug", "trace", "verbose"} or trace in {
+        "1",
+        "true",
+        "yes",
+        "debug",
+        "trace",
+        "verbose",
+    }
+
+
+def _is_synthetic_output_tool(tool_name: str | None) -> bool:
+    return bool(tool_name) and tool_name in _SYNTHETIC_OUTPUT_TOOLS
+
+
+def _visible_tool_names(tool_names: list[str]) -> list[str]:
+    return [name for name in tool_names if not _is_synthetic_output_tool(name)]
+
+
+def _rt_detail(msg: str, color: str = "dim", indent: int = 0) -> None:
+    if _verbose_trace_logs():
+        _rt(msg, color, indent)
+
 
 def log_event(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(_c(f"[{ts}] ", "dim") + msg)
 
 
-def start_trace_collection(sink: Any = None) -> tuple[tuple[Any, Any], list[dict[str, Any]]]:
+def start_trace_collection(
+    sink: Any = None,
+) -> tuple[tuple[Any, Any], list[dict[str, Any]]]:
     events: list[dict[str, Any]] = []
     token = _trace_events.set(events)
     sink_token = _trace_sink.set(sink)
@@ -148,7 +183,9 @@ async def observable_run(
                 f"{label} stopped after {max_approval_rounds} approval round(s) "
                 "without reaching a final answer."
             )
-        deferred_tool_results = _collect_local_approvals(output, label=label, indent=indent)
+        deferred_tool_results = _collect_local_approvals(
+            output, label=label, indent=indent
+        )
         current_history = result.all_messages()
         current_prompt = None
 
@@ -163,8 +200,14 @@ def _handle_event(event: Any, label: str, indent: int) -> None:
 
     # A tool is being called
     if isinstance(event, ToolCallPart):
+        if _is_synthetic_output_tool(event.tool_name):
+            return
         args_preview = _preview_args(event)
-        _rt(f"[{label}] → tool_call  {_c(event.tool_name, 'yellow')}  {args_preview}", "dim", indent + 1)
+        _rt(
+            f"[{label}] → tool_call  {_c(event.tool_name, 'yellow')}  {args_preview}",
+            "dim",
+            indent + 1,
+        )
         _record_trace(
             {
                 "kind": "tool_call",
@@ -177,8 +220,14 @@ def _handle_event(event: Any, label: str, indent: int) -> None:
 
     # A tool returned a result
     if isinstance(event, ToolReturnPart):
+        if _is_synthetic_output_tool(event.tool_name):
+            return
         result_preview = str(event.content)[:120].replace("\n", " ")
-        _rt(f"[{label}] ← tool_return {_c(event.tool_name, 'yellow')}  {result_preview}", "dim", indent + 1)
+        _rt(
+            f"[{label}] ← tool_return {_c(event.tool_name, 'yellow')}  {result_preview}",
+            "dim",
+            indent + 1,
+        )
         _record_trace(
             {
                 "kind": "tool_result",
@@ -197,7 +246,12 @@ def _handle_event(event: Any, label: str, indent: int) -> None:
 
     # Full model response node (fires after streaming completes)
     if isinstance(event, ModelResponse):
-        tool_calls = [p for p in event.parts if isinstance(p, ToolCallPart)]
+        tool_calls = [
+            p
+            for p in event.parts
+            if isinstance(p, ToolCallPart)
+            and not _is_synthetic_output_tool(p.tool_name)
+        ]
         if tool_calls:
             names = ", ".join(p.tool_name for p in tool_calls)
             _rt(f"[{label}] ⚙ model→tools  [{names}]", "blue", indent + 1)
@@ -214,22 +268,26 @@ def _handle_event(event: Any, label: str, indent: int) -> None:
 async def _handle_node(node: Any, agent_run: Any, *, label: str, indent: int) -> None:
     """Log graph nodes and stream tool events from pydantic-ai runs."""
     if isinstance(node, UserPromptNode):
-        _rt(f"[{label}] user prompt", "dim", indent)
-        _record_trace({"kind": "status", "label": label, "message": "User prompt accepted"})
+        _rt_detail(f"[{label}] user prompt", "dim", indent)
+        _record_trace(
+            {"kind": "status", "label": label, "message": "User prompt accepted"}
+        )
         return
 
     if Agent.is_model_request_node(node):
-        _rt(f"[{label}] ↻ model request", "dim", indent)
+        _rt_detail(f"[{label}] ↻ model request", "dim", indent)
         _record_trace({"kind": "model_request", "label": label})
         await _stream_model_request_node(node, agent_run, label=label, indent=indent)
         return
 
     if Agent.is_call_tools_node(node):
-        tool_names = [
-            getattr(part, "tool_name", "")
-            for part in getattr(getattr(node, "model_response", None), "parts", [])
-            if getattr(part, "tool_name", "")
-        ]
+        tool_names = _visible_tool_names(
+            [
+                getattr(part, "tool_name", "")
+                for part in getattr(getattr(node, "model_response", None), "parts", [])
+                if getattr(part, "tool_name", "")
+            ]
+        )
         if tool_names:
             names = ", ".join(tool_names)
             _rt(f"[{label}] ⚙ model→tools  [{names}]", "blue", indent + 1)
@@ -238,14 +296,16 @@ async def _handle_node(node: Any, agent_run: Any, *, label: str, indent: int) ->
         return
 
     if isinstance(node, End):
-        _rt(f"[{label}] end node", "dim", indent)
+        _rt_detail(f"[{label}] end node", "dim", indent)
         _record_trace({"kind": "status", "label": label, "message": "Completed"})
         return
 
     _handle_event(node, label=label, indent=indent)
 
 
-async def _stream_model_request_node(node: Any, agent_run: Any, *, label: str, indent: int) -> None:
+async def _stream_model_request_node(
+    node: Any, agent_run: Any, *, label: str, indent: int
+) -> None:
     try:
         async with node.stream(agent_run.ctx) as request_stream:
             current_tool_name: str | None = None
@@ -253,18 +313,19 @@ async def _stream_model_request_node(node: Any, agent_run: Any, *, label: str, i
                 if isinstance(event, PartStartEvent):
                     current_tool_name = getattr(event.part, "tool_name", None)
                     if current_tool_name:
-                        _rt(
-                            f"[{label}] → tool_call_start {_c(current_tool_name, 'yellow')}",
-                            "dim",
-                            indent + 1,
-                        )
-                        _record_trace(
-                            {
-                                "kind": "tool_call_start",
-                                "label": label,
-                                "tool_name": current_tool_name,
-                            }
-                        )
+                        if not _is_synthetic_output_tool(current_tool_name):
+                            _rt(
+                                f"[{label}] → tool_call_start {_c(current_tool_name, 'yellow')}",
+                                "dim",
+                                indent + 1,
+                            )
+                            _record_trace(
+                                {
+                                    "kind": "tool_call_start",
+                                    "label": label,
+                                    "tool_name": current_tool_name,
+                                }
+                            )
                 elif isinstance(event, PartDeltaEvent):
                     if isinstance(event.delta, TextPartDelta):
                         content_delta = getattr(event.delta, "content_delta", "")
@@ -288,7 +349,9 @@ async def _stream_model_request_node(node: Any, agent_run: Any, *, label: str, i
                             )
                     elif isinstance(event.delta, ToolCallPartDelta):
                         args_delta = getattr(event.delta, "args_delta", "")
-                        if args_delta:
+                        if args_delta and not _is_synthetic_output_tool(
+                            current_tool_name
+                        ):
                             _record_trace(
                                 {
                                     "kind": "tool_args_delta",
@@ -301,8 +364,11 @@ async def _stream_model_request_node(node: Any, agent_run: Any, *, label: str, i
         _rt(f"[{label}] model stream unavailable: {exc}", "yellow", indent + 1)
 
 
-async def _stream_call_tools_node(node: Any, agent_run: Any, *, label: str, indent: int) -> None:
+async def _stream_call_tools_node(
+    node: Any, agent_run: Any, *, label: str, indent: int
+) -> None:
     tool_names_by_id: dict[str, str] = {}
+    hidden_tool_call_ids: set[str] = set()
     try:
         async with node.stream(agent_run.ctx) as handle_stream:
             async for event in handle_stream:
@@ -310,6 +376,10 @@ async def _stream_call_tools_node(node: Any, agent_run: Any, *, label: str, inde
                     tool_name = event.part.tool_name
                     tool_args = event.part.args
                     tool_call_id = event.part.tool_call_id
+                    if _is_synthetic_output_tool(tool_name):
+                        if tool_call_id:
+                            hidden_tool_call_ids.add(tool_call_id)
+                        continue
                     if tool_call_id:
                         tool_names_by_id[tool_call_id] = tool_name
                     args_preview = _preview_tool_args(tool_args)
@@ -329,8 +399,14 @@ async def _stream_call_tools_node(node: Any, agent_run: Any, *, label: str, inde
                     )
                 elif isinstance(event, FunctionToolResultEvent):
                     tool_call_id = getattr(event.result, "tool_call_id", "") or ""
+                    if tool_call_id in hidden_tool_call_ids:
+                        continue
                     tool_name = tool_names_by_id.get(tool_call_id, "unknown")
-                    result_content = event.content if event.content is not None else getattr(event.result, "content", "")
+                    result_content = (
+                        event.content
+                        if event.content is not None
+                        else getattr(event.result, "content", "")
+                    )
                     result_preview = _preview_tool_result(result_content)
                     _rt(
                         f"[{label}] ← tool_return {_c(tool_name, 'yellow')}  {result_preview[:160]}",
@@ -354,7 +430,11 @@ async def _stream_call_tools_node(node: Any, agent_run: Any, *, label: str, inde
 def _preview_tool_result(value: Any) -> str:
     try:
         sanitized = _sanitize_tool_result(value)
-        raw = sanitized if isinstance(sanitized, str) else json.dumps(sanitized, ensure_ascii=False, default=str)
+        raw = (
+            sanitized
+            if isinstance(sanitized, str)
+            else json.dumps(sanitized, ensure_ascii=False, default=str)
+        )
         return raw[:1200].replace("\n", " ")
     except Exception:
         return ""
@@ -379,12 +459,20 @@ def _sanitize_tool_result(value: Any, *, depth: int = 0) -> Any:
             for key, item in list(value.items())[:50]
         }
     if isinstance(value, (list, tuple, set)):
-        return [_sanitize_tool_result(item, depth=depth + 1) for item in list(value)[:50]]
+        return [
+            _sanitize_tool_result(item, depth=depth + 1) for item in list(value)[:50]
+        ]
     if all(hasattr(value, attr) for attr in ("return_value", "content", "metadata")):
         return {
-            "return_value": _sanitize_tool_result(getattr(value, "return_value"), depth=depth + 1),
-            "content": _sanitize_tool_result(getattr(value, "content"), depth=depth + 1),
-            "metadata": _sanitize_tool_result(getattr(value, "metadata"), depth=depth + 1),
+            "return_value": _sanitize_tool_result(
+                getattr(value, "return_value"), depth=depth + 1
+            ),
+            "content": _sanitize_tool_result(
+                getattr(value, "content"), depth=depth + 1
+            ),
+            "metadata": _sanitize_tool_result(
+                getattr(value, "metadata"), depth=depth + 1
+            ),
         }
     return str(value)
 
@@ -519,21 +607,20 @@ def _prompt_for_tool_approval(tool_name: str, args_preview: str) -> ApprovalDeci
         reason = input("Deny reason (optional): ").strip()
         return ApprovalDecision("deny", reason)
     return ApprovalDecision("deny", "Denied by default.")
-    
 
 
 class TaskLog(BaseModel):
-    task_id:        str
-    objective:      str
-    status:         str
-    summary:        Optional[str]  = None
-    key_findings:   List[str]      = Field(default_factory=list)
-    uncertainties:  List[str]      = Field(default_factory=list)
+    task_id: str
+    objective: str
+    status: str
+    summary: Optional[str] = None
+    key_findings: List[str] = Field(default_factory=list)
+    uncertainties: List[str] = Field(default_factory=list)
     suggested_next_steps: List[str] = Field(default_factory=list)
-    cited_node_ids: List[str]      = Field(default_factory=list)
-    error:          Optional[str]  = None
-    trace:          Optional[Any]  = None
-    finished_at:    Optional[str]  = None
+    cited_node_ids: List[str] = Field(default_factory=list)
+    error: Optional[str] = None
+    trace: Optional[Any] = None
+    finished_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()

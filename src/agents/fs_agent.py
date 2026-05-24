@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import UsageLimits
 
@@ -106,6 +107,14 @@ class FsPromptContext:
             f"{self.skills_context}\n\n"
             f"{report_section}"
             f"{self.skill_policy}\n"
+            "Tool-use policy:\n"
+            "- Use the Readable file index below before calling discovery tools.\n"
+            "- For broad discovery, prefer grep_files or list_files over repeated list_directory calls.\n"
+            "- Do not call list_directory for a directory whose relevant files are already visible in the index.\n"
+            "- Only call file tools with paths from resolved path hints, valid write targets, the file index, or a tool result.\n"
+            "- Never invent paths. If no matching path exists, report uncertainty instead.\n"
+            "- Never read the same path twice in one run.\n"
+            "- After reading each relevant candidate file once, stop gathering and produce the result.\n\n"
             "Readable file index (actual validator paths):\n"
             f"{self._list(listed_files)}\n"
             f"File index truncated: {len(self.files) > len(listed_files)}\n\n"
@@ -153,6 +162,7 @@ class FsAgentResult(BaseModel):
 fs_agent = Agent(
     model=model,
     output_type=[FsAgentResult, DeferredToolRequests],
+    output_retries=2,
     toolsets=[fs_toolset],
     system_prompt="""
 You are a filesystem specialist agent.
@@ -162,7 +172,13 @@ this is a filesystem task, so do not second-guess that routing.
 
 Rules:
   - Use only validator paths under the readable/writable roots in the prompt.
-  - Discover uncertain paths with list_directory, list_files, grep, and stat.
+  - Use the injected file index first; discover uncertain paths with list_files,
+    grep_files, list_directory, and stat only when the index is insufficient.
+  - Prefer list_files or grep_files for broad discovery. list_directory is for
+    immediate child inspection, not recursive search.
+  - Never call read_file/read_image/stat on a path unless it came from the file
+    index, resolved path hints, valid write targets, or a prior tool result.
+  - Do not read the same file path twice in one run.
   - Do not invent paths. Use exact paths from the prompt only when they are
     listed as resolved paths or possible write targets.
   - For directories, many files, or truncated reads, set needs_rag=true and
@@ -194,7 +210,8 @@ def _roots_context() -> str:
     return (
         f"Readable roots: {readable}\n"
         f"Writable roots: {writable}\n"
-        "Use list_directory('/') to discover root entries. Use only these roots."
+        "Use only these roots. The readable file index lists known files; use "
+        "list_directory('/') only when you need root metadata."
     )
 
 
@@ -203,7 +220,9 @@ def _readable_file_index() -> list[str]:
     files: set[str] = set()
     for root_virtual in validator.readable_roots:
         try:
-            mount_point, resolved, _ = validator.get_path_config(root_virtual, op="read")
+            mount_point, resolved, _ = validator.get_path_config(
+                root_virtual, op="read"
+            )
             mount_root = validator.get_mount_root(mount_point)
         except Exception:
             continue
@@ -303,7 +322,9 @@ class PathPreflight:
     def _suggest(self, path: str, *, limit: int = 5) -> list[str]:
         """Find close readable path suggestions for an invalid hint."""
         parents = {str(PurePosixPath(file_path).parent) for file_path in self.files}
-        return get_close_matches(path, [*self.files, *sorted(parents)], n=limit, cutoff=0.68)
+        return get_close_matches(
+            path, [*self.files, *sorted(parents)], n=limit, cutoff=0.68
+        )
 
     @staticmethod
     def _normalize(path: str) -> str:
@@ -360,7 +381,9 @@ def _paths_that_need_rag(paths: list[str]) -> list[str]:
 
 def _needs_skill_editing_policy(analysis: PathAnalysis) -> bool:
     """Decide whether to inject the skills editing policy."""
-    return any(PathPreflight._is_skills_path(path) for path in analysis.all_path_hints())
+    return any(
+        PathPreflight._is_skills_path(path) for path in analysis.all_path_hints()
+    )
 
 
 def _skill_editing_policy_context(analysis: PathAnalysis) -> str:
@@ -449,7 +472,7 @@ async def _run_fs_agent(prompt: str) -> FsAgentResult:
         prompt,
         label="fs_agent",
         indent=1,
-        usage_limits=UsageLimits(tool_calls_limit=12),
+        usage_limits=UsageLimits(tool_calls_limit=20),
     )
     if not isinstance(result.output, FsAgentResult):
         raise RuntimeError(
@@ -494,7 +517,9 @@ def _format_success_response(output: FsAgentResult) -> str:
     if output.changes_made:
         notes.append(f"Changes made: {len(output.changes_made)}")
     if output.findings:
-        notes.append(f"Detailed findings in fs-report.md: {len(output.findings)} item(s)")
+        notes.append(
+            f"Detailed findings in fs-report.md: {len(output.findings)} item(s)"
+        )
     if output.uncertainties:
         notes.append("Uncertainties: " + "; ".join(_dedupe(output.uncertainties)))
 
@@ -509,6 +534,22 @@ def _format_success_response(output: FsAgentResult) -> str:
 
 def _format_exception_report(objective: str, exc: Exception) -> str:
     """Write and return a terminal report for unexpected filesystem failures."""
+    if isinstance(exc, UsageLimitExceeded):
+        message = (
+            "I stopped the filesystem task because the model exceeded its tool-call budget.\n\n"
+            f"Error: {exc}\n\n"
+            "This usually means the model kept exploring or repeated file reads instead of producing a result. "
+            "Try a narrower request or provide exact paths, or adjust the filesystem prompt/tool budget."
+        )
+        write_agent_report(
+            "fs",
+            objective=objective,
+            summary=message,
+            answer=message,
+            uncertainties=[str(exc)],
+        )
+        return message
+
     message = (
         "I could not complete the filesystem request because of a file access problem.\n\n"
         f"Error: {exc}\n\n"
@@ -542,7 +583,11 @@ async def run_fs_task(objective: str) -> str:
 
     prompt, path_analysis = _fs_task_prompt(objective)
     if path_analysis.invalid_paths:
-        _rt(f"[fs_agent] invalid path hints ignored: {path_analysis.invalid_paths}", "yellow", 1)
+        _rt(
+            f"[fs_agent] invalid path hints ignored: {path_analysis.invalid_paths}",
+            "yellow",
+            1,
+        )
     if path_analysis.write_targets:
         _rt(f"[fs_agent] write target hints: {path_analysis.write_targets}", "dim", 1)
     if path_analysis.terminal_issues:

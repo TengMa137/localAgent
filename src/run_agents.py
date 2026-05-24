@@ -14,6 +14,7 @@ Features
 import argparse
 import asyncio
 import json
+import os
 import re
 import shutil
 import sys
@@ -38,13 +39,33 @@ from agents.observability import (
     stop_trace_collection,
     task_log_store,
     _c,
+    _is_synthetic_output_tool,
     log_event,
 )
+from agents.runtime.query_policy import extract_arxiv_ids, extract_urls
 from agents.runtime.reports import REPORT_ROOT, load_agent_reports, set_report_dir
 from agents.runtime.skills_context import scan_skills_context
 from speech.stream_tts import StreamingTTSConfig, StreamingTTSPlayer
 
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
+_PATH_OR_FILENAME_RE = re.compile(
+    r"(?<!\S)/(?:docs|skills)(?:/[A-Za-z0-9._~@%+=:,/-]*)?"
+    r"|(?<![/\w.-])[A-Za-z0-9._-]+\."
+    r"(?:cfg|csv|gif|html|ini|jpe?g|json|lock|log|md|pdf|png|py|rst|toml|txt|webp|xml|ya?ml)(?![/\w.-])",
+    re.IGNORECASE,
+)
+_FS_ACTION_RE = re.compile(
+    r"\b(?:read|open|edit|write|update|list|summari[sz]e|review|inspect|search|find)\b"
+    r".{0,60}\b(?:local file|files?|repo|repository|codebase|skills?)\b"
+    r"|\b(?:local docs?|local documentation|skill paths?)\b",
+    re.IGNORECASE,
+)
+_WEB_ACTION_RE = re.compile(
+    r"\b(?:search|browse|crawl|fetch|look up|lookup)\b.{0,60}\b(?:web|internet|online|url|website)\b"
+    r"|\b(?:web search|internet search|latest|current|today|recent|news|up[- ]?to[- ]?date|arxiv|doi)\b",
+    re.IGNORECASE,
+)
+
 
 def _deserialize_messages(raw: Any) -> List[ModelMessage]:
     """Coerce plain dicts (from task log store) back to ModelMessage objects."""
@@ -67,7 +88,7 @@ def _debug_messages(messages: List[ModelMessage], label: str = "") -> None:
     print(sep)
 
     for i, msg in enumerate(messages):
-        kind  = "REQUEST" if isinstance(msg, ModelRequest) else "RESPONSE"
+        kind = "REQUEST" if isinstance(msg, ModelRequest) else "RESPONSE"
         color = "cyan" if kind == "REQUEST" else "green"
         print(f"\n[{i}] {_c(kind, color)}")
 
@@ -92,11 +113,13 @@ def _debug_messages(messages: List[ModelMessage], label: str = "") -> None:
                     print(f"    args : {raw[:800].replace(chr(10), ' ')}")
 
             if part_kind == "tool-return":
-                tool    = getattr(part, "tool_name", "?")
+                tool = getattr(part, "tool_name", "?")
                 content = getattr(part, "content", None)
                 print(f"    tool : {tool}")
                 if content is not None:
-                    print(f"    result:\n    {str(content)[:800].replace(chr(10), ' ')}")
+                    print(
+                        f"    result:\n    {str(content)[:800].replace(chr(10), ' ')}"
+                    )
 
     print(f"{sep}\n")
 
@@ -109,14 +132,51 @@ def _summarize_messages(messages: Any) -> None:
         for m in messages
         for p in (getattr(m, "parts", []) if not isinstance(m, dict) else [])
         if getattr(p, "part_kind", "") == "tool-call"
+        and not _is_synthetic_output_tool(getattr(p, "tool_name", ""))
     )
     print(_c(f"[run summary] model_calls={model_calls} tool_calls={tool_calls}", "dim"))
 
 
+def _routing_preflight_context(user_text: str) -> str:
+    """Return short deterministic routing hints for the orchestrator."""
+    reasons: list[str] = []
+    has_url = bool(extract_urls(user_text))
+    has_arxiv = bool(extract_arxiv_ids(user_text))
+    web_signal = has_url or has_arxiv or bool(_WEB_ACTION_RE.search(user_text))
+    fs_signal = bool(_PATH_OR_FILENAME_RE.search(user_text)) or bool(
+        _FS_ACTION_RE.search(user_text)
+    )
+
+    if has_url:
+        reasons.append("URL present")
+    if has_arxiv:
+        reasons.append("arXiv identifier/reference present")
+    if web_signal and not (has_url or has_arxiv):
+        reasons.append("web/current-information wording present")
+    if fs_signal:
+        reasons.append("local file/docs/skills wording or path present")
+
+    if web_signal and fs_signal:
+        route = "plan"
+    elif web_signal:
+        route = "web"
+    elif fs_signal:
+        route = "fs"
+    else:
+        route = "none"
+        reasons.append("no strong retrieval signal")
+
+    return (
+        "Deterministic routing preflight:\n"
+        f"- Strong route hint: {route}\n"
+        f"- Reason: {'; '.join(reasons)}\n"
+        "- If this is a conceptual question about the system, prompts, tools, or logs, prefer direct."
+    )
+
 
 CHAT_HISTORY_DIR = Path("./chat_history/chats")
-EXIT_COMMANDS    = {"exit", "quit", "q", ":q"}
-_MSG_ADAPTER     = TypeAdapter(List[ModelMessage])
+EXIT_COMMANDS = {"exit", "quit", "q", ":q"}
+_MSG_ADAPTER = TypeAdapter(List[ModelMessage])
 
 BANNER = """\
 ╔══════════════════════════════════════════╗
@@ -130,9 +190,9 @@ BANNER = """\
 @dataclass
 class ChatSession:
     message_history: List[ModelMessage] = field(default_factory=list)
-    session_title:   Optional[str]      = None
-    history_path:    Optional[Path]     = None
-    report_dir:      Optional[Path]     = None
+    session_title: Optional[str] = None
+    history_path: Optional[Path] = None
+    report_dir: Optional[Path] = None
 
 
 def _slugify(title: str) -> str:
@@ -165,12 +225,13 @@ def _init_session_paths_from_user_text(session: ChatSession, user_text: str) -> 
     if session.history_path is not None:
         return
     words = re.findall(r"[a-z0-9]+", user_text.lower())[:6]
-    slug = _slugify("-".join(words) or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"))
+    slug = _slugify(
+        "-".join(words) or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    )
     session.history_path = _resolve_history_path(slug)
     session.session_title = session.history_path.stem
     session.report_dir = REPORT_ROOT / session.session_title
     _reset_report_dir(session.report_dir)
-
 
 
 def _save_history(session: ChatSession) -> None:
@@ -180,11 +241,9 @@ def _save_history(session: ChatSession) -> None:
         session.history_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "session_title": session.session_title,
-            "report_dir":    str(session.report_dir) if session.report_dir else None,
-            "saved_at":      datetime.now(timezone.utc).isoformat(),
-            "messages":      _MSG_ADAPTER.dump_python(
-                session.message_history, mode="json"
-            ),
+            "report_dir": str(session.report_dir) if session.report_dir else None,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "messages": _MSG_ADAPTER.dump_python(session.message_history, mode="json"),
         }
         session.history_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False)
@@ -195,8 +254,8 @@ def _save_history(session: ChatSession) -> None:
 
 async def handle_turn(
     user_text: str,
-    session:   ChatSession,
-    debug:     bool = False,
+    session: ChatSession,
+    debug: bool = False,
     tts_player: StreamingTTSPlayer | None = None,
 ) -> None:
     response, _result_messages, turn_logs, _trace_events = await run_turn(
@@ -232,10 +291,12 @@ async def handle_turn(
         if docs:
             print(_c(f"[rag] {len(docs)} documents in store", "dim"))
             for d in docs[:10]:
-                print(_c(
-                    f"  • {d['doc_id']}  {d['source']}  ({d['nodes']} nodes)",
-                    "dim",
-                ))
+                print(
+                    _c(
+                        f"  • {d['doc_id']}  {d['source']}  ({d['nodes']} nodes)",
+                        "dim",
+                    )
+                )
 
 
 async def run_turn(
@@ -243,7 +304,9 @@ async def run_turn(
     session: ChatSession,
     debug: bool = False,
     trace_sink: Any = None,
-) -> tuple[OrchestratorResponse, list[ModelMessage], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    OrchestratorResponse, list[ModelMessage], list[dict[str, Any]], list[dict[str, Any]]
+]:
     """Run one agent turn and update/persist the supplied session.
 
     This is shared by the terminal CLI and the web backend. CLI-only printing
@@ -254,11 +317,13 @@ async def run_turn(
     set_report_dir(session.report_dir)
     report_context = load_agent_reports(session.report_dir)
     skills_context = scan_skills_context()
-    prompt_sections = [f"Current skill scan:\n{skills_context}"]
+    prompt_sections = [
+        _routing_preflight_context(user_text),
+        f"Current skill scan:\n{skills_context}",
+    ]
     if report_context:
         prompt_sections.append(
-            "Session agent reports from previous tool runs:\n"
-            f"{report_context}"
+            f"Session agent reports from previous tool runs:\n{report_context}"
         )
     prompt_sections.append(f"User request:\n{user_text}")
     prompt = "\n\n".join(prompt_sections)
@@ -281,7 +346,12 @@ async def run_turn(
     session.message_history = result.all_messages()
     duration = time.time() - start
 
-    log_event(f"orchestrator completed in {duration:.2f}s")
+    if debug or os.getenv("LOCALAGENT_LOG_LEVEL", "").strip().lower() in {
+        "debug",
+        "trace",
+        "verbose",
+    }:
+        log_event(f"orchestrator completed in {duration:.2f}s")
 
     if debug:
         _debug_messages(result.all_messages(), label="orchestrator")
@@ -295,6 +365,7 @@ async def run_turn(
         # Workers from this turn are at the end of the store (insertion order)
         turn_had_tools = result.delegated or any(
             getattr(p, "part_kind", "") == "tool-call"
+            and not _is_synthetic_output_tool(getattr(p, "tool_name", ""))
             for m in result.all_messages()
             for p in getattr(m, "parts", [])
         )
@@ -302,7 +373,8 @@ async def run_turn(
             # Collect logs whose finished_at is within this turn's window
             turn_start_iso = datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
             turn_logs = [
-                item for item in all_logs
+                item
+                for item in all_logs
                 if (item.get("finished_at") or "") >= turn_start_iso
             ]
 
@@ -338,7 +410,7 @@ async def run(
 
     while True:
         try:
-            prompt     = "> " if not session.message_history else "You: "
+            prompt = "> " if not session.message_history else "You: "
             user_input = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye.")

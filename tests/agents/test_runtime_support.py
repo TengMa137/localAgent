@@ -88,9 +88,9 @@ def test_default_skills_mount_is_writable_with_approval():
 def test_fs_preflight_replaces_missing_path_hint():
     from agents import fs_agent
 
-    sanitized, analysis = fs_agent.PathPreflight(fs_agent._readable_file_index()).analyze(
-        "find and read the /skills/local-fitness-skills file"
-    )
+    sanitized, analysis = fs_agent.PathPreflight(
+        fs_agent._readable_file_index()
+    ).analyze("find and read the /skills/local-fitness-skills file")
 
     assert analysis.invalid_paths == ["/skills/local-fitness-skills"]
     assert analysis.write_targets == []
@@ -130,6 +130,9 @@ def test_fs_task_prompt_includes_file_index_and_write_targets():
     assert "Invalid exact path hints" in prompt
     assert "/skills/fitness/diet.md" in prompt
     assert "/skills/fitness/workout.md" in prompt
+    assert "Use the Readable file index below before calling discovery tools." in prompt
+    assert "Never invent paths." in prompt
+    assert "Never read the same path twice in one run." in prompt
 
     prompt, analysis = fs_agent._fs_task_prompt(
         "create /skills/fitness/movement_recovery.md."
@@ -209,7 +212,11 @@ def test_prompt_for_tool_approval_non_interactive_denies(monkeypatch):
 
 
 def test_write_and_load_agent_report(tmp_path):
-    from agents.runtime.reports import load_agent_reports, set_report_dir, write_agent_report
+    from agents.runtime.reports import (
+        load_agent_reports,
+        set_report_dir,
+        write_agent_report,
+    )
 
     set_report_dir(tmp_path)
     write_agent_report(
@@ -233,7 +240,11 @@ def test_write_and_load_agent_report(tmp_path):
 
 
 def test_agent_report_appends_runs_in_same_session(tmp_path):
-    from agents.runtime.reports import load_agent_reports, set_report_dir, write_agent_report
+    from agents.runtime.reports import (
+        load_agent_reports,
+        set_report_dir,
+        write_agent_report,
+    )
 
     set_report_dir(tmp_path)
     write_agent_report(
@@ -298,6 +309,19 @@ def test_web_response_keeps_full_findings_out_of_tool_return():
     assert "Summary: Short web summary." in formatted
     assert "Detailed findings in web-report.md: 1 item(s)" in formatted
     assert "large crawled/RAG finding that belongs in the report" not in formatted
+
+
+def test_web_query_guidance_includes_time_sensitive_semantic_guidance():
+    from agents.web_agent import _web_query_guidance
+
+    guidance = _web_query_guidance("What's today's gold price?")
+
+    assert "Current date/time:" in guidance
+    assert (
+        "Choose the first web_search_tool query semantically from the objective"
+        in guidance
+    )
+    assert "avoid adding a bare year" in guidance
 
 
 def test_orchestrator_decision_requires_route_payload():
@@ -459,3 +483,36 @@ def test_fs_task_prompt_does_not_infer_write_intent(monkeypatch, tmp_path):
     assert analysis.invalid_paths == []
     assert analysis.resolved_paths == ["/docs/actual.md"]
     assert analysis.terminal_issues == []
+
+
+def test_fs_usage_limit_error_is_not_reported_as_file_access_problem():
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    from agents.fs_agent import _format_exception_report
+    from agents.runtime.reports import set_report_dir
+
+    set_report_dir(None)
+    message = _format_exception_report(
+        "read local files",
+        UsageLimitExceeded("The next tool call(s) would exceed the tool_calls_limit."),
+    )
+
+    assert "tool-call budget" in message
+    assert "file access problem" not in message
+
+
+def test_routing_preflight_context_prefers_strong_signals():
+    from run_agents import _routing_preflight_context
+
+    assert "Strong route hint: web" in _routing_preflight_context(
+        "search the web for latest Pydantic AI output docs"
+    )
+    assert "Strong route hint: fs" in _routing_preflight_context(
+        "read /skills/fitness/diet.md"
+    )
+    assert "Strong route hint: plan" in _routing_preflight_context(
+        "compare /docs/notes.md with the latest docs online"
+    )
+    assert "Strong route hint: none" in _routing_preflight_context(
+        "why does the fs agent call the same tool?"
+    )

@@ -7,13 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.usage import UsageLimits
 
-from .runtime.context import (
-    model,
-    MCP_URL,
-    rag_service,
-    rag_validator,
-    _now
-)
+from .runtime.context import model, MCP_URL, rag_service, rag_validator, _now
 from .runtime.query_policy import TaskKind, extract_arxiv_ids, extract_urls
 from tools.retrieval.interceptor import (
     arxiv_fetch_and_ingest,
@@ -33,15 +27,16 @@ MAX_EVIDENCE_ITEMS = 6
 T = TypeVar("T", bound=BaseModel)
 ConfidenceLevel = Literal["low", "high"]
 
+
 class TaskSpec(BaseModel):
-    objective:              str
-    kind:                   Optional[TaskKind] = None
-    query:                  Optional[str] = None
-    urls:                   List[str] = Field(default_factory=list)
-    relevant_files:         List[str] = Field(default_factory=list)
-    requires_current_info:  bool = False
-    as_of:                  Optional[str] = None
-    user_prompt:            Optional[str] = None
+    objective: str
+    kind: Optional[TaskKind] = None
+    query: Optional[str] = None
+    urls: List[str] = Field(default_factory=list)
+    relevant_files: List[str] = Field(default_factory=list)
+    requires_current_info: bool = False
+    as_of: Optional[str] = None
+    user_prompt: Optional[str] = None
     relevant_skills: Optional[List[str]] = None
 
     @model_validator(mode="before")
@@ -53,18 +48,24 @@ class TaskSpec(BaseModel):
                     values[field] = []
         return values
 
+
 class WorkerOutput(BaseModel):
-    summary:              str
-    key_findings:         List[str] = Field(default_factory=list)
-    uncertainties:        List[str] = Field(default_factory=list)
+    summary: str
+    key_findings: List[str] = Field(default_factory=list)
+    uncertainties: List[str] = Field(default_factory=list)
     suggested_next_steps: List[str] = Field(default_factory=list)
-    cited_node_ids:       List[str] = Field(default_factory=list)
+    cited_node_ids: List[str] = Field(default_factory=list)
 
     # Add a validator to coerce None → [] for all list fields
     @model_validator(mode="before")
     @classmethod
     def coerce_none_lists(cls, values: Any) -> Any:
-        list_fields = {"key_findings", "uncertainties", "suggested_next_steps", "cited_node_ids"}
+        list_fields = {
+            "key_findings",
+            "uncertainties",
+            "suggested_next_steps",
+            "cited_node_ids",
+        }
         for f in list_fields:
             if values.get(f) is None:
                 values[f] = []
@@ -73,8 +74,8 @@ class WorkerOutput(BaseModel):
 
 class ReflectionOutput(BaseModel):
     objective_complete: bool
-    confidence:         ConfidenceLevel
-    next_tasks:         List[TaskSpec]
+    confidence: ConfidenceLevel
+    next_tasks: List[TaskSpec]
 
     @model_validator(mode="before")
     @classmethod
@@ -198,6 +199,7 @@ async def _run_structured_worker(
         model=model,
         system_prompt=system_prompt,
         output_type=output_type,
+        output_retries=2,
     )
     return await observable_run(
         worker,
@@ -366,7 +368,7 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
             label=f"worker:{task_id[:8]}",
             indent=2,
         )
-        messages   = result.all_messages()
+        messages = result.all_messages()
         tool_calls = sum(
             1
             for m in messages
@@ -376,22 +378,22 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
         if tool_calls > MAX_TOOL_CALLS:
             _rt(f"[worker {task_id[:8]}] ✗ TOOL LOOP ({tool_calls} calls)", "red")
             log.status = "failed"
-            log.error  = f"tool loop detected ({tool_calls} calls)"
-            log.trace  = messages
+            log.error = f"tool loop detected ({tool_calls} calls)"
+            log.trace = messages
         else:
             out = result.output
             _rt(f"[worker {task_id[:8]}] ✓ DONE — {out.summary[:80]}", "green")
-            log.status         = "done"
-            log.summary        = out.summary
-            log.key_findings   = out.key_findings
-            log.uncertainties  = out.uncertainties
+            log.status = "done"
+            log.summary = out.summary
+            log.key_findings = out.key_findings
+            log.uncertainties = out.uncertainties
             log.suggested_next_steps = out.suggested_next_steps
             log.cited_node_ids = out.cited_node_ids
-            log.trace          = messages
+            log.trace = messages
     except Exception as exc:
         _rt(f"[worker {task_id[:8]}] ✗ ERROR — {exc}", "red")
         log.status = "failed"
-        log.error  = str(exc)
+        log.error = str(exc)
     finally:
         log.finished_at = datetime.now(timezone.utc).isoformat()
         task_log_store.save(log)

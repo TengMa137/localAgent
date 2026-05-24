@@ -32,6 +32,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from rag import RagServiceProtocol, Document
 from tools.retrieval.make_doc import make_title, stable_doc_id
 
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -49,6 +50,7 @@ def _to_dict(obj: Any) -> dict:
         except Exception:
             return {"raw": obj}
     return {}
+
 
 def _result_to_dict(result: Any) -> dict:
     """
@@ -104,7 +106,9 @@ async def web_search_results(mcp_url: str, query: str) -> List[dict]:
     return data.get("results", [])
 
 
-def select_urls_from_search_results(results: List[dict], *, max_urls: int = 3) -> List[str]:
+def select_urls_from_search_results(
+    results: List[dict], *, max_urls: int = 3
+) -> List[str]:
     urls: list[str] = []
     seen: set[str] = set()
     for result in sorted(results, key=lambda item: item.get("position", 9999)):
@@ -132,10 +136,7 @@ async def web_crawl_and_ingest(
         else:
             result = await client.call_tool("crawl_urls", {"urls": urls})
             data = _result_to_dict(result)
-            docs = [
-                d for d in [_crawl_to_doc(c) for c in data.get("results", [])]
-                if d
-            ]
+            docs = [d for d in [_crawl_to_doc(c) for c in data.get("results", [])] if d]
 
     if not docs:
         return f"No usable content retrieved from: {urls}"
@@ -150,10 +151,13 @@ async def arxiv_search_results(
     max_results: int = 5,
 ) -> List[dict]:
     async with fastmcp.Client(mcp_url) as client:
-        result = await client.call_tool("search_arxiv", {
-            "query": query,
-            "max_results": max_results,
-        })
+        result = await client.call_tool(
+            "search_arxiv",
+            {
+                "query": query,
+                "max_results": max_results,
+            },
+        )
     data = _result_to_dict(result)
     return data.get("results", [])
 
@@ -173,29 +177,31 @@ async def arxiv_fetch_and_ingest(
                 continue
             authors = [a.get("name", "") for a in paper.get("authors", [])]
             url = str(paper.get("pdf_url") or f"https://arxiv.org/abs/{arxiv_id}")
-            docs.append(Document(
-                doc_id=stable_doc_id(arxiv_id),
-                source=url,
-                title=make_title(
+            docs.append(
+                Document(
+                    doc_id=stable_doc_id(arxiv_id),
                     source=url,
-                    raw_title=paper.get("title"),
-                    arxiv_id=arxiv_id,
-                ),
-                text=(
-                    f"{paper.get('title', '')}\n\n"
-                    f"Authors: {', '.join(authors)}\n\n"
-                    f"{paper.get('summary', '')}"
-                ),
-                mime="text/plain",
-                meta={
-                    "tool": "arxiv_fetch",
-                    "arxiv_id": arxiv_id,
-                    "authors": authors,
-                    "published": paper.get("published"),
-                    "categories": paper.get("categories", []),
-                    "ingested_at": _now(),
-                },
-            ))
+                    title=make_title(
+                        source=url,
+                        raw_title=paper.get("title"),
+                        arxiv_id=arxiv_id,
+                    ),
+                    text=(
+                        f"{paper.get('title', '')}\n\n"
+                        f"Authors: {', '.join(authors)}\n\n"
+                        f"{paper.get('summary', '')}"
+                    ),
+                    mime="text/plain",
+                    meta={
+                        "tool": "arxiv_fetch",
+                        "arxiv_id": arxiv_id,
+                        "authors": authors,
+                        "published": paper.get("published"),
+                        "categories": paper.get("categories", []),
+                        "ingested_at": _now(),
+                    },
+                )
+            )
 
     if not docs:
         return f"No papers found for ids: {arxiv_ids}"
@@ -219,12 +225,14 @@ def make_web_toolset(
     """
     toolset = FunctionToolset()
 
-    @toolset.tool(name="web_search_tool",
+    @toolset.tool(
+        name="web_search_tool",
         description=(
-        "Search the web and return a list of results (title, url, snippet, position). "
-        "Review the snippets and select the most relevant URLs, "
-        "then call web_crawl_tool() with those URLs to store the full content."
-    ))
+            "Search the web and return a list of results (title, url, snippet, position). "
+            "Review the snippets and select the most relevant URLs, "
+            "then call web_crawl_tool() with those URLs to store the full content."
+        ),
+    )
     async def web_search(
         ctx: RunContext,
         query: str,
@@ -232,13 +240,15 @@ def make_web_toolset(
         """Returns raw search results. LLM picks which URLs to crawl."""
         return await web_search_results(mcp_url, query)
 
-
-    @toolset.tool(name="web_crawl_tool", description=(
-        "Crawl one or more URLs and store the full content in the knowledge base. "
-        "Only call this for URLs you selected from web_search_tool results as relevant "
-        "to the objective — do not crawl every result. "
-        "After crawling, use rag_search_tool() to retrieve specific sections."
-    ))
+    @toolset.tool(
+        name="web_crawl_tool",
+        description=(
+            "Crawl one or more URLs and store the full content in the knowledge base. "
+            "Only call this for URLs you selected from web_search_tool results as relevant "
+            "to the objective — do not crawl every result. "
+            "After crawling, use rag_search_tool() to retrieve specific sections."
+        ),
+    )
     async def crawl_and_ingest(
         ctx: RunContext,
         urls: List[str],
@@ -249,12 +259,14 @@ def make_web_toolset(
         """
         return await web_crawl_and_ingest(mcp_url, rag_service, urls)
 
-
-    @toolset.tool(name="arxiv_search_tool", description=(
-        "Search arXiv and return a list of papers (title, arxiv_id, summary, authors). "
-        "Review the abstracts and select relevant arxiv_ids, "
-        "then call arxiv_fetch() to store those papers in the knowledge base."
-    ))
+    @toolset.tool(
+        name="arxiv_search_tool",
+        description=(
+            "Search arXiv and return a list of papers (title, arxiv_id, summary, authors). "
+            "Review the abstracts and select relevant arxiv_ids, "
+            "then call arxiv_fetch() to store those papers in the knowledge base."
+        ),
+    )
     async def arxiv_search(
         ctx: RunContext,
         query: str,
@@ -264,11 +276,14 @@ def make_web_toolset(
         """Returns paper list. LLM picks which papers to fetch."""
         return await arxiv_search_results(mcp_url, query, max_results=max_results)
 
-    @toolset.tool(name="arxiv_fetch_tool", description=(
-        "Fetch specific arXiv papers by ID and store their abstracts in the knowledge base. "
-        "Only fetch papers you selected from arxiv_search as relevant to the objective. "
-        "To also ingest the full PDF text, pass the pdf_url to web_crawl_tool()."
-    ))
+    @toolset.tool(
+        name="arxiv_fetch_tool",
+        description=(
+            "Fetch specific arXiv papers by ID and store their abstracts in the knowledge base. "
+            "Only fetch papers you selected from arxiv_search as relevant to the objective. "
+            "To also ingest the full PDF text, pass the pdf_url to web_crawl_tool()."
+        ),
+    )
     async def arxiv_fetch(
         ctx: RunContext,
         arxiv_ids: List[str],
