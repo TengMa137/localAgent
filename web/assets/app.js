@@ -906,7 +906,26 @@ async function refreshSessions() {
   renderSessions();
 }
 
+function isEmptyNewChat(session) {
+  const messageCount = session?.message_count ?? 0;
+  const fileCount = session?.file_count ?? 0;
+  return session
+    && session.title === "New chat"
+    && (
+      session.is_empty === true
+      || (session.is_empty === undefined && messageCount === 0 && fileCount === 0)
+    );
+}
+
 async function createSession() {
+  await refreshSessions();
+  const existingEmpty = state.sessions.find(isEmptyNewChat);
+  if (existingEmpty) {
+    state.activeSessionId = existingEmpty.id;
+    await loadSession(existingEmpty.id);
+    return;
+  }
+
   const data = await api("/api/chat/sessions", {
     method: "POST",
     body: JSON.stringify({ title: "New chat" }),

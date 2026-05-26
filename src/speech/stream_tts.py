@@ -31,21 +31,18 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
-import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
-from localagent_env import load_dotenv
+from localagent_settings import SpeechSettings
 from .qwen3 import Qwen3TTSProvider
-
-load_dotenv()
 
 
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n{2,}")
@@ -54,20 +51,38 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 
 class TTSProvider(Protocol):
-    async def synthesize(self, text: str, **kwargs) -> object:
-        ...
+    async def synthesize(self, text: str, **kwargs) -> object: ...
+
+
+def _speech_settings() -> SpeechSettings:
+    return SpeechSettings()
+
+
+def _speech_int_setting(name: str, default: int) -> int:
+    value = getattr(_speech_settings(), name)
+    return default if value is None else value
 
 
 @dataclass(frozen=True)
 class StreamingTTSConfig:
     """Runtime controls for terminal TTS chunking and playback."""
 
-    min_chunk_chars: int = int(os.getenv("LOCALAGENT_TTS_MIN_CHARS", "80"))
-    max_chunk_chars: int = int(os.getenv("LOCALAGENT_TTS_MAX_CHARS", "260"))
-    min_sentence_chars: int = int(os.getenv("LOCALAGENT_TTS_MIN_SENTENCE_CHARS", "1"))
-    initial_max_chunk_chars: int = int(os.getenv("LOCALAGENT_TTS_INITIAL_MAX_CHARS", "0"))
-    phrase_boundary_chars: int = int(os.getenv("LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS", "0"))
-    player_command: str = os.getenv("LOCALAGENT_TTS_PLAYER", "")
+    min_chunk_chars: int = field(
+        default_factory=lambda: _speech_int_setting("tts_min_chars", 80)
+    )
+    max_chunk_chars: int = field(
+        default_factory=lambda: _speech_int_setting("tts_max_chars", 260)
+    )
+    min_sentence_chars: int = field(
+        default_factory=lambda: _speech_int_setting("tts_min_sentence_chars", 1)
+    )
+    initial_max_chunk_chars: int = field(
+        default_factory=lambda: _speech_int_setting("tts_initial_max_chars", 0)
+    )
+    phrase_boundary_chars: int = field(
+        default_factory=lambda: _speech_int_setting("tts_phrase_boundary_chars", 0)
+    )
+    player_command: str = field(default_factory=lambda: _speech_settings().tts_player)
 
 
 @dataclass(frozen=True)
@@ -336,15 +351,16 @@ def _resolve_player_command(player_command: str) -> list[str]:
 
 
 def _with_qwen3_chunking_defaults(config: StreamingTTSConfig) -> StreamingTTSConfig:
-    updates = {}
-    if "LOCALAGENT_TTS_MIN_CHARS" not in os.environ:
+    updates: dict[str, Any] = {}
+    configured = _speech_settings().model_fields_set
+    if "tts_min_chars" not in configured:
         updates["min_chunk_chars"] = 50
-    if "LOCALAGENT_TTS_MAX_CHARS" not in os.environ:
+    if "tts_max_chars" not in configured:
         updates["max_chunk_chars"] = 180
-    if "LOCALAGENT_TTS_MIN_SENTENCE_CHARS" not in os.environ:
+    if "tts_min_sentence_chars" not in configured:
         updates["min_sentence_chars"] = 24
-    if "LOCALAGENT_TTS_INITIAL_MAX_CHARS" not in os.environ:
+    if "tts_initial_max_chars" not in configured:
         updates["initial_max_chunk_chars"] = 120
-    if "LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS" not in os.environ:
+    if "tts_phrase_boundary_chars" not in configured:
         updates["phrase_boundary_chars"] = 90
     return replace(config, **updates) if updates else config

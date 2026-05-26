@@ -7,7 +7,6 @@ import asyncio
 import base64
 import json
 import mimetypes
-import os
 import re
 import shutil
 import subprocess
@@ -15,31 +14,23 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from localagent_env import load_dotenv
-
-load_dotenv()
+from localagent_settings import SpeechSettings
 
 
 _ASR_TEXT_TAG = "<asr_text>"
 _LANG_PREFIX = "language "
 
 
-def _optional_float(name: str) -> float | None:
-    value = os.getenv(name)
-    return float(value) if value else None
-
-
-def _optional_int(name: str) -> int | None:
-    value = os.getenv(name)
-    return int(value) if value else None
-
-
 def _optional_text(value: object | None) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _speech_settings() -> SpeechSettings:
+    return SpeechSettings()
 
 
 @dataclass(frozen=True)
@@ -74,23 +65,27 @@ class Qwen3ASRConfig:
     Set ``base_url`` to an empty string only for ad hoc CLI fallback.
     """
 
-    base_url: str = os.getenv("LOCALAGENT_ASR_BASE_URL", "http://localhost:8081/v1")
-    cli_path: str = os.getenv("LOCALAGENT_SPEECH_CLI", "crispasr")
-    backend: str = os.getenv("LOCALAGENT_ASR_BACKEND", "qwen3")
-    model: str = os.getenv("LOCALAGENT_ASR_MODEL", "./models/qwen3-asr-1.7b-q8_0.gguf")
-    api_key: str = os.getenv("LOCALAGENT_ASR_API_KEY", "no-key")
-    timeout_seconds: float = float(os.getenv("LOCALAGENT_ASR_TIMEOUT_SECONDS", "300"))
-    max_tokens: int = int(os.getenv("LOCALAGENT_ASR_MAX_TOKENS", "512"))
-    temperature: float = float(os.getenv("LOCALAGENT_ASR_TEMPERATURE", "0"))
-    response_format: str = os.getenv("LOCALAGENT_ASR_RESPONSE_FORMAT", "json")
-    language: str = os.getenv("LOCALAGENT_ASR_LANGUAGE", "")
-    threads: int | None = _optional_int("LOCALAGENT_ASR_THREADS")
-    vad: bool = os.getenv("LOCALAGENT_ASR_VAD", "").lower() in {"1", "true", "yes"}
-    output_json: bool = os.getenv("LOCALAGENT_ASR_OUTPUT_JSON", "1").lower() not in {
-        "0",
-        "false",
-        "no",
-    }
+    base_url: str = field(default_factory=lambda: _speech_settings().asr_base_url)
+    cli_path: str = field(default_factory=lambda: _speech_settings().speech_cli)
+    backend: str = field(default_factory=lambda: _speech_settings().asr_backend)
+    model: str = field(default_factory=lambda: _speech_settings().asr_model)
+    api_key: str = field(default_factory=lambda: _speech_settings().asr_api_key)
+    timeout_seconds: float = field(
+        default_factory=lambda: _speech_settings().asr_timeout_seconds
+    )
+    max_tokens: int = field(default_factory=lambda: _speech_settings().asr_max_tokens)
+    temperature: float = field(
+        default_factory=lambda: _speech_settings().asr_temperature
+    )
+    response_format: str = field(
+        default_factory=lambda: _speech_settings().asr_response_format
+    )
+    language: str = field(default_factory=lambda: _speech_settings().asr_language)
+    threads: int | None = field(default_factory=lambda: _speech_settings().asr_threads)
+    vad: bool = field(default_factory=lambda: _speech_settings().asr_vad)
+    output_json: bool = field(
+        default_factory=lambda: _speech_settings().asr_output_json
+    )
 
 
 class Qwen3ASRError(RuntimeError):
@@ -101,30 +96,30 @@ class Qwen3ASRError(RuntimeError):
 class Qwen3TTSConfig:
     """Runtime config for CrispASR Qwen3-TTS."""
 
-    base_url: str = os.getenv("LOCALAGENT_TTS_BASE_URL", "http://localhost:8082/v1")
-    cli_path: str = os.getenv(
-        "LOCALAGENT_TTS_CLI", os.getenv("LOCALAGENT_SPEECH_CLI", "crispasr")
+    base_url: str = field(default_factory=lambda: _speech_settings().tts_base_url)
+    cli_path: str = field(default_factory=lambda: _speech_settings().tts_cli_path)
+    backend: str = field(default_factory=lambda: _speech_settings().tts_backend)
+    model: str = field(default_factory=lambda: _speech_settings().tts_model)
+    api_key: str = field(default_factory=lambda: _speech_settings().tts_api_key)
+    timeout_seconds: float = field(
+        default_factory=lambda: _speech_settings().tts_timeout_seconds
     )
-    backend: str = os.getenv("LOCALAGENT_TTS_BACKEND", "qwen3-tts-customvoice")
-    model: str = os.getenv(
-        "LOCALAGENT_TTS_MODEL",
-        "./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf",
+    voice: str = field(default_factory=lambda: _speech_settings().tts_voice)
+    voice_dir: str = field(default_factory=lambda: _speech_settings().tts_voice_dir)
+    reference_text: str = field(default_factory=lambda: _speech_settings().tts_ref_text)
+    codec_model: str = field(default_factory=lambda: _speech_settings().tts_codec_model)
+    language: str = field(default_factory=lambda: _speech_settings().tts_language)
+    instructions: str = field(
+        default_factory=lambda: _speech_settings().tts_instructions
     )
-    api_key: str = os.getenv("LOCALAGENT_TTS_API_KEY", "no-key")
-    timeout_seconds: float = float(os.getenv("LOCALAGENT_TTS_TIMEOUT_SECONDS", "600"))
-    voice: str = os.getenv("LOCALAGENT_TTS_VOICE", "vivian")
-    voice_dir: str = os.getenv("LOCALAGENT_TTS_VOICE_DIR", "")
-    reference_text: str = os.getenv("LOCALAGENT_TTS_REF_TEXT", "")
-    codec_model: str = os.getenv(
-        "LOCALAGENT_TTS_CODEC_MODEL",
-        "./models/qwen3-tts-tokenizer-12hz.gguf",
+    response_format: str = field(
+        default_factory=lambda: _speech_settings().tts_response_format
     )
-    language: str = os.getenv("LOCALAGENT_TTS_LANGUAGE", "")
-    instructions: str = os.getenv("LOCALAGENT_TTS_INSTRUCTIONS", "")
-    response_format: str = os.getenv("LOCALAGENT_TTS_RESPONSE_FORMAT", "wav")
-    temperature: float | None = _optional_float("LOCALAGENT_TTS_TEMPERATURE")
-    speed: float | None = _optional_float("LOCALAGENT_TTS_SPEED")
-    threads: int | None = _optional_int("LOCALAGENT_TTS_THREADS")
+    temperature: float | None = field(
+        default_factory=lambda: _speech_settings().tts_temperature
+    )
+    speed: float | None = field(default_factory=lambda: _speech_settings().tts_speed)
+    threads: int | None = field(default_factory=lambda: _speech_settings().tts_threads)
 
 
 class Qwen3TTSError(RuntimeError):
@@ -239,7 +234,9 @@ class Qwen3ASRProvider:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as resp:
+            with urllib.request.urlopen(
+                request, timeout=self.config.timeout_seconds
+            ) as resp:
                 body = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -558,7 +555,9 @@ class Qwen3TTSProvider:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as resp:
+            with urllib.request.urlopen(
+                request, timeout=self.config.timeout_seconds
+            ) as resp:
                 audio_bytes = resp.read()
                 mime_type = resp.headers.get_content_type() or "audio/wav"
         except urllib.error.HTTPError as exc:
@@ -606,9 +605,7 @@ class Qwen3TTSProvider:
                 context += f", ... (+{len(voices) - 12} more)"
         elif voices == []:
             context += "; server reported no named voices"
-        context += (
-            "; check LOCALAGENT_TTS_VOICE against the CrispASR server backend"
-        )
+        context += "; check LOCALAGENT_TTS_VOICE against the CrispASR server backend"
         return f" ({context})"
 
     def _fetch_server_voice_names(self, speech_url: str) -> list[str] | None:
@@ -697,7 +694,9 @@ class Qwen3TTSProvider:
         return self.config.voice.strip()
 
 
-def parse_asr_output(raw: str | None, user_language: str | None = None) -> tuple[str, str]:
+def parse_asr_output(
+    raw: str | None, user_language: str | None = None
+) -> tuple[str, str]:
     """Parse Qwen3-ASR raw output into ``(language, text)``.
 
     Qwen3-ASR usually returns ``language English<asr_text>...``. If a caller
@@ -916,7 +915,9 @@ async def _main() -> None:
     asr_file.add_argument("--language", help="Optional forced language, e.g. English")
     asr_file.set_defaults(handler=_run_asr_file)
 
-    asr_mic = subparsers.add_parser("asr-mic", help="Record mic audio and transcribe it")
+    asr_mic = subparsers.add_parser(
+        "asr-mic", help="Record mic audio and transcribe it"
+    )
     asr_mic.add_argument("--seconds", type=float, default=5.0, help="Recording length")
     asr_mic.add_argument("--out-dir", type=Path, default=Path("./tmp"))
     asr_mic.add_argument("--language", help="Optional forced language, e.g. English")
@@ -929,7 +930,9 @@ async def _main() -> None:
     tts.add_argument("text", help="Text to synthesize")
     tts.add_argument("--out-dir", type=Path, default=Path("./tmp"))
     tts.add_argument("--output", type=Path, help="Exact output WAV path")
-    tts.add_argument("--reference-audio", type=Path, help="Optional voice reference WAV")
+    tts.add_argument(
+        "--reference-audio", type=Path, help="Optional voice reference WAV"
+    )
     tts.set_defaults(handler=_run_tts)
 
     args = parser.parse_args()

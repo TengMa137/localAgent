@@ -9,6 +9,7 @@ test-old/
 mkdocs.yml
 Makefile
 chat_history/
+/.memory/
 localagent_state/
 user_docs/web_uploads/
 *.egg-info/

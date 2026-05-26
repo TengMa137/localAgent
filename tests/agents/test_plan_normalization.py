@@ -6,6 +6,7 @@ from agents.plan_agent import (
     PlanOutput,
     PlannerInput,
     SessionState,
+    _format_plan_handoff,
     _run_research_loop,
     _normalize_plan,
 )
@@ -131,10 +132,7 @@ def test_normalize_plan_adds_required_local_task_for_objective_files():
 
     normalized = _normalize_plan(
         plan,
-        objective=(
-            "check out /skills/fitness/diet.md and "
-            "/skills/fitness/workout.md"
-        ),
+        objective=("check out /skills/fitness/diet.md and /skills/fitness/workout.md"),
         matched_files=[],
         as_of="now",
     )
@@ -322,6 +320,42 @@ def test_planner_input_renders_known_file_context():
     assert "PATH: /docs/code.md" in prompt
 
 
+def test_plan_handoff_keeps_compact_task_ledger():
+    state = SessionState(user_query="Compare local and current docs")
+    state.completed_tasks = ["Read local docs"]
+    state.findings = ["Detailed specialist result that should stay out of notes"]
+    state.uncertainties = ["Need current API confirmation"]
+    state.sources = ["/docs/local.md"]
+
+    handoff = _format_plan_handoff(
+        answer="Use the new API shape.",
+        state=state,
+        planned_tasks=[
+            TaskSpec(
+                kind=TaskKind.LOCAL_RAG,
+                objective="Read local docs",
+                relevant_files=["/docs/local.md"],
+            ),
+            TaskSpec(
+                kind=TaskKind.WEB_SEARCH,
+                objective="Check current API docs",
+                query="current API docs",
+            ),
+        ],
+        as_of="now",
+        time_sensitive=True,
+    )
+
+    assert "Forwardable answer:\nUse the new API shape." in handoff
+    assert "Orchestrator notes:" in handoff
+    assert "Tasks planned: 2; completed: 1" in handoff
+    assert "Pending tasks: Check current API docs" in handoff
+    assert "Findings available: 1" in handoff
+    assert (
+        "Detailed specialist result" not in handoff.split("Orchestrator notes:", 1)[1]
+    )
+
+
 @pytest.mark.asyncio
 async def test_research_loop_runs_followups_when_reflection_confidence_is_low(
     monkeypatch,
@@ -428,13 +462,19 @@ async def test_research_loop_records_low_confidence_when_no_followup(monkeypatch
 
 
 def test_reflection_output_coerces_legacy_numeric_confidence():
-    assert ReflectionOutput(
-        objective_complete=False,
-        confidence=0.2,
-        next_tasks=[],
-    ).confidence == "low"
-    assert ReflectionOutput(
-        objective_complete=True,
-        confidence=0.9,
-        next_tasks=[],
-    ).confidence == "high"
+    assert (
+        ReflectionOutput(
+            objective_complete=False,
+            confidence=0.2,
+            next_tasks=[],
+        ).confidence
+        == "low"
+    )
+    assert (
+        ReflectionOutput(
+            objective_complete=True,
+            confidence=0.9,
+            next_tasks=[],
+        ).confidence
+        == "high"
+    )

@@ -1,47 +1,45 @@
-import os
 from datetime import datetime, timezone
 from typing import Any
 
-from localagent_env import load_dotenv
 from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.toolsets import ApprovalRequiredToolset
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-load_dotenv()
-
+from localagent_settings import get_runtime_settings
 from rag import rag_service
 from tools.retrieval import make_rag_toolset, make_web_toolset
-from tools.filesystem import FilesystemValidator, FilesystemValidatorConfig, Mount, make_filesystem_toolset
+from tools.filesystem import (
+    FilesystemValidator,
+    FilesystemValidatorConfig,
+    Mount,
+    make_filesystem_toolset,
+)
 from tools.skills import build_index, make_skills, refresh_index
 
 
-def _mount_mode_env(name: str, default: str) -> str:
-    value = os.getenv(name, default).strip().lower()
-    if value not in {"ro", "rw"}:
-        raise ValueError(f"{name} must be 'ro' or 'rw', got {value!r}")
-    return value
+settings = get_runtime_settings()
 
 
 model = OpenAIChatModel(
     "openai:gpt-4o-mini",
     provider=OpenAIProvider(
-        base_url=os.getenv("LOCALAGENT_MODEL_BASE_URL", "http://localhost:8080/v1"),
-        api_key=os.getenv("LOCALAGENT_MODEL_API_KEY", "no-key"),
+        base_url=settings.model_base_url,
+        api_key=settings.model_api_key,
     ),
 )
 
 config = FilesystemValidatorConfig(
     mounts=[
         Mount(
-            host_path=os.getenv("LOCALAGENT_DOCS_DIR", "user_docs"),
+            host_path=settings.docs_dir,
             mount_point="/docs",
             mode="ro",
         ),
         Mount(
-            host_path=os.getenv("LOCALAGENT_SKILLS_DIR", "skills"),
+            host_path=settings.skills_dir,
             mount_point="/skills",
-            mode=_mount_mode_env("LOCALAGENT_SKILLS_MODE", "rw"),
+            mode=settings.skills_mode,
             write_approval=True,
         ),
     ]
@@ -62,7 +60,13 @@ FS_WRITE_TOOLS = {
 
 
 def _fs_write_path(tool_name: str, tool_args: dict[str, Any]) -> str | None:
-    if tool_name in {"write_file", "edit_file", "search_and_replace", "make_directory", "delete_file"}:
+    if tool_name in {
+        "write_file",
+        "edit_file",
+        "search_and_replace",
+        "make_directory",
+        "delete_file",
+    }:
         return tool_args.get("path")
     if tool_name == "move_file":
         return tool_args.get("destination") or tool_args.get("source")
@@ -97,7 +101,9 @@ fs_toolset = ApprovalRequiredToolset(
 )
 
 index = build_index(validator=validator, skills_root="/skills")
-skills_prompt, load_skill = make_skills(index, validator=validator, skills_root="/skills")
+skills_prompt, load_skill = make_skills(
+    index, validator=validator, skills_root="/skills"
+)
 
 
 def refresh_skills() -> str:
@@ -106,7 +112,8 @@ def refresh_skills() -> str:
     prompt, _ = make_skills(index, validator=validator, skills_root="/skills")
     return prompt
 
-MCP_URL = os.getenv("LOCALAGENT_MCP_URL", "http://localhost:8000/sse")
+
+MCP_URL = settings.mcp_url
 
 web_toolset = make_web_toolset(
     mcp_url=MCP_URL,
@@ -122,6 +129,7 @@ rag_validator = validator.derive(
 rag_toolset = make_rag_toolset(
     doc_validator=rag_validator,
 )
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%A, %d %B %Y, %H:%M UTC")

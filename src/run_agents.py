@@ -14,7 +14,6 @@ Features
 import argparse
 import asyncio
 import json
-import os
 import re
 import shutil
 import sys
@@ -28,10 +27,7 @@ from pydantic import TypeAdapter
 from pydantic_ai.messages import ModelMessage, ModelRequest
 from pydantic_ai.usage import UsageLimits
 
-from localagent_env import load_dotenv
-
-load_dotenv()
-
+from localagent_settings import get_runtime_settings
 from rag import rag_service
 from agents.orchestrator_agent import OrchestratorResponse, run_orchestrator_turn
 from agents.observability import (
@@ -42,29 +38,16 @@ from agents.observability import (
     _is_synthetic_output_tool,
     log_event,
 )
-from agents.runtime.query_policy import extract_arxiv_ids, extract_urls
-from agents.runtime.reports import REPORT_ROOT, load_agent_reports, set_report_dir
+from agents.runtime.reports import REPORT_ROOT, set_report_dir
 from agents.runtime.skills_context import scan_skills_context
+from agents.runtime.memory import (
+    apply_memory_findings,
+    default_memory_dir,
+    load_user_memory_context,
+)
 from speech.stream_tts import StreamingTTSConfig, StreamingTTSPlayer
 
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
-_PATH_OR_FILENAME_RE = re.compile(
-    r"(?<!\S)/(?:docs|skills)(?:/[A-Za-z0-9._~@%+=:,/-]*)?"
-    r"|(?<![/\w.-])[A-Za-z0-9._-]+\."
-    r"(?:cfg|csv|gif|html|ini|jpe?g|json|lock|log|md|pdf|png|py|rst|toml|txt|webp|xml|ya?ml)(?![/\w.-])",
-    re.IGNORECASE,
-)
-_FS_ACTION_RE = re.compile(
-    r"\b(?:read|open|edit|write|update|list|summari[sz]e|review|inspect|search|find)\b"
-    r".{0,60}\b(?:local file|files?|repo|repository|codebase|skills?)\b"
-    r"|\b(?:local docs?|local documentation|skill paths?)\b",
-    re.IGNORECASE,
-)
-_WEB_ACTION_RE = re.compile(
-    r"\b(?:search|browse|crawl|fetch|look up|lookup)\b.{0,60}\b(?:web|internet|online|url|website)\b"
-    r"|\b(?:web search|internet search|latest|current|today|recent|news|up[- ]?to[- ]?date|arxiv|doi)\b",
-    re.IGNORECASE,
-)
 
 
 def _deserialize_messages(raw: Any) -> List[ModelMessage]:
@@ -137,43 +120,6 @@ def _summarize_messages(messages: Any) -> None:
     print(_c(f"[run summary] model_calls={model_calls} tool_calls={tool_calls}", "dim"))
 
 
-def _routing_preflight_context(user_text: str) -> str:
-    """Return short deterministic routing hints for the orchestrator."""
-    reasons: list[str] = []
-    has_url = bool(extract_urls(user_text))
-    has_arxiv = bool(extract_arxiv_ids(user_text))
-    web_signal = has_url or has_arxiv or bool(_WEB_ACTION_RE.search(user_text))
-    fs_signal = bool(_PATH_OR_FILENAME_RE.search(user_text)) or bool(
-        _FS_ACTION_RE.search(user_text)
-    )
-
-    if has_url:
-        reasons.append("URL present")
-    if has_arxiv:
-        reasons.append("arXiv identifier/reference present")
-    if web_signal and not (has_url or has_arxiv):
-        reasons.append("web/current-information wording present")
-    if fs_signal:
-        reasons.append("local file/docs/skills wording or path present")
-
-    if web_signal and fs_signal:
-        route = "plan"
-    elif web_signal:
-        route = "web"
-    elif fs_signal:
-        route = "fs"
-    else:
-        route = "none"
-        reasons.append("no strong retrieval signal")
-
-    return (
-        "Deterministic routing preflight:\n"
-        f"- Strong route hint: {route}\n"
-        f"- Reason: {'; '.join(reasons)}\n"
-        "- If this is a conceptual question about the system, prompts, tools, or logs, prefer direct."
-    )
-
-
 CHAT_HISTORY_DIR = Path("./chat_history/chats")
 EXIT_COMMANDS = {"exit", "quit", "q", ":q"}
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
@@ -193,6 +139,7 @@ class ChatSession:
     session_title: Optional[str] = None
     history_path: Optional[Path] = None
     report_dir: Optional[Path] = None
+    memory_dir: Optional[Path] = field(default_factory=default_memory_dir)
 
 
 def _slugify(title: str) -> str:
@@ -215,10 +162,17 @@ def _resolve_history_path(slug: str) -> Path:
 
 
 def _reset_report_dir(report_dir: Path) -> None:
-    """Start each fresh CLI session with report memory from this run only."""
+    """Start one user turn with report memory from this run only."""
     if report_dir.exists():
         shutil.rmtree(report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _reset_turn_report_dir(session: ChatSession) -> None:
+    """Clear specialist reports so each user turn starts from scratch."""
+    if session.report_dir is None:
+        return
+    _reset_report_dir(session.report_dir)
 
 
 def _init_session_paths_from_user_text(session: ChatSession, user_text: str) -> None:
@@ -231,7 +185,6 @@ def _init_session_paths_from_user_text(session: ChatSession, user_text: str) -> 
     session.history_path = _resolve_history_path(slug)
     session.session_title = session.history_path.stem
     session.report_dir = REPORT_ROOT / session.session_title
-    _reset_report_dir(session.report_dir)
 
 
 def _save_history(session: ChatSession) -> None:
@@ -242,6 +195,7 @@ def _save_history(session: ChatSession) -> None:
         payload = {
             "session_title": session.session_title,
             "report_dir": str(session.report_dir) if session.report_dir else None,
+            "memory_dir": str(session.memory_dir) if session.memory_dir else None,
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "messages": _MSG_ADAPTER.dump_python(session.message_history, mode="json"),
         }
@@ -314,22 +268,22 @@ async def run_turn(
     without scraping stdout.
     """
     _init_session_paths_from_user_text(session, user_text)
+    _reset_turn_report_dir(session)
     set_report_dir(session.report_dir)
-    report_context = load_agent_reports(session.report_dir)
     skills_context = scan_skills_context()
-    prompt_sections = [
-        _routing_preflight_context(user_text),
-        f"Current skill scan:\n{skills_context}",
-    ]
-    if report_context:
-        prompt_sections.append(
-            f"Session agent reports from previous tool runs:\n{report_context}"
-        )
+    memory_context = (
+        load_user_memory_context(session.memory_dir)
+        if not session.message_history
+        else ""
+    )
+    prompt_sections = []
+    prompt_sections.append(f"Current skill scan:\n{skills_context}")
     prompt_sections.append(f"User request:\n{user_text}")
     prompt = "\n\n".join(prompt_sections)
 
     start = time.time()
     turn_id = f"{session.session_title}:{time.time_ns()}"
+    runtime_settings = get_runtime_settings()
     trace_token, trace_events = start_trace_collection(trace_sink)
     try:
         result = await run_orchestrator_turn(
@@ -339,14 +293,18 @@ async def run_turn(
             message_history=session.message_history,
             usage_limits=UsageLimits(tool_calls_limit=10),
             metadata={"turn_id": turn_id},
+            memory_context=memory_context,
+            use_xml=runtime_settings.orchestrator_use_xml,
         )
     finally:
         stop_trace_collection(trace_token)
     response: OrchestratorResponse = result.output
+    if response.session_title:
+        session.session_title = response.session_title
     session.message_history = result.all_messages()
     duration = time.time() - start
 
-    if debug or os.getenv("LOCALAGENT_LOG_LEVEL", "").strip().lower() in {
+    if debug or runtime_settings.log_level.strip().lower() in {
         "debug",
         "trace",
         "verbose",
@@ -356,6 +314,11 @@ async def run_turn(
     if debug:
         _debug_messages(result.all_messages(), label="orchestrator")
         _summarize_messages(result.all_messages())
+
+    try:
+        apply_memory_findings(session.memory_dir, result.decision.memory_findings)
+    except Exception as exc:
+        log_event(f"memory update skipped: {exc}")
 
     # Show logs for any workers that ran during this turn. We identify them
     # by recency — logs added since the previous turn are the current ones.

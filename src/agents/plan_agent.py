@@ -31,6 +31,8 @@ from tools.filesystem.text_ops import read_text_with_policy
 MAX_TASKS_PER_PLAN = 5
 MAX_ITERATIONS = 2
 MAX_PLAN_PREVIEW_CHARS = 4000
+MAX_HANDOFF_ITEMS = 5
+MAX_HANDOFF_ITEM_CHARS = 180
 
 
 class PlanOutput(BaseModel):
@@ -52,8 +54,8 @@ You are a planning agent.
 
 You receive a research objective, resolved file paths, and optional file
 previews. Return PlanOutput directly. Do not perform retrieval while planning;
-workers retrieve evidence deterministically from TaskSpec after your plan is
-normalized.
+workers delegate normalized TaskSpecs to fs_agent or web_agent after your plan
+is normalized.
 
 Available skills:
 {skills_prompt}
@@ -67,7 +69,7 @@ Rule 1 — Web/real-time objectives ALWAYS need tasks.
     → Generate tasks with explicit search queries or URLs
     → Set requires_current_info=true when current/recent information is needed
     → Never short-circuit with initial_answer
-  Search guard will review and repair web query freshness before execution.
+  web_agent will choose and execute the concrete query or crawl target.
 
 Rule 2 — File objectives: preview first, then decide honestly.
   Use the provided file previews.
@@ -102,12 +104,14 @@ Bad task examples:
 === OUTPUT RULES ===
 
 - Max {MAX_TASKS_PER_PLAN} tasks
+- If the user prompt includes a stricter execution budget, obey the stricter
+  task and iteration budget.
 - Assign relevant_files per task using the resolved paths provided
 - Use kind=local_rag for local file tasks
 - Use kind=web_search for current or web lookup tasks
 - Use kind=url_crawl for user-provided URLs
 - Use kind=arxiv for arXiv paper lookup
-- Workers execute retrieval deterministically from TaskSpec — inject query, URLs, and files clearly
+- Workers execute via fs_agent or web_agent from TaskSpec — inject query, URLs, and files clearly
 """
 
 
@@ -162,6 +166,91 @@ def _state_summary(state: SessionState) -> str:
         f"Uncertainties: {state.uncertainties[:3]}\n"
         f"Suggested next steps: {state.suggested_next_steps[:3]}\n"
         f"Confidence: {state.confidence}"
+    )
+
+
+def _brief_handoff_text(text: str, limit: int = MAX_HANDOFF_ITEM_CHARS) -> str:
+    """Compact one ledger item for the orchestrator handoff."""
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _brief_handoff_items(
+    items: list[str],
+    *,
+    limit: int = MAX_HANDOFF_ITEMS,
+) -> list[str]:
+    shown = [_brief_handoff_text(item) for item in items[:limit]]
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        shown.append(f"... {remaining} more")
+    return shown
+
+
+def _task_ledger_items(tasks: list[TaskSpec]) -> list[str]:
+    entries = []
+    for task in tasks:
+        kind = task.kind.value if task.kind is not None else "unknown"
+        entries.append(f"{kind}: {_brief_handoff_text(task.objective)}")
+    return _brief_handoff_items(entries)
+
+
+def _completion_status(
+    *,
+    state: SessionState,
+    planned_tasks: list[TaskSpec],
+    pending_tasks: list[str],
+) -> str:
+    failed_tasks = [
+        note for note in state.uncertainties if note.startswith("Worker failed for:")
+    ]
+    if not state.findings:
+        return "failed-no-findings"
+    if pending_tasks:
+        return "partial-pending-tasks"
+    if failed_tasks:
+        return "partial-failed-tasks"
+    if state.uncertainties:
+        return "complete-with-uncertainties"
+    if not planned_tasks:
+        return "complete-from-preview"
+    return "complete"
+
+
+def _format_plan_handoff(
+    *,
+    answer: str,
+    state: SessionState,
+    planned_tasks: list[TaskSpec],
+    as_of: str,
+    time_sensitive: bool,
+) -> str:
+    """Return a compact final handoff for the orchestrator answer pass."""
+    completed = set(state.completed_tasks)
+    pending_tasks = [
+        task.objective for task in planned_tasks if task.objective not in completed
+    ]
+    notes = [
+        f"Execution status: {_completion_status(state=state, planned_tasks=planned_tasks, pending_tasks=pending_tasks)}",
+        f"As of: {as_of}",
+        f"Time sensitive: {time_sensitive}",
+        f"Tasks planned: {len(planned_tasks)}; completed: {len(state.completed_tasks)}",
+        "Planned task ledger: "
+        + (" | ".join(_task_ledger_items(planned_tasks)) or "none"),
+        "Pending tasks: " + (" | ".join(_brief_handoff_items(pending_tasks)) or "none"),
+        f"Findings available: {len(state.findings)}",
+        "Open uncertainties: "
+        + (" | ".join(_brief_handoff_items(state.uncertainties, limit=3)) or "none"),
+        "Sources: " + (" | ".join(_brief_handoff_items(state.sources)) or "none"),
+        "Use the forwardable answer as the response draft; use this ledger only to catch missing coverage or uncertainty.",
+    ]
+    return "\n\n".join(
+        [
+            "Forwardable answer:\n" + answer.strip(),
+            "Orchestrator notes:\n" + "\n".join(f"- {note}" for note in notes),
+        ]
     )
 
 
@@ -274,12 +363,14 @@ class PlanNormalizer:
     matched_files: list[str]
     as_of: str
     resolver: PlanFileResolver
+    max_tasks: int = MAX_TASKS_PER_PLAN
     objective_urls: list[str] = dataclass_field(init=False)
     objective_arxiv_ids: list[str] = dataclass_field(init=False)
     objective_files: list[str] = dataclass_field(init=False)
 
     def __post_init__(self) -> None:
         """Resolve objective-level structural signals once."""
+        self.max_tasks = max(1, min(self.max_tasks, MAX_TASKS_PER_PLAN))
         self.objective_urls = extract_urls(self.objective)
         self.objective_arxiv_ids = extract_arxiv_ids(self.objective)
         self.objective_files = self.resolver.resolve(
@@ -297,18 +388,18 @@ class PlanNormalizer:
 
         planner_tasks = [
             task
-            for raw_task in plan_output.tasks[:MAX_TASKS_PER_PLAN]
+            for raw_task in plan_output.tasks[: self.max_tasks]
             if (task := self._normalize_task(raw_task)) is not None
         ]
         required_tasks = self._required_tasks(planner_tasks)
-        open_slots = max(0, MAX_TASKS_PER_PLAN - len(required_tasks))
+        open_slots = max(0, self.max_tasks - len(required_tasks))
         tasks = [*required_tasks, *planner_tasks[:open_slots]]
 
         if not tasks:
             fallback_task = self._fallback_task()
             if fallback_task is not None:
                 tasks.append(fallback_task)
-        return plan_output.model_copy(update={"tasks": tasks[:MAX_TASKS_PER_PLAN]})
+        return plan_output.model_copy(update={"tasks": tasks[: self.max_tasks]})
 
     def _normalize_task(self, raw_task: TaskSpec) -> TaskSpec | None:
         """Resolve files and fill TaskSpec defaults for one task."""
@@ -432,6 +523,7 @@ def _normalize_plan(
     objective: str,
     matched_files: list[str],
     as_of: str,
+    max_tasks: int = MAX_TASKS_PER_PLAN,
 ) -> PlanOutput:
     """Repair planner omissions that small local models commonly make."""
     return PlanNormalizer(
@@ -439,6 +531,7 @@ def _normalize_plan(
         matched_files=matched_files,
         as_of=as_of,
         resolver=PlanFileResolver.from_validator(),
+        max_tasks=max_tasks,
     ).normalize(plan_output)
 
 
@@ -478,9 +571,18 @@ class PlannerInput:
     file_paths: list[str]
     file_context: str
     resolver: PlanFileResolver
+    max_tasks: int = MAX_TASKS_PER_PLAN
+    max_iterations: int = MAX_ITERATIONS
 
     @classmethod
-    def build(cls, objective: str, matched_files: list[str]) -> "PlannerInput":
+    def build(
+        cls,
+        objective: str,
+        matched_files: list[str],
+        *,
+        max_tasks: int = MAX_TASKS_PER_PLAN,
+        max_iterations: int = MAX_ITERATIONS,
+    ) -> "PlannerInput":
         """Resolve known local context before planner tool calls."""
         resolver = PlanFileResolver.from_validator()
         objective_files = resolver.resolve(objective, matched_files=matched_files)
@@ -491,12 +593,16 @@ class PlannerInput:
             file_paths=file_paths,
             file_context=resolver.preview(file_paths),
             resolver=resolver,
+            max_tasks=max_tasks,
+            max_iterations=max_iterations,
         )
 
     def render_prompt(self) -> str:
         """Render the model prompt for plan_agent."""
         return (
             f"Objective: {self.objective}\n"
+            f"Execution budget: at most {self.max_tasks} task(s), "
+            f"{self.max_iterations} research iteration(s). Keep the plan as small as the objective allows.\n"
             f"Resolved file paths: {self.file_paths or 'none'}\n"
             f"File previews:\n{self.file_context}"
         )
@@ -551,17 +657,21 @@ async def _run_research_loop(
     as_of: str,
     state: SessionState,
     tasks: list[TaskSpec],
+    max_tasks: int = MAX_TASKS_PER_PLAN,
+    max_iterations: int = MAX_ITERATIONS,
 ) -> bool:
     """Run worker batches and optional reflection until evidence is sufficient."""
+    max_tasks = max(1, min(max_tasks, MAX_TASKS_PER_PLAN))
+    max_iterations = max(1, min(max_iterations, MAX_ITERATIONS))
     used_current_info = False
     state_plan = _limit_tasks(
         tasks,
         state.completed_tasks,
-        MAX_TASKS_PER_PLAN,
+        max_tasks,
     )
     _rt(f"[plan_agent] spawning {len(state_plan)} tasks", "yellow")
 
-    for iteration in range(MAX_ITERATIONS):
+    for iteration in range(max_iterations):
         if not state_plan:
             break
         batch = state_plan[:MAX_PARALLEL_TASKS]
@@ -612,7 +722,7 @@ async def _run_research_loop(
                 "yellow",
             )
 
-        if iteration + 1 >= MAX_ITERATIONS:
+        if iteration + 1 >= max_iterations:
             _record_reflection_uncertainty(
                 state,
                 confidence=reflect.confidence,
@@ -635,11 +745,12 @@ async def _run_research_loop(
             objective=objective,
             matched_files=matched_files,
             as_of=as_of,
+            max_tasks=max_tasks,
         )
         state_plan = _limit_tasks(
             follow_up.tasks,
             state.completed_tasks,
-            MAX_TASKS_PER_PLAN,
+            max_tasks,
         )
         if not state_plan:
             _record_reflection_uncertainty(
@@ -668,20 +779,34 @@ def _failed_research_report(state: SessionState) -> str:
     )
 
 
-async def _run_plan_workflow_internal(objective: str, matched_files: list[str]) -> str:
+async def _run_plan_workflow_internal(
+    objective: str,
+    matched_files: list[str],
+    *,
+    max_tasks: int = MAX_TASKS_PER_PLAN,
+    max_iterations: int = MAX_ITERATIONS,
+) -> str:
     """Execute a complex research task with planning, workers, and synthesis."""
+    max_tasks = max(1, min(max_tasks, MAX_TASKS_PER_PLAN))
+    max_iterations = max(1, min(max_iterations, MAX_ITERATIONS))
     _rt(f"[plan_workflow] objective: {objective[:80]}", "yellow")
     state = SessionState(user_query=objective)
     as_of = _now()
 
     _rt("[plan_agent] running ...", "dim")
-    planner_input = PlannerInput.build(objective, matched_files)
+    planner_input = PlannerInput.build(
+        objective,
+        matched_files,
+        max_tasks=max_tasks,
+        max_iterations=max_iterations,
+    )
     raw_plan = await _run_planner(planner_input.render_prompt())
     plan_output = PlanNormalizer(
         objective=objective,
         matched_files=matched_files,
         as_of=as_of,
         resolver=planner_input.resolver,
+        max_tasks=max_tasks,
     ).normalize(raw_plan)
 
     time_sensitive = any(task.requires_current_info for task in plan_output.tasks)
@@ -693,7 +818,13 @@ async def _run_plan_workflow_internal(objective: str, matched_files: list[str]) 
         time_sensitive=time_sensitive,
     )
     if initial_report is not None:
-        return initial_report
+        return _format_plan_handoff(
+            answer=initial_report,
+            state=state,
+            planned_tasks=plan_output.tasks,
+            as_of=as_of,
+            time_sensitive=time_sensitive,
+        )
 
     loop_time_sensitive = await _run_research_loop(
         objective=objective,
@@ -701,12 +832,20 @@ async def _run_plan_workflow_internal(objective: str, matched_files: list[str]) 
         as_of=as_of,
         state=state,
         tasks=plan_output.tasks,
+        max_tasks=max_tasks,
+        max_iterations=max_iterations,
     )
     time_sensitive = time_sensitive or loop_time_sensitive
 
     if not state.findings:
         _rt("[synthesis] skipped — no findings collected", "yellow")
-        return _failed_research_report(state)
+        return _format_plan_handoff(
+            answer=_failed_research_report(state),
+            state=state,
+            planned_tasks=plan_output.tasks,
+            as_of=as_of,
+            time_sensitive=time_sensitive,
+        )
 
     _rt("[synthesis] generating final report ...", "dim")
     report = await run_synthesis_worker(
@@ -718,10 +857,21 @@ async def _run_plan_workflow_internal(objective: str, matched_files: list[str]) 
         sources=state.sources,
     )
     _rt("[synthesis] done", "green")
-    return report
+    return _format_plan_handoff(
+        answer=report,
+        state=state,
+        planned_tasks=plan_output.tasks,
+        as_of=as_of,
+        time_sensitive=time_sensitive,
+    )
 
 
-async def run_plan_workflow(objective: str) -> str:
+async def run_plan_workflow(
+    objective: str,
+    *,
+    max_tasks: int = MAX_TASKS_PER_PLAN,
+    max_iterations: int = MAX_ITERATIONS,
+) -> str:
     """Run the complex-task planning workflow and write plan-report.md."""
     report_memory = load_agent_report_summaries(current_report_dir())
     workflow_objective = objective
@@ -732,7 +882,10 @@ async def run_plan_workflow(objective: str) -> str:
             f"Objective: {objective}"
         )
     report = await _run_plan_workflow_internal(
-        objective=workflow_objective, matched_files=[]
+        objective=workflow_objective,
+        matched_files=[],
+        max_tasks=max_tasks,
+        max_iterations=max_iterations,
     )
     write_agent_report(
         "plan",

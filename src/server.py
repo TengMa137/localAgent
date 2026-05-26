@@ -13,16 +13,26 @@ from typing import Any, Iterator
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from pydantic_ai.messages import ModelRequest as ModelRequest, ModelResponse as ModelResponse, TextPart as TextPart
-
-from localagent_env import load_dotenv
-
-load_dotenv()
+from pydantic_ai.messages import (
+    ModelRequest as ModelRequest,
+    ModelResponse as ModelResponse,
+    TextPart as TextPart,
+)
 
 from run_agents import ChatSession, run_turn
 from speech.qwen3 import Qwen3ASRProvider
@@ -153,7 +163,9 @@ def _client_key(request: Request, username: str) -> str:
 def _check_login_rate(request: Request, username: str) -> None:
     key = _client_key(request, username)
     now = time.time()
-    window = [ts for ts in _login_attempts.get(key, []) if now - ts < LOGIN_WINDOW_SECONDS]
+    window = [
+        ts for ts in _login_attempts.get(key, []) if now - ts < LOGIN_WINDOW_SECONDS
+    ]
     if len(window) >= LOGIN_MAX_ATTEMPTS:
         raise HTTPException(status_code=429, detail="Too many login attempts.")
     _login_attempts[key] = window
@@ -262,18 +274,34 @@ def _init_db() -> None:
             );
             """
         )
-        session_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chat_sessions)").fetchall()}
+        session_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(chat_sessions)").fetchall()
+        }
         if "active_branch_id" not in session_columns:
-            conn.execute("ALTER TABLE chat_sessions ADD COLUMN active_branch_id TEXT NOT NULL DEFAULT 'main'")
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()}
+            conn.execute(
+                "ALTER TABLE chat_sessions ADD COLUMN active_branch_id TEXT NOT NULL DEFAULT 'main'"
+            )
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()
+        }
         if "metadata_json" not in columns:
-            conn.execute("ALTER TABLE chat_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+            conn.execute(
+                "ALTER TABLE chat_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
         if "branch_id" not in columns:
-            conn.execute("ALTER TABLE chat_messages ADD COLUMN branch_id TEXT NOT NULL DEFAULT 'main'")
+            conn.execute(
+                "ALTER TABLE chat_messages ADD COLUMN branch_id TEXT NOT NULL DEFAULT 'main'"
+            )
         if "fork_parent_id" not in columns:
-            conn.execute("ALTER TABLE chat_messages ADD COLUMN fork_parent_id INTEGER REFERENCES chat_messages(id) ON DELETE SET NULL")
+            conn.execute(
+                "ALTER TABLE chat_messages ADD COLUMN fork_parent_id INTEGER REFERENCES chat_messages(id) ON DELETE SET NULL"
+            )
         if "variant_number" not in columns:
-            conn.execute("ALTER TABLE chat_messages ADD COLUMN variant_number INTEGER NOT NULL DEFAULT 1")
+            conn.execute(
+                "ALTER TABLE chat_messages ADD COLUMN variant_number INTEGER NOT NULL DEFAULT 1"
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO chat_branches (
@@ -298,7 +326,12 @@ def _init_db() -> None:
                 )
 
 
-def _audit(conn: sqlite3.Connection, user_id: int | None, event_type: str, details: dict[str, Any] | None = None) -> None:
+def _audit(
+    conn: sqlite3.Connection,
+    user_id: int | None,
+    event_type: str,
+    details: dict[str, Any] | None = None,
+) -> None:
     conn.execute(
         "INSERT INTO audit_events (user_id, event_type, details_json, created_at) VALUES (?, ?, ?, ?)",
         (user_id, event_type, json_dumps(details or {}), utc_now()),
@@ -355,7 +388,9 @@ def _revoke_user_sessions(conn: sqlite3.Connection, user_id: int) -> None:
 def _get_current_user(request: Request) -> sqlite3.Row:
     token = request.cookies.get(SESSION_COOKIE, "")
     if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated."
+        )
     now = int(time.time())
     with db() as conn:
         row = conn.execute(
@@ -370,7 +405,9 @@ def _get_current_user(request: Request) -> sqlite3.Row:
         if not row or row["expires_at"] < now or not row["is_active"]:
             if row:
                 conn.execute("DELETE FROM web_sessions WHERE token = ?", (token,))
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated."
+            )
         return row
 
 
@@ -390,7 +427,9 @@ def require_admin(user: sqlite3.Row = Depends(current_user)) -> sqlite3.Row:
     return user
 
 
-def _load_chat_for_user(conn: sqlite3.Connection, session_id: str, user_id: int) -> sqlite3.Row:
+def _load_chat_for_user(
+    conn: sqlite3.Connection, session_id: str, user_id: int
+) -> sqlite3.Row:
     row = conn.execute(
         "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ? AND archived_at IS NULL",
         (session_id, user_id),
@@ -410,14 +449,21 @@ def _chat_session_for_agent(
     history_dir = STATE_DIR / "history" / str(user_id)
     report_dir = STATE_DIR / "reports" / str(user_id) / row["id"] / branch_id
     return ChatSession(
-        message_history=messages_from_json(model_messages_json if model_messages_json is not None else row["model_messages_json"]),
+        message_history=messages_from_json(
+            model_messages_json
+            if model_messages_json is not None
+            else row["model_messages_json"]
+        ),
         session_title=row["title"],
         history_path=history_dir / f"{row['id']}-{branch_id}.json",
         report_dir=report_dir,
+        memory_dir=STATE_DIR / "memory" / str(user_id),
     )
 
 
-def _load_chat_file_for_user(conn: sqlite3.Connection, file_id: int, session_id: str, user_id: int) -> sqlite3.Row:
+def _load_chat_file_for_user(
+    conn: sqlite3.Connection, file_id: int, session_id: str, user_id: int
+) -> sqlite3.Row:
     row = conn.execute(
         """
         SELECT *
@@ -432,8 +478,12 @@ def _load_chat_file_for_user(conn: sqlite3.Connection, file_id: int, session_id:
 
 
 def _list_session_reports(session: sqlite3.Row, user_id: int) -> list[dict[str, Any]]:
-    branch_id = session["active_branch_id"] if row_has(session, "active_branch_id") else "main"
-    report_dir = _chat_session_for_agent(session, user_id, branch_id=branch_id).report_dir
+    branch_id = (
+        session["active_branch_id"] if row_has(session, "active_branch_id") else "main"
+    )
+    report_dir = _chat_session_for_agent(
+        session, user_id, branch_id=branch_id
+    ).report_dir
     if report_dir is None or not report_dir.exists():
         return []
     reports: list[dict[str, Any]] = []
@@ -443,7 +493,9 @@ def _list_session_reports(session: sqlite3.Row, user_id: int) -> list[dict[str, 
             {
                 "name": path.name,
                 "size_bytes": stat.st_size,
-                "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                "updated_at": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).isoformat(),
             }
         )
     return reports
@@ -453,8 +505,12 @@ def _session_report_path(session: sqlite3.Row, user_id: int, report_name: str) -
     name = Path(report_name).name
     if name != report_name or not name.endswith("-report.md"):
         raise HTTPException(status_code=404, detail="Report not found.")
-    branch_id = session["active_branch_id"] if row_has(session, "active_branch_id") else "main"
-    report_dir = _chat_session_for_agent(session, user_id, branch_id=branch_id).report_dir
+    branch_id = (
+        session["active_branch_id"] if row_has(session, "active_branch_id") else "main"
+    )
+    report_dir = _chat_session_for_agent(
+        session, user_id, branch_id=branch_id
+    ).report_dir
     if report_dir is None:
         raise HTTPException(status_code=404, detail="Report not found.")
     path = (report_dir / name).resolve()
@@ -462,6 +518,33 @@ def _session_report_path(session: sqlite3.Row, user_id: int, report_name: str) -
     if not path.is_file() or not path.is_relative_to(root):
         raise HTTPException(status_code=404, detail="Report not found.")
     return path
+
+
+def _empty_new_chat_for_user(
+    conn: sqlite3.Connection,
+    user_id: int,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT s.id, s.title, s.active_branch_id, s.created_at, s.updated_at,
+               COUNT(DISTINCT m.id) AS message_count,
+               COUNT(DISTINCT f.id) AS file_count,
+               1 AS is_empty
+        FROM chat_sessions s
+        LEFT JOIN chat_messages m
+          ON m.session_id = s.id AND m.user_id = s.user_id
+        LEFT JOIN chat_files f
+          ON f.session_id = s.id AND f.user_id = s.user_id
+        WHERE s.user_id = ?
+          AND s.archived_at IS NULL
+          AND s.title = 'New chat'
+        GROUP BY s.id
+        HAVING message_count = 0 AND file_count = 0
+        ORDER BY s.updated_at DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    ).fetchone()
 
 
 @app.get("/health")
@@ -488,7 +571,9 @@ def register(body: RegisterRequest, response: Response) -> dict[str, Any]:
                 status_code=409,
                 detail="Admin account is not initialized. Set LOCALAGENT_ADMIN_USERNAME and LOCALAGENT_ADMIN_PASSWORD on the backend.",
             )
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (sqlite_lastrowid(cur),)).fetchone()
+        user = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (sqlite_lastrowid(cur),)
+        ).fetchone()
         token, csrf_token = _create_web_session(conn, user_id=user["id"])
         _audit(conn, user["id"], "register_user", {})
         _set_session_cookies(response, token, csrf_token)
@@ -505,16 +590,29 @@ def login(body: LoginRequest, request: Request, response: Response) -> dict[str,
         ).fetchone()
         if not user or not user["is_active"]:
             _record_login_failure(request, body.username)
-            _audit(conn, None, "login_failed", {"username": body.username.strip(), "reason": "unknown_user"})
+            _audit(
+                conn,
+                None,
+                "login_failed",
+                {"username": body.username.strip(), "reason": "unknown_user"},
+            )
             raise HTTPException(status_code=401, detail="Invalid username or password.")
         try:
             ph.verify(user["password_hash"], body.password)
         except VerifyMismatchError:
             _record_login_failure(request, body.username)
-            _audit(conn, user["id"], "login_failed", {"username": user["username"], "reason": "bad_password"})
+            _audit(
+                conn,
+                user["id"],
+                "login_failed",
+                {"username": user["username"], "reason": "bad_password"},
+            )
             raise HTTPException(status_code=401, detail="Invalid username or password.")
         if ph.check_needs_rehash(user["password_hash"]):
-            conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (ph.hash(body.password), user["id"]))
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (ph.hash(body.password), user["id"]),
+            )
         token, csrf_token = _create_web_session(conn, user_id=user["id"])
         _audit(conn, user["id"], "login_success", {})
         _clear_login_failures(request, body.username)
@@ -523,7 +621,9 @@ def login(body: LoginRequest, request: Request, response: Response) -> dict[str,
 
 
 @app.post("/api/auth/logout")
-def logout(request: Request, response: Response, user: sqlite3.Row = Depends(current_user)) -> dict[str, bool]:
+def logout(
+    request: Request, response: Response, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, bool]:
     token = request.cookies.get(SESSION_COOKIE, "")
     with db() as conn:
         if token:
@@ -552,7 +652,9 @@ async def transcribe_speech(
 
     mime_type = _normalized_mime_type(file.content_type, DEFAULT_VOICE_MIME_TYPE)
     if not (mime_type.startswith("audio/") or mime_type == "application/octet-stream"):
-        raise HTTPException(status_code=415, detail="Voice recording must be an audio file.")
+        raise HTTPException(
+            status_code=415, detail="Voice recording must be an audio file."
+        )
 
     filename = _audio_upload_filename(file.filename, mime_type)
     provider = Qwen3ASRProvider()
@@ -566,7 +668,9 @@ async def transcribe_speech(
             language=request_language,
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Speech transcription failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Speech transcription failed: {exc}"
+        ) from exc
 
     return {
         "text": result.text,
@@ -586,7 +690,10 @@ def change_my_password(
     except VerifyMismatchError:
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
     with db() as conn:
-        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (ph.hash(body.new_password), user["id"]))
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (ph.hash(body.new_password), user["id"]),
+        )
         _revoke_user_sessions(conn, user["id"])
         _audit(conn, user["id"], "change_own_password", {})
     _clear_session_cookies(response)
@@ -601,7 +708,9 @@ def list_users(user: sqlite3.Row = Depends(require_admin)) -> dict[str, Any]:
 
 
 @app.post("/api/admin/users")
-def create_user(body: CreateUserRequest, admin: sqlite3.Row = Depends(require_admin)) -> dict[str, Any]:
+def create_user(
+    body: CreateUserRequest, admin: sqlite3.Row = Depends(require_admin)
+) -> dict[str, Any]:
     with db() as conn:
         try:
             cur = conn.execute(
@@ -613,8 +722,15 @@ def create_user(body: CreateUserRequest, admin: sqlite3.Row = Depends(require_ad
             )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409, detail="Username already exists.")
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (sqlite_lastrowid(cur),)).fetchone()
-        _audit(conn, admin["id"], "admin_create_user", {"target_user_id": row["id"], "role": row["role"]})
+        row = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (sqlite_lastrowid(cur),)
+        ).fetchone()
+        _audit(
+            conn,
+            admin["id"],
+            "admin_create_user",
+            {"target_user_id": row["id"], "role": row["role"]},
+        )
         return {"user": public_user(row)}
 
 
@@ -632,21 +748,33 @@ def update_user(
         if body.role is not None:
             conn.execute("UPDATE users SET role = ? WHERE id = ?", (body.role, user_id))
         if body.is_active is not None:
-            conn.execute("UPDATE users SET is_active = ? WHERE id = ?", (1 if body.is_active else 0, user_id))
+            conn.execute(
+                "UPDATE users SET is_active = ? WHERE id = ?",
+                (1 if body.is_active else 0, user_id),
+            )
             if not body.is_active:
                 _revoke_user_sessions(conn, user_id)
         if body.password is not None:
-            conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (ph.hash(body.password), user_id))
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (ph.hash(body.password), user_id),
+            )
             _revoke_user_sessions(conn, user_id)
         _audit(conn, admin["id"], "admin_update_user", {"target_user_id": user_id})
-        updated = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        if user_id == admin["id"] and (body.password is not None or body.is_active is False):
+        updated = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if user_id == admin["id"] and (
+            body.password is not None or body.is_active is False
+        ):
             _clear_session_cookies(response)
         return {"user": public_user(updated)}
 
 
 @app.get("/api/admin/chat/sessions")
-def list_all_chat_sessions(admin: sqlite3.Row = Depends(require_admin)) -> dict[str, Any]:
+def list_all_chat_sessions(
+    admin: sqlite3.Row = Depends(require_admin),
+) -> dict[str, Any]:
     with db() as conn:
         rows = conn.execute(
             """
@@ -662,7 +790,9 @@ def list_all_chat_sessions(admin: sqlite3.Row = Depends(require_admin)) -> dict[
 
 
 @app.get("/api/admin/chat/sessions/{session_id}")
-def get_any_chat_session(session_id: str, admin: sqlite3.Row = Depends(require_admin)) -> dict[str, Any]:
+def get_any_chat_session(
+    session_id: str, admin: sqlite3.Row = Depends(require_admin)
+) -> dict[str, Any]:
     with db() as conn:
         session = conn.execute(
             """
@@ -679,7 +809,12 @@ def get_any_chat_session(session_id: str, admin: sqlite3.Row = Depends(require_a
             "SELECT id, role, content, metadata_json, created_at, branch_id, fork_parent_id, variant_number FROM chat_messages WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
-        _audit(conn, admin["id"], "admin_view_chat_session", {"session_id": session_id, "user_id": session["user_id"]})
+        _audit(
+            conn,
+            admin["id"],
+            "admin_view_chat_session",
+            {"session_id": session_id, "user_id": session["user_id"]},
+        )
         return {
             "session": public_chat_session(session),
             "messages": [public_message(row) for row in messages],
@@ -691,10 +826,21 @@ def list_chat_sessions(user: sqlite3.Row = Depends(current_user)) -> dict[str, A
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, active_branch_id, created_at, updated_at
-            FROM chat_sessions
-            WHERE user_id = ? AND archived_at IS NULL
-            ORDER BY updated_at DESC
+            SELECT s.id, s.title, s.active_branch_id, s.created_at, s.updated_at,
+                   COUNT(DISTINCT m.id) AS message_count,
+                   COUNT(DISTINCT f.id) AS file_count,
+                   CASE
+                     WHEN COUNT(DISTINCT m.id) = 0 AND COUNT(DISTINCT f.id) = 0
+                     THEN 1 ELSE 0
+                   END AS is_empty
+            FROM chat_sessions s
+            LEFT JOIN chat_messages m
+              ON m.session_id = s.id AND m.user_id = s.user_id
+            LEFT JOIN chat_files f
+              ON f.session_id = s.id AND f.user_id = s.user_id
+            WHERE s.user_id = ? AND s.archived_at IS NULL
+            GROUP BY s.id
+            ORDER BY s.updated_at DESC
             """,
             (user["id"],),
         ).fetchall()
@@ -702,11 +848,18 @@ def list_chat_sessions(user: sqlite3.Row = Depends(current_user)) -> dict[str, A
 
 
 @app.post("/api/chat/sessions")
-def create_chat_session(body: CreateChatRequest, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+def create_chat_session(
+    body: CreateChatRequest, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, Any]:
     session_id = secrets.token_urlsafe(16)
     title = (body.title or "New chat").strip() or "New chat"
     now = utc_now()
     with db() as conn:
+        if title == "New chat":
+            existing = _empty_new_chat_for_user(conn, user["id"])
+            if existing is not None:
+                return {"session": public_chat_session(existing), "messages": []}
+
         conn.execute(
             """
             INSERT INTO chat_sessions (id, user_id, title, model_messages_json, created_at, updated_at)
@@ -725,11 +878,25 @@ def create_chat_session(body: CreateChatRequest, user: sqlite3.Row = Depends(cur
             (session_id, user["id"], now, now),
         )
         _audit(conn, user["id"], "chat_create", {"session_id": session_id})
-    return {"session": {"id": session_id, "title": title, "active_branch_id": "main", "created_at": now, "updated_at": now}, "messages": []}
+    return {
+        "session": {
+            "id": session_id,
+            "title": title,
+            "active_branch_id": "main",
+            "created_at": now,
+            "updated_at": now,
+            "message_count": 0,
+            "file_count": 0,
+            "is_empty": True,
+        },
+        "messages": [],
+    }
 
 
 @app.get("/api/chat/sessions/{session_id}")
-def get_chat_session(session_id: str, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+def get_chat_session(
+    session_id: str, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, Any]:
     with db() as conn:
         session = _load_chat_for_user(conn, session_id, user["id"])
         mark_stale_running_messages(conn, session_id, user["id"], _agent_locks)
@@ -755,7 +922,9 @@ def get_chat_session(session_id: str, user: sqlite3.Row = Depends(current_user))
 
 
 @app.get("/api/chat/sessions/{session_id}/files")
-def list_chat_files(session_id: str, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+def list_chat_files(
+    session_id: str, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, Any]:
     with db() as conn:
         session = _load_chat_for_user(conn, session_id, user["id"])
         uploads = conn.execute(
@@ -813,13 +982,22 @@ async def upload_chat_file(
                 now,
             ),
         )
-        row = conn.execute("SELECT * FROM chat_files WHERE id = ?", (sqlite_lastrowid(cur),)).fetchone()
-        _audit(conn, user["id"], "chat_file_upload", {"session_id": session_id, "file_id": row["id"]})
+        row = conn.execute(
+            "SELECT * FROM chat_files WHERE id = ?", (sqlite_lastrowid(cur),)
+        ).fetchone()
+        _audit(
+            conn,
+            user["id"],
+            "chat_file_upload",
+            {"session_id": session_id, "file_id": row["id"]},
+        )
         return {"file": public_chat_file(row)}
 
 
 @app.get("/api/chat/sessions/{session_id}/files/{file_id}/content")
-def get_chat_file_content(session_id: str, file_id: int, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+def get_chat_file_content(
+    session_id: str, file_id: int, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, Any]:
     with db() as conn:
         _load_chat_for_user(conn, session_id, user["id"])
         row = _load_chat_file_for_user(conn, file_id, session_id, user["id"])
@@ -834,7 +1012,9 @@ def get_chat_file_content(session_id: str, file_id: int, user: sqlite3.Row = Dep
         with path.open("rb") as fh:
             sample = fh.read(4096)
     content_type = row["content_type"] or mimetypes.guess_type(row["filename"])[0]
-    is_text = size <= TEXT_PREVIEW_LIMIT and is_text_preview(row["filename"], content_type, sample)
+    is_text = size <= TEXT_PREVIEW_LIMIT and is_text_preview(
+        row["filename"], content_type, sample
+    )
     content = path.read_text(encoding="utf-8", errors="replace") if is_text else ""
     return {
         "file": public_chat_file(row),
@@ -845,19 +1025,27 @@ def get_chat_file_content(session_id: str, file_id: int, user: sqlite3.Row = Dep
 
 
 @app.get("/api/chat/sessions/{session_id}/files/{file_id}/raw")
-def get_chat_file_raw(session_id: str, file_id: int, user: sqlite3.Row = Depends(current_user)) -> FileResponse:
+def get_chat_file_raw(
+    session_id: str, file_id: int, user: sqlite3.Row = Depends(current_user)
+) -> FileResponse:
     with db() as conn:
         _load_chat_for_user(conn, session_id, user["id"])
         row = _load_chat_file_for_user(conn, file_id, session_id, user["id"])
     path = _upload_host_path(user["id"], session_id, row["stored_name"])
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
-    media_type = row["content_type"] or mimetypes.guess_type(row["filename"])[0] or "application/octet-stream"
+    media_type = (
+        row["content_type"]
+        or mimetypes.guess_type(row["filename"])[0]
+        or "application/octet-stream"
+    )
     return FileResponse(path, media_type=media_type, filename=row["filename"])
 
 
 @app.get("/api/chat/sessions/{session_id}/reports/{report_name}")
-def get_chat_report(session_id: str, report_name: str, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+def get_chat_report(
+    session_id: str, report_name: str, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, Any]:
     with db() as conn:
         session = _load_chat_for_user(conn, session_id, user["id"])
     path = _session_report_path(session, user["id"], report_name)
@@ -865,14 +1053,18 @@ def get_chat_report(session_id: str, report_name: str, user: sqlite3.Row = Depen
         "report": {
             "name": path.name,
             "size_bytes": path.stat().st_size,
-            "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+            "updated_at": datetime.fromtimestamp(
+                path.stat().st_mtime, tz=timezone.utc
+            ).isoformat(),
         },
         "content": path.read_text(encoding="utf-8", errors="replace"),
     }
 
 
 @app.patch("/api/chat/sessions/{session_id}")
-def rename_chat_session(session_id: str, body: RenameChatRequest, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+def rename_chat_session(
+    session_id: str, body: RenameChatRequest, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, Any]:
     with db() as conn:
         _load_chat_for_user(conn, session_id, user["id"])
         now = utc_now()
@@ -885,7 +1077,9 @@ def rename_chat_session(session_id: str, body: RenameChatRequest, user: sqlite3.
 
 
 @app.delete("/api/chat/sessions/{session_id}")
-def delete_chat_session(session_id: str, user: sqlite3.Row = Depends(current_user)) -> dict[str, bool]:
+def delete_chat_session(
+    session_id: str, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, bool]:
     with db() as conn:
         _load_chat_for_user(conn, session_id, user["id"])
         upload_rows = conn.execute(
@@ -893,7 +1087,10 @@ def delete_chat_session(session_id: str, user: sqlite3.Row = Depends(current_use
             (session_id, user["id"]),
         ).fetchall()
         report_dir = STATE_DIR / "reports" / str(user["id"]) / session_id
-        conn.execute("DELETE FROM chat_sessions WHERE id = ? AND user_id = ?", (session_id, user["id"]))
+        conn.execute(
+            "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
+            (session_id, user["id"]),
+        )
         _audit(conn, user["id"], "chat_delete", {"session_id": session_id})
 
     upload_dir = WEB_UPLOAD_ROOT / str(user["id"]) / session_id
@@ -905,7 +1102,9 @@ def delete_chat_session(session_id: str, user: sqlite3.Row = Depends(current_use
 
 
 @app.post("/api/chat/sessions/{session_id}/branches/{branch_id}/activate")
-def activate_chat_branch(session_id: str, branch_id: str, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+def activate_chat_branch(
+    session_id: str, branch_id: str, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, Any]:
     with db() as conn:
         session = _load_chat_for_user(conn, session_id, user["id"])
         branch = load_branch_for_user(conn, session_id, branch_id, user["id"])
@@ -919,7 +1118,12 @@ def activate_chat_branch(session_id: str, branch_id: str, user: sqlite3.Row = De
             """,
             (branch["id"], branch["model_messages_json"], now, session_id, user["id"]),
         )
-        _audit(conn, user["id"], "chat_branch_activate", {"session_id": session_id, "branch_id": branch["id"]})
+        _audit(
+            conn,
+            user["id"],
+            "chat_branch_activate",
+            {"session_id": session_id, "branch_id": branch["id"]},
+        )
         message_rows = visible_message_rows(conn, session_id, user["id"], branch["id"])
         messages = [public_message(row) for row in message_rows]
         return {
@@ -1012,7 +1216,15 @@ async def fork_chat_from_message(
             )
             VALUES (?, ?, ?, ?, ?, 'user', ?, ?)
             """,
-            (session_id, user["id"], new_branch_id, root_message_id, next_variant, body.content, now),
+            (
+                session_id,
+                user["id"],
+                new_branch_id,
+                root_message_id,
+                next_variant,
+                body.content,
+                now,
+            ),
         )
         edited_message_id = sqlite_lastrowid(cur)
         conn.execute(
@@ -1075,10 +1287,12 @@ async def _execute_chat_message(
                 )
             else:
                 user_message_id = existing_user_message_id
+            turn_title = session["title"]
             if session["title"] == "New chat":
+                turn_title = slugish(content)
                 conn.execute(
                     "UPDATE chat_sessions SET title = ? WHERE id = ? AND user_id = ?",
-                    (slugish(content), session_id, user["id"]),
+                    (turn_title, session_id, user["id"]),
                 )
             agent_session = _chat_session_for_agent(
                 session,
@@ -1086,6 +1300,7 @@ async def _execute_chat_message(
                 model_messages_json=branch["model_messages_json"],
                 branch_id=branch["id"],
             )
+            agent_session.session_title = turn_title
             uploads = session_upload_context(conn, session_id, user["id"])
             assistant_message_id = insert_assistant_placeholder(
                 conn,
@@ -1097,7 +1312,11 @@ async def _execute_chat_message(
 
         persisted_trace_events: list[dict[str, Any]] = []
 
-        def persist_assistant_message(status: str, text: str | None = None, turn_logs: list[dict[str, Any]] | None = None) -> None:
+        def persist_assistant_message(
+            status: str,
+            text: str | None = None,
+            turn_logs: list[dict[str, Any]] | None = None,
+        ) -> None:
             metadata = message_metadata(
                 status=status,
                 trace_events=persisted_trace_events,
@@ -1153,15 +1372,28 @@ async def _execute_chat_message(
                 SET content = ?, metadata_json = ?, created_at = ?
                 WHERE id = ? AND user_id = ?
                 """,
-                (assistant_text, json_dumps(metadata), now, assistant_message_id, user["id"]),
+                (
+                    assistant_text,
+                    json_dumps(metadata),
+                    now,
+                    assistant_message_id,
+                    user["id"],
+                ),
             )
             conn.execute(
                 """
                 UPDATE chat_sessions
-                SET model_messages_json = ?, active_branch_id = ?, updated_at = ?
+                SET title = ?, model_messages_json = ?, active_branch_id = ?, updated_at = ?
                 WHERE id = ? AND user_id = ?
                 """,
-                (messages_to_json(model_messages), branch["id"], now, session_id, user["id"]),
+                (
+                    agent_session.session_title or turn_title,
+                    messages_to_json(model_messages),
+                    branch["id"],
+                    now,
+                    session_id,
+                    user["id"],
+                ),
             )
             conn.execute(
                 """
@@ -1169,7 +1401,13 @@ async def _execute_chat_message(
                 SET model_messages_json = ?, updated_at = ?
                 WHERE session_id = ? AND user_id = ? AND id = ?
                 """,
-                (messages_to_json(model_messages), now, session_id, user["id"], branch["id"]),
+                (
+                    messages_to_json(model_messages),
+                    now,
+                    session_id,
+                    user["id"],
+                    branch["id"],
+                ),
             )
             _audit(conn, user["id"], "chat_message", {"session_id": session_id})
 
@@ -1185,7 +1423,7 @@ async def _execute_chat_message(
             "user_message_id": user_message_id,
             "session": {
                 "id": session_id,
-                "title": agent_session.session_title or "New chat",
+                "title": agent_session.session_title or turn_title,
                 "active_branch_id": branch["id"],
                 "updated_at": now,
             },
@@ -1193,12 +1431,16 @@ async def _execute_chat_message(
 
 
 @app.post("/api/chat/sessions/{session_id}/messages")
-async def send_message(session_id: str, body: SendMessageRequest, user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+async def send_message(
+    session_id: str, body: SendMessageRequest, user: sqlite3.Row = Depends(current_user)
+) -> dict[str, Any]:
     return await _execute_chat_message(session_id, body.content, user)
 
 
 @app.post("/api/chat/sessions/{session_id}/messages/stream")
-async def stream_message(session_id: str, body: SendMessageRequest, user: sqlite3.Row = Depends(current_user)) -> StreamingResponse:
+async def stream_message(
+    session_id: str, body: SendMessageRequest, user: sqlite3.Row = Depends(current_user)
+) -> StreamingResponse:
     async def events():
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
 
@@ -1209,7 +1451,10 @@ async def stream_message(session_id: str, body: SendMessageRequest, user: sqlite
                 pass
 
         def sink(event: dict[str, Any]) -> None:
-            if event.get("kind") == "text_delta" and event.get("label") == "orchestrator":
+            if event.get("kind") == "text_delta" and event.get("label") in {
+                "orchestrator",
+                "orchestrator:answer",
+            }:
                 enqueue({"type": "text_delta", "content": event.get("content") or ""})
                 return
             compact = compact_trace_events([event])
@@ -1218,8 +1463,12 @@ async def stream_message(session_id: str, body: SendMessageRequest, user: sqlite
 
         async def run_and_signal() -> None:
             try:
-                payload = await _execute_chat_message(session_id, body.content, user, trace_sink=sink)
-                await queue.put({"type": "replace", "content": payload["message"]["content"]})
+                payload = await _execute_chat_message(
+                    session_id, body.content, user, trace_sink=sink
+                )
+                await queue.put(
+                    {"type": "replace", "content": payload["message"]["content"]}
+                )
                 await queue.put({"type": "done", "data": payload})
             except Exception as exc:
                 await queue.put({"type": "error", "error": str(exc)})

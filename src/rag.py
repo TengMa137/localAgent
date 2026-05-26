@@ -1,11 +1,8 @@
-import os
 from typing import Any, Protocol, runtime_checkable
 
-from localagent_env import load_dotenv
+from localagent_settings import get_runtime_settings
 from rag_lib.rag import RagService
 from rag_lib.types_doc import Document
-
-load_dotenv()
 
 
 @runtime_checkable
@@ -46,5 +43,5 @@ class RagServiceProtocol(Protocol):
 
 
 rag_service: RagServiceProtocol = RagService(
-    base_url=os.getenv("LOCALAGENT_MODEL_BASE_URL", "http://localhost:8080/v1")
+    base_url=get_runtime_settings().model_base_url
 )

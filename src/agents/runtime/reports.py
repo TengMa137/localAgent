@@ -3,11 +3,14 @@ from __future__ import annotations
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
 from typing import Iterable
 
 REPORT_ROOT = Path("chat_history/reports")
 
 _report_dir: ContextVar[Path | None] = ContextVar("agent_report_dir", default=None)
+_REPORT_LOCKS_GUARD = threading.Lock()
+_REPORT_PATH_LOCKS: dict[Path, threading.RLock] = {}
 
 
 def set_report_dir(path: Path | None) -> None:
@@ -26,6 +29,20 @@ def report_path(agent_name: str) -> Path | None:
     return directory / f"{safe_name}-report.md"
 
 
+def _report_path_lock(path: Path) -> threading.RLock:
+    try:
+        key = path.expanduser().resolve()
+    except OSError:
+        key = path.expanduser().absolute()
+
+    with _REPORT_LOCKS_GUARD:
+        lock = _REPORT_PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _REPORT_PATH_LOCKS[key] = lock
+        return lock
+
+
 def write_agent_report(
     agent_name: str,
     *,
@@ -42,51 +59,52 @@ def write_agent_report(
     if path is None:
         return
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    with _report_path_lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-    forwardable_answer = (answer or summary).strip() or "No answer returned."
-    heading = f"# {agent_name.replace('_', ' ').title()} Report"
-    existing = ""
-    if path.exists():
-        try:
-            existing = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            existing = ""
+        forwardable_answer = (answer or summary).strip() or "No answer returned."
+        heading = f"# {agent_name.replace('_', ' ').title()} Report"
+        existing = ""
+        if path.exists():
+            try:
+                existing = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                existing = ""
 
-    run_heading = "## Run " + datetime.now(timezone.utc).isoformat()
-    lines = [
-        run_heading,
-        "",
-        "Answer:",
-        forwardable_answer,
-        "",
-        f"Objective: {objective.strip()}",
-        "",
-        "Summary:",
-        summary.strip() or "No summary returned.",
-    ]
+        run_heading = "## Run " + datetime.now(timezone.utc).isoformat()
+        lines = [
+            run_heading,
+            "",
+            "Answer:",
+            forwardable_answer,
+            "",
+            f"Objective: {objective.strip()}",
+            "",
+            "Summary:",
+            summary.strip() or "No summary returned.",
+        ]
 
-    sections = [
-        ("Findings", findings),
-        ("Paths", paths),
-        ("Sources", sources),
-        ("Uncertainties", uncertainties),
-        ("Details", details),
-    ]
-    for heading, items in sections:
-        cleaned = [str(item).strip() for item in items if str(item).strip()]
-        if not cleaned:
-            continue
-        lines.extend(["", f"{heading}:"])
-        lines.extend(f"- {item}" for item in dict.fromkeys(cleaned))
+        sections = [
+            ("Findings", findings),
+            ("Paths", paths),
+            ("Sources", sources),
+            ("Uncertainties", uncertainties),
+            ("Details", details),
+        ]
+        for heading, items in sections:
+            cleaned = [str(item).strip() for item in items if str(item).strip()]
+            if not cleaned:
+                continue
+            lines.extend(["", f"{heading}:"])
+            lines.extend(f"- {item}" for item in dict.fromkeys(cleaned))
 
-    entry = "\n".join(lines).strip()
-    if existing:
-        content = f"{existing}\n\n---\n\n{entry}\n"
-    else:
-        content = f"{heading}\n\n{entry}\n"
+        entry = "\n".join(lines).strip()
+        if existing:
+            content = f"{existing}\n\n---\n\n{entry}\n"
+        else:
+            content = f"{heading}\n\n{entry}\n"
 
-    path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
 
 
 def load_agent_reports(report_dir: Path | None) -> str:
@@ -105,7 +123,9 @@ def load_agent_reports(report_dir: Path | None) -> str:
     return "\n\n---\n\n".join(sections)
 
 
-def load_agent_report_summaries(report_dir: Path | None, *, max_chars: int = 4000) -> str:
+def load_agent_report_summaries(
+    report_dir: Path | None, *, max_chars: int = 4000
+) -> str:
     """Load compact prior report memory for one-shot specialist agents."""
     full = load_agent_reports(report_dir)
     if not full:

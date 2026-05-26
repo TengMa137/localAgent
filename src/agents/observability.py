@@ -4,14 +4,12 @@ Drop-in replacement for agent.run() that streams events to stderr.
 """
 
 import json
-import os
 import sys
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, TypeVar
 
-from localagent_env import load_dotenv
 from pydantic_ai import Agent, PartDeltaEvent, PartStartEvent
 from pydantic_ai._agent_graph import End, UserPromptNode
 from pydantic_ai.messages import (
@@ -29,7 +27,7 @@ from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDen
 
 from pydantic import BaseModel, Field
 
-load_dotenv()
+from localagent_settings import get_runtime_settings
 
 T = TypeVar("T")
 ApprovalAction = Literal["approve", "deny", "suggest", "abort"]
@@ -71,8 +69,9 @@ def _rt(msg: str, color: str = "dim", indent: int = 0) -> None:
 
 
 def _verbose_trace_logs() -> bool:
-    level = os.getenv("LOCALAGENT_LOG_LEVEL", "").strip().lower()
-    trace = os.getenv("LOCALAGENT_TRACE", "").strip().lower()
+    settings = get_runtime_settings()
+    level = settings.log_level.strip().lower()
+    trace = settings.trace.strip().lower()
     return level in {"debug", "trace", "verbose"} or trace in {
         "1",
         "true",
@@ -151,7 +150,7 @@ async def observable_run(
         "deferred_tool_results", None
     )
     approval_rounds = 0
-    max_approval_rounds = int(os.getenv("LOCALAGENT_MAX_APPROVAL_ROUNDS", "3"))
+    max_approval_rounds = get_runtime_settings().max_approval_rounds
 
     while True:
         run_kwargs = dict(
@@ -571,7 +570,7 @@ def _collect_local_approvals(
 
 
 def _prompt_for_tool_approval(tool_name: str, args_preview: str) -> ApprovalDecision:
-    env = os.getenv("LOCALAGENT_APPROVE_TOOLS", "").strip().lower()
+    env = get_runtime_settings().approve_tools.strip().lower()
     if env in {"1", "true", "yes", "always"}:
         return ApprovalDecision("approve")
     if env in {"0", "false", "no", "never"}:

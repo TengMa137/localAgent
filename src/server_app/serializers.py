@@ -25,6 +25,12 @@ def public_chat_session(row: sqlite3.Row) -> dict[str, Any]:
     }
     if "active_branch_id" in row.keys():
         data["active_branch_id"] = row["active_branch_id"]
+    if "message_count" in row.keys():
+        data["message_count"] = int(row["message_count"] or 0)
+    if "file_count" in row.keys():
+        data["file_count"] = int(row["file_count"] or 0)
+    if "is_empty" in row.keys():
+        data["is_empty"] = bool(row["is_empty"])
     if "user_id" in row.keys():
         data["user_id"] = row["user_id"]
     if "username" in row.keys():
@@ -45,7 +51,9 @@ def public_message(row: sqlite3.Row) -> dict[str, Any]:
         data["fork_parent_id"] = row["fork_parent_id"]
     if "variant_number" in row.keys():
         data["variant_number"] = row["variant_number"]
-    raw_metadata = row["metadata_json"] or "{}" if "metadata_json" in row.keys() else "{}"
+    raw_metadata = (
+        row["metadata_json"] or "{}" if "metadata_json" in row.keys() else "{}"
+    )
     metadata = json_loads_dict(raw_metadata)
     if metadata:
         data["metadata"] = metadata
@@ -103,7 +111,10 @@ def compact_trace_events(trace_events: list[dict[str, Any]]) -> list[dict[str, A
                 "tool_name": item.get("tool_name") or "",
                 "tool_call_id": item.get("tool_call_id") or "",
                 "args": item.get("args") or item.get("args_delta") or "",
-                "output": item.get("output") or item.get("message") or item.get("content") or "",
+                "output": item.get("output")
+                or item.get("message")
+                or item.get("content")
+                or "",
             }
         )
         if len(compact) >= 80:

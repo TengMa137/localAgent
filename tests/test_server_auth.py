@@ -36,7 +36,9 @@ def test_login_me_logout(monkeypatch, tmp_path):
         assert response.status_code == 200
         assert response.json()["user"]["username"] == "admin"
 
-        response = client.post("/api/auth/logout", headers={"X-CSRF-Token": _csrf(client)})
+        response = client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": _csrf(client)}
+        )
         assert response.status_code == 200
         assert client.get("/api/me").status_code == 401
 
@@ -56,36 +58,51 @@ def test_register_creates_normal_user_after_admin_is_initialized(monkeypatch, tm
 def test_user_can_change_own_password(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         csrf = _csrf(client)
         response = client.patch(
             "/api/me/password",
             headers={"X-CSRF-Token": csrf},
-            json={"current_password": "admin-password", "new_password": "new-admin-password"},
+            json={
+                "current_password": "admin-password",
+                "new_password": "new-admin-password",
+            },
         )
         assert response.status_code == 200
         assert client.get("/api/me").status_code == 401
 
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 401
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "new-admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "new-admin-password"},
+            ).status_code
+            == 200
+        )
 
 
 def test_admin_can_reset_user_password(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
     with TestClient(server.app) as admin_client:
-        assert admin_client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            admin_client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         csrf = _csrf(admin_client)
         create_user = admin_client.post(
             "/api/admin/users",
@@ -96,10 +113,13 @@ def test_admin_can_reset_user_password(monkeypatch, tmp_path):
         user_id = create_user.json()["user"]["id"]
 
         with TestClient(server.app) as user_client:
-            assert user_client.post(
-                "/api/auth/login",
-                json={"username": "normal", "password": "normal-password"},
-            ).status_code == 200
+            assert (
+                user_client.post(
+                    "/api/auth/login",
+                    json={"username": "normal", "password": "normal-password"},
+                ).status_code
+                == 200
+            )
             assert user_client.get("/api/me").status_code == 200
 
             response = admin_client.patch(
@@ -109,35 +129,50 @@ def test_admin_can_reset_user_password(monkeypatch, tmp_path):
             )
             assert response.status_code == 200
             assert user_client.get("/api/me").status_code == 401
-            assert user_client.post(
-                "/api/auth/login",
-                json={"username": "normal", "password": "normal-password"},
-            ).status_code == 401
-            assert user_client.post(
-                "/api/auth/login",
-                json={"username": "normal", "password": "changed-password"},
-            ).status_code == 200
+            assert (
+                user_client.post(
+                    "/api/auth/login",
+                    json={"username": "normal", "password": "normal-password"},
+                ).status_code
+                == 401
+            )
+            assert (
+                user_client.post(
+                    "/api/auth/login",
+                    json={"username": "normal", "password": "changed-password"},
+                ).status_code
+                == 200
+            )
 
 
 def test_blank_normalized_fields_are_rejected(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/register",
-            json={"username": "   ", "password": "normal-password"},
-        ).status_code == 422
+        assert (
+            client.post(
+                "/api/auth/register",
+                json={"username": "   ", "password": "normal-password"},
+            ).status_code
+            == 422
+        )
 
-        assert client.post(
-            "/api/auth/login",
-            json={"username": " admin ", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": " admin ", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         csrf = _csrf(client)
 
-        assert client.post(
-            "/api/admin/users",
-            headers={"X-CSRF-Token": csrf},
-            json={"username": "   ", "password": "normal-password", "role": "user"},
-        ).status_code == 422
+        assert (
+            client.post(
+                "/api/admin/users",
+                headers={"X-CSRF-Token": csrf},
+                json={"username": "   ", "password": "normal-password", "role": "user"},
+            ).status_code
+            == 422
+        )
 
         create_chat = client.post(
             "/api/chat/sessions",
@@ -148,16 +183,224 @@ def test_blank_normalized_fields_are_rejected(monkeypatch, tmp_path):
         assert create_chat.json()["session"]["title"] == "New chat"
         chat_id = create_chat.json()["session"]["id"]
 
-        assert client.patch(
-            f"/api/chat/sessions/{chat_id}",
+        assert (
+            client.patch(
+                f"/api/chat/sessions/{chat_id}",
+                headers={"X-CSRF-Token": csrf},
+                json={"title": "   "},
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                f"/api/chat/sessions/{chat_id}/messages",
+                headers={"X-CSRF-Token": csrf},
+                json={"content": "   "},
+            ).status_code
+            == 422
+        )
+
+
+def test_create_chat_reuses_empty_new_chat(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+
+        first = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "New chat"},
+        )
+        second = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "New chat"},
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["session"]["id"] == first.json()["session"]["id"]
+        assert second.json()["session"]["is_empty"] is True
+
+        sessions = client.get("/api/chat/sessions").json()["sessions"]
+        empty_new_chats = [
+            session
+            for session in sessions
+            if session["title"] == "New chat" and session["is_empty"]
+        ]
+        assert len(empty_new_chats) == 1
+
+
+def test_first_message_preserves_generated_chat_title(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    class FakeResponse:
+        reply = "ok"
+
+    async def fake_run_turn(user_text, session, debug=False, trace_sink=None):
+        return (
+            FakeResponse(),
+            [
+                *session.message_history,
+                server.ModelRequest.user_text_prompt(user_text),
+                server.ModelResponse(parts=[server.TextPart(content="ok")]),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
             headers={"X-CSRF-Token": csrf},
             json={"title": "   "},
-        ).status_code == 422
-        assert client.post(
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+        response = client.post(
             f"/api/chat/sessions/{chat_id}/messages",
             headers={"X-CSRF-Token": csrf},
-            json={"content": "   "},
-        ).status_code == 422
+            json={"content": "Explain report writes"},
+        )
+        assert response.status_code == 200
+        assert response.json()["session"]["title"] == "explain report writes"
+
+        loaded = client.get(f"/api/chat/sessions/{chat_id}")
+        assert loaded.status_code == 200
+        assert loaded.json()["session"]["title"] == "explain report writes"
+
+        next_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "New chat"},
+        )
+        assert next_chat.status_code == 200
+        assert next_chat.json()["session"]["id"] != chat_id
+        assert next_chat.json()["session"]["title"] == "New chat"
+
+
+def test_first_message_can_use_agent_generated_chat_title(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    class FakeResponse:
+        reply = "ok"
+
+    async def fake_run_turn(user_text, session, debug=False, trace_sink=None):
+        session.session_title = "agent-named-chat"
+        return (
+            FakeResponse(),
+            [
+                *session.message_history,
+                server.ModelRequest.user_text_prompt(user_text),
+                server.ModelResponse(parts=[server.TextPart(content="ok")]),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "   "},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+        response = client.post(
+            f"/api/chat/sessions/{chat_id}/messages",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "How are you?"},
+        )
+        assert response.status_code == 200
+        assert response.json()["session"]["title"] == "agent-named-chat"
+
+
+def test_stream_forwards_final_answer_pass_text_delta(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    class FakeResponse:
+        reply = "final answer"
+
+    async def fake_run_turn(user_text, session, debug=False, trace_sink=None):
+        if trace_sink is not None:
+            trace_sink(
+                {
+                    "kind": "text_delta",
+                    "label": "orchestrator:answer",
+                    "content": "streamed final chunk",
+                }
+            )
+        return (
+            FakeResponse(),
+            [
+                *session.message_history,
+                server.ModelRequest.user_text_prompt(user_text),
+                server.ModelResponse(parts=[server.TextPart(content="final answer")]),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "stream test"},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+        with client.stream(
+            "POST",
+            f"/api/chat/sessions/{chat_id}/messages/stream",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "plan question"},
+        ) as response:
+            assert response.status_code == 200
+            body = "".join(response.iter_text())
+
+    assert "text_delta" in body
+    assert "streamed final chunk" in body
+    assert "final answer" in body
 
 
 def test_user_can_transcribe_voice_input(monkeypatch, tmp_path):
@@ -165,20 +408,27 @@ def test_user_can_transcribe_voice_input(monkeypatch, tmp_path):
     captured = {}
 
     class FakeASRProvider:
-        async def transcribe_bytes(self, audio_bytes, *, filename, mime_type, language=None):
+        async def transcribe_bytes(
+            self, audio_bytes, *, filename, mime_type, language=None
+        ):
             captured["audio_bytes"] = audio_bytes
             captured["filename"] = filename
             captured["mime_type"] = mime_type
             captured["language"] = language
-            return SimpleNamespace(text="hello from voice", language="en", provider="fake-asr")
+            return SimpleNamespace(
+                text="hello from voice", language="en", provider="fake-asr"
+            )
 
     monkeypatch.setattr(server, "Qwen3ASRProvider", FakeASRProvider)
 
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         response = client.post(
             "/api/speech/asr",
             headers={"X-CSRF-Token": _csrf(client)},
@@ -199,24 +449,31 @@ def test_user_can_transcribe_voice_input(monkeypatch, tmp_path):
     }
 
 
-def test_voice_input_uses_provider_language_when_client_omits_field(monkeypatch, tmp_path):
+def test_voice_input_uses_provider_language_when_client_omits_field(
+    monkeypatch, tmp_path
+):
     server = _load_server(monkeypatch, tmp_path)
     captured = {}
 
     class FakeASRProvider:
         config = SimpleNamespace(language="Swedish")
 
-        async def transcribe_bytes(self, audio_bytes, *, filename, mime_type, language=None):
+        async def transcribe_bytes(
+            self, audio_bytes, *, filename, mime_type, language=None
+        ):
             captured["language"] = language
             return SimpleNamespace(text="hej", language="sv", provider="fake-asr")
 
     monkeypatch.setattr(server, "Qwen3ASRProvider", FakeASRProvider)
 
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         response = client.post(
             "/api/speech/asr",
             headers={"X-CSRF-Token": _csrf(client)},
@@ -250,10 +507,13 @@ def test_image_upload_context_tells_agent_to_use_read_image(monkeypatch, tmp_pat
     monkeypatch.setattr(server, "run_turn", fake_run_turn)
 
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         csrf = _csrf(client)
         create_chat = client.post(
             "/api/chat/sessions",
@@ -279,11 +539,45 @@ def test_image_upload_context_tells_agent_to_use_read_image(monkeypatch, tmp_pat
 
     assert "screenshot.png [image, image/png" in captured["prompt"]
     assert "(image; use read_image to inspect visual content)" in captured["prompt"]
-    assert "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_image." in captured["prompt"]
+    assert (
+        "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_image."
+        in captured["prompt"]
+    )
     assert "call read_image for supported image paths" in captured["prompt"]
 
 
-def test_unsupported_image_upload_context_is_not_routed_to_read_image(monkeypatch, tmp_path):
+def test_web_agent_session_uses_per_user_memory_dir(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": _csrf(client)},
+            json={"title": "memory path"},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+    with server.db() as conn:
+        row = conn.execute(
+            "SELECT * FROM chat_sessions WHERE id = ?", (chat_id,)
+        ).fetchone()
+
+    agent_session = server._chat_session_for_agent(row, 1)
+
+    assert agent_session.memory_dir == server.STATE_DIR / "memory" / "1"
+
+
+def test_unsupported_image_upload_context_is_not_routed_to_read_image(
+    monkeypatch, tmp_path
+):
     server = _load_server(monkeypatch, tmp_path)
     captured = {}
 
@@ -306,10 +600,13 @@ def test_unsupported_image_upload_context_is_not_routed_to_read_image(monkeypatc
     monkeypatch.setattr(server, "run_turn", fake_run_turn)
 
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         csrf = _csrf(client)
         create_chat = client.post(
             "/api/chat/sessions",
@@ -346,6 +643,7 @@ def test_register_is_blocked_until_backend_admin_is_initialized(monkeypatch, tmp
     monkeypatch.setenv("LOCALAGENT_COOKIE_SECURE", "false")
 
     import server
+
     server = importlib.reload(server)
 
     with TestClient(server.app) as client:
@@ -360,10 +658,13 @@ def test_register_is_blocked_until_backend_admin_is_initialized(monkeypatch, tmp
 def test_users_cannot_read_each_others_chat_sessions(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
     with TestClient(server.app) as admin_client:
-        assert admin_client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            admin_client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         admin_csrf = _csrf(admin_client)
         create_user = admin_client.post(
             "/api/admin/users",
@@ -380,17 +681,26 @@ def test_users_cannot_read_each_others_chat_sessions(monkeypatch, tmp_path):
         admin_chat_id = create_chat.json()["session"]["id"]
 
         with TestClient(server.app) as user_client:
-            assert user_client.post(
-                "/api/auth/login",
-                json={"username": "normal", "password": "normal-password"},
-            ).status_code == 200
+            assert (
+                user_client.post(
+                    "/api/auth/login",
+                    json={"username": "normal", "password": "normal-password"},
+                ).status_code
+                == 200
+            )
             user_csrf = _csrf(user_client)
-            assert user_client.get(f"/api/chat/sessions/{admin_chat_id}").status_code == 404
-            assert user_client.patch(
-                f"/api/chat/sessions/{admin_chat_id}",
-                headers={"X-CSRF-Token": user_csrf},
-                json={"title": "stolen"},
-            ).status_code == 404
+            assert (
+                user_client.get(f"/api/chat/sessions/{admin_chat_id}").status_code
+                == 404
+            )
+            assert (
+                user_client.patch(
+                    f"/api/chat/sessions/{admin_chat_id}",
+                    headers={"X-CSRF-Token": user_csrf},
+                    json={"title": "stolen"},
+                ).status_code
+                == 404
+            )
 
 
 def test_admin_can_view_all_user_chat_history(monkeypatch, tmp_path):
@@ -423,10 +733,13 @@ def test_admin_can_view_all_user_chat_history(monkeypatch, tmp_path):
         assert user_client.get("/api/admin/chat/sessions").status_code == 403
 
     with TestClient(server.app) as admin_client:
-        assert admin_client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            admin_client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
 
         response = admin_client.get("/api/admin/chat/sessions")
         assert response.status_code == 200
@@ -466,10 +779,13 @@ def test_editing_user_message_creates_switchable_branch(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "run_turn", fake_run_turn)
 
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         csrf = _csrf(client)
         create_chat = client.post(
             "/api/chat/sessions",
@@ -530,7 +846,10 @@ def test_editing_user_message_creates_switchable_branch(monkeypatch, tmp_path):
         ]
         edited = data["messages"][2]
         assert [variant["number"] for variant in edited["branch_variants"]] == [1, 2]
-        assert [variant["active"] for variant in edited["branch_variants"]] == [False, True]
+        assert [variant["active"] for variant in edited["branch_variants"]] == [
+            False,
+            True,
+        ]
 
         response = client.post(
             f"/api/chat/sessions/{chat_id}/branches/main/activate",
@@ -547,7 +866,10 @@ def test_editing_user_message_creates_switchable_branch(monkeypatch, tmp_path):
         ]
         original = data["messages"][2]
         assert [variant["number"] for variant in original["branch_variants"]] == [1, 2]
-        assert [variant["active"] for variant in original["branch_variants"]] == [True, False]
+        assert [variant["active"] for variant in original["branch_variants"]] == [
+            True,
+            False,
+        ]
 
 
 def test_fork_allows_user_message_from_inactive_branch(monkeypatch, tmp_path):
@@ -571,10 +893,13 @@ def test_fork_allows_user_message_from_inactive_branch(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "run_turn", fake_run_turn)
 
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         csrf = _csrf(client)
         create_chat = client.post(
             "/api/chat/sessions",
@@ -624,10 +949,13 @@ def test_fork_allows_user_message_from_inactive_branch(monkeypatch, tmp_path):
 def test_stale_running_message_is_marked_failed_on_session_load(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
     with TestClient(server.app) as client:
-        assert client.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin-password"},
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
         csrf = _csrf(client)
         create_chat = client.post(
             "/api/chat/sessions",

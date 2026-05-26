@@ -7,23 +7,16 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.usage import UsageLimits
 
-from .runtime.context import model, MCP_URL, rag_service, rag_validator, _now
-from .runtime.query_policy import TaskKind, extract_arxiv_ids, extract_urls
-from tools.retrieval.interceptor import (
-    arxiv_fetch_and_ingest,
-    arxiv_search_results,
-    select_urls_from_search_results,
-    web_crawl_and_ingest,
-    web_search_results,
-)
-from tools.retrieval.toolset import _get_doc_ids
+from .runtime.context import model, _now
+from .runtime.query_policy import TaskKind
+from .fs_agent import run_fs_task
+from .web_agent import run_web_task
 
 from .observability import observable_run, _rt, task_log_store, TaskLog
 
 
 MAX_PARALLEL_TASKS = 3
 MAX_TOOL_CALLS = 10
-MAX_EVIDENCE_ITEMS = 6
 T = TypeVar("T", bound=BaseModel)
 ConfidenceLevel = Literal["low", "high"]
 
@@ -46,29 +39,6 @@ class TaskSpec(BaseModel):
             for field in ("urls", "relevant_files"):
                 if values.get(field) is None:
                     values[field] = []
-        return values
-
-
-class WorkerOutput(BaseModel):
-    summary: str
-    key_findings: List[str] = Field(default_factory=list)
-    uncertainties: List[str] = Field(default_factory=list)
-    suggested_next_steps: List[str] = Field(default_factory=list)
-    cited_node_ids: List[str] = Field(default_factory=list)
-
-    # Add a validator to coerce None → [] for all list fields
-    @model_validator(mode="before")
-    @classmethod
-    def coerce_none_lists(cls, values: Any) -> Any:
-        list_fields = {
-            "key_findings",
-            "uncertainties",
-            "suggested_next_steps",
-            "cited_node_ids",
-        }
-        for f in list_fields:
-            if values.get(f) is None:
-                values[f] = []
         return values
 
 
@@ -107,29 +77,8 @@ class SynthesisOutput(BaseModel):
     report: str
 
 
-class SearchQueryReview(BaseModel):
-    query: str
-    time_sensitive: bool
-    changed: bool
-    reason: str
-
-
 class HistorySummaryOutput(BaseModel):
     summary: str
-
-
-WORKER_SYSTEM_PROMPT = """
-You are a focused evidence extractor.
-
-You receive ONE objective and retrieved evidence. Do not request tools.
-Return a structured result using only the evidence provided.
-
-Rules:
-  - Prefer exact evidence over assumptions
-  - Never fabricate sources or citations
-  - cited_node_ids must come from evidence node_id values only
-  - If evidence is insufficient, say so in uncertainties
-"""
 
 
 REFLECT_SYSTEM_PROMPT = """
@@ -160,20 +109,6 @@ Requirements:
   - Evidence-backed tone
 
 Do not hallucinate citations or sources.
-"""
-
-
-SEARCH_GUARD_SYSTEM_PROMPT = """
-Review one proposed web search query against the original user prompt.
-
-Return a corrected query if needed.
-
-Rules:
-  - Preserve the user's intent.
-  - Add current/recent/date wording only when the original prompt requires it.
-  - Do not append today's exact date mechanically.
-  - If the query already captures the needed date or freshness, keep it.
-  - Keep the query concise.
 """
 
 
@@ -211,37 +146,6 @@ async def _run_structured_worker(
     )
 
 
-async def review_search_query(
-    *,
-    original_prompt: str,
-    task_objective: str,
-    proposed_query: str,
-) -> SearchQueryReview:
-    result = await _run_structured_worker(
-        prompt=(
-            f"Current date: {_now()}\n"
-            f"Original user prompt: {original_prompt}\n"
-            f"Task objective: {task_objective}\n"
-            f"Proposed query: {proposed_query}"
-        ),
-        system_prompt=SEARCH_GUARD_SYSTEM_PROMPT,
-        output_type=SearchQueryReview,
-        label="search_guard",
-        indent=2,
-    )
-    review = result.output
-
-    if not review.query.strip():
-        return SearchQueryReview(
-            query=proposed_query,
-            time_sensitive=review.time_sensitive,
-            changed=False,
-            reason="Empty reviewed query; kept proposed query.",
-        )
-
-    return review
-
-
 async def run_history_summary_worker(
     *,
     message_history: list,
@@ -259,95 +163,100 @@ async def run_history_summary_worker(
     return result.output.summary
 
 
-def _build_worker_instructions(task: TaskSpec) -> str:
+def _build_specialist_objective(task: TaskSpec) -> str:
     if task.kind is None:
         raise ValueError("TaskSpec.kind is required before worker execution")
-    files_section = ""
+    sections = [
+        "Plan worker task:",
+        f"Original user prompt: {task.user_prompt or task.objective}",
+        f"Task objective: {task.objective}",
+        f"Task kind: {task.kind.value}",
+        f"Query: {task.query or task.objective}",
+        f"Requires current info: {task.requires_current_info}",
+        f"As of: {task.as_of or _now()}",
+    ]
     if task.relevant_files:
-        files_section = (
-            "\nRelevant local files (provided by planner):\n"
-            + "\n".join(f"  - {f}" for f in task.relevant_files)
-            + "\n"
+        sections.append(
+            "Relevant local files:\n"
+            + "\n".join(f"- {path}" for path in task.relevant_files)
         )
-    skills_section = ""
+    if task.urls:
+        sections.append("URLs:\n" + "\n".join(f"- {url}" for url in task.urls))
     if task.relevant_skills:
-        skills_section = (
-            "\nRelevant skills (call load_skill first):\n"
-            + "\n".join(f"  - {s}" for s in task.relevant_skills)
-            + "\n"
+        sections.append(
+            "Relevant skills:\n"
+            + "\n".join(f"- {skill}" for skill in task.relevant_skills)
         )
-    return (
-        f"Objective:\n  {task.objective}\n"
-        f"Task kind: {task.kind.value}\n"
-        f"Query: {task.query or task.objective}\n"
-        f"Requires current info: {task.requires_current_info}\n"
-        f"As of: {task.as_of or _now()}\n"
-        f"Original user prompt: {task.user_prompt or task.objective}\n"
-        f"{files_section}{skills_section}"
-        "Use only the retrieved evidence in the prompt and output schema strictly."
-    )
+    sections.append("Return a concise, forwardable result for this task only.")
+    return "\n".join(sections)
 
 
-async def _rag_search(question: str, docs: list[str] | None = None) -> list[dict]:
-    doc_ids = await _get_doc_ids(rag_service, rag_validator, docs)
-    return await rag_service.search(question=question, doc_ids=doc_ids)
-
-
-def _format_evidence(results: list[dict]) -> str:
-    if not results:
-        return "No evidence retrieved."
-
-    chunks = []
-    for idx, item in enumerate(results[:MAX_EVIDENCE_ITEMS], start=1):
-        chunks.append(
-            "\n".join(
-                [
-                    f"EVIDENCE {idx}",
-                    f"node_id: {item.get('node_id', '')}",
-                    f"source: {item.get('source', '')}",
-                    f"title: {item.get('title', '')}",
-                    f"text: {str(item.get('text', ''))[:1500]}",
-                ]
-            )
-        )
-    return "\n\n".join(chunks)
-
-
-async def _retrieve_evidence(task: TaskSpec) -> list[dict]:
-    if task.kind is None:
-        raise ValueError("TaskSpec.kind is required before evidence retrieval")
-    query = task.query or task.objective
-
+def _task_sources(task: TaskSpec) -> list[str]:
     if task.kind == TaskKind.LOCAL_RAG:
-        return await _rag_search(query, task.relevant_files or None)
+        return task.relevant_files
+    return task.urls
 
-    if task.kind == TaskKind.URL_CRAWL:
-        urls = task.urls or extract_urls(task.objective)
-        if urls:
-            await web_crawl_and_ingest(MCP_URL, rag_service, urls)
-            return await _rag_search(query, urls)
-        return await _rag_search(query, task.relevant_files or None)
 
-    if task.kind == TaskKind.ARXIV:
-        arxiv_ids = extract_arxiv_ids(task.objective)
-        if not arxiv_ids:
-            papers = await arxiv_search_results(MCP_URL, query, max_results=5)
-            arxiv_ids = [p.get("arxiv_id", "") for p in papers[:3] if p.get("arxiv_id")]
-        if arxiv_ids:
-            await arxiv_fetch_and_ingest(MCP_URL, rag_service, arxiv_ids)
-        return await _rag_search(query, arxiv_ids or None)
+async def _run_specialist_task(task: TaskSpec) -> tuple[str, str]:
+    if task.kind is None:
+        raise ValueError("TaskSpec.kind is required before worker execution")
 
-    review = await review_search_query(
-        original_prompt=task.user_prompt or task.objective,
-        task_objective=task.objective,
-        proposed_query=query,
+    objective = _build_specialist_objective(task)
+    if task.kind == TaskKind.LOCAL_RAG:
+        return "fs_agent", await run_fs_task(objective)
+    return "web_agent", await run_web_task(objective)
+
+
+def _compact_specialist_result(result: str, limit: int = 4000) -> str:
+    text = result.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _handoff_answer(result: str) -> str:
+    marker = "Forwardable answer:\n"
+    notes_marker = "\n\nOrchestrator notes:"
+    if marker not in result:
+        return result.strip()
+    answer = result.split(marker, 1)[1]
+    if notes_marker in answer:
+        answer = answer.split(notes_marker, 1)[0]
+    return answer.strip()
+
+
+def _handoff_note_values(result: str, label: str) -> list[str]:
+    notes_marker = "\n\nOrchestrator notes:"
+    if notes_marker not in result:
+        return []
+
+    values: list[str] = []
+    prefix = f"{label}:"
+    for raw_line in result.split(notes_marker, 1)[1].splitlines():
+        line = raw_line.strip()
+        if line.startswith("- "):
+            line = line[2:].strip()
+        if not line.startswith(prefix):
+            continue
+        value = line.split(":", 1)[1].strip()
+        values.extend(part.strip() for part in value.split(";") if part.strip())
+    return values
+
+
+def _worker_success_log(task: TaskSpec, task_id: str, result: str) -> TaskLog:
+    compact = _compact_specialist_result(result)
+    answer = _handoff_answer(result)
+    uncertainties = _handoff_note_values(result, "Uncertainties")
+    findings = [answer] if answer and answer != "No answer returned." else []
+    return TaskLog(
+        task_id=task_id,
+        objective=task.objective,
+        status="done",
+        summary=compact,
+        key_findings=findings,
+        uncertainties=uncertainties,
+        cited_node_ids=_task_sources(task),
     )
-    search_results = await web_search_results(MCP_URL, review.query)
-    urls = select_urls_from_search_results(search_results, max_urls=3)
-    if urls:
-        await web_crawl_and_ingest(MCP_URL, rag_service, urls)
-        return await _rag_search(review.query, urls)
-    return []
 
 
 async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
@@ -356,40 +265,9 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
     _rt(f"[worker {task_id[:8]}] START → {task.objective[:80]}", "cyan")
 
     try:
-        evidence = await _retrieve_evidence(task)
-        evidence_text = _format_evidence(evidence)
-        result = await _run_structured_worker(
-            prompt=(
-                f"{_build_worker_instructions(task)}\n\n"
-                f"Retrieved evidence:\n{evidence_text}"
-            ),
-            system_prompt=WORKER_SYSTEM_PROMPT,
-            output_type=WorkerOutput,
-            label=f"worker:{task_id[:8]}",
-            indent=2,
-        )
-        messages = result.all_messages()
-        tool_calls = sum(
-            1
-            for m in messages
-            for p in getattr(m, "parts", [])
-            if getattr(p, "part_kind", "") == "tool-call"
-        )
-        if tool_calls > MAX_TOOL_CALLS:
-            _rt(f"[worker {task_id[:8]}] ✗ TOOL LOOP ({tool_calls} calls)", "red")
-            log.status = "failed"
-            log.error = f"tool loop detected ({tool_calls} calls)"
-            log.trace = messages
-        else:
-            out = result.output
-            _rt(f"[worker {task_id[:8]}] ✓ DONE — {out.summary[:80]}", "green")
-            log.status = "done"
-            log.summary = out.summary
-            log.key_findings = out.key_findings
-            log.uncertainties = out.uncertainties
-            log.suggested_next_steps = out.suggested_next_steps
-            log.cited_node_ids = out.cited_node_ids
-            log.trace = messages
+        specialist, result = await _run_specialist_task(task)
+        log = _worker_success_log(task, task_id, result)
+        _rt(f"[worker {task_id[:8]}] ✓ DONE via {specialist}", "green")
     except Exception as exc:
         _rt(f"[worker {task_id[:8]}] ✗ ERROR — {exc}", "red")
         log.status = "failed"

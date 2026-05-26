@@ -47,7 +47,7 @@ Current implementation highlights:
 │   ├── server.py            # FastAPI backend and static web app
 │   ├── run_agents.py        # Interactive terminal chat entry point
 │   ├── rag.py               # RAG service entry point, imported from rag_lib
-│   ├── localagent_env.py    # .env loading for direct os.getenv users
+│   ├── localagent_settings.py # Pydantic settings for LOCALAGENT_* config
 │   ├── server_app/          # Web chat persistence, schemas, upload classification
 │   ├── speech/              # CrispASR/Qwen3 ASR, TTS, and terminal voice helpers
 │   ├── agents/
@@ -156,10 +156,10 @@ LOCALAGENT_COOKIE_SECURE=false
 Start from `.env.example` if you want a complete list of supported local
 configuration variables with defaults.
 
-The app loads `.env` automatically before reading `LOCALAGENT_*` settings, including
-the direct `os.getenv` config used by agent, RAG, ASR, and TTS modules. Use `.env`
-for a single local machine; use real environment variables or your container/host
-secret manager for deployment so secrets are not copied into the repo or image.
+The app reads `.env` through Pydantic settings before using `LOCALAGENT_*`
+configuration. Use `.env` for a single local machine; use real environment
+variables or your container/host secret manager for deployment so secrets are
+not copied into the repo or image.
 
 Open `http://127.0.0.1:8088`. Browser auth uses server-side sessions with
 `HttpOnly` cookies; JWTs are not needed for this same-origin frontend.
@@ -192,20 +192,11 @@ published to the host. (inspect: lsof -nP -iTCP:8088 -sTCP:LISTEN)
 
 ## Model providers
 
-The agent uses pydantic-ai's `provider:model` identifier format, so any OpenAI-compatible
-endpoint works without code changes.
-
-### Cloud APIs
-
-```bash
-# OpenAI
-export OPENAI_API_KEY=sk-...
-# set model = "openai:gpt-4o" in src/agents/runtime/context.py
-
-# Anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-# set model = "anthropic:claude-sonnet-4-5" in src/agents/runtime/context.py
-```
+The agent is wired to an OpenAI-compatible chat endpoint through
+`LOCALAGENT_MODEL_BASE_URL` and `LOCALAGENT_MODEL_API_KEY`. Bare provider keys
+such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` are not read by this runtime.
+To use a non-local endpoint, point `LOCALAGENT_MODEL_BASE_URL` at that
+OpenAI-compatible API and set `LOCALAGENT_MODEL_API_KEY`.
 
 ### Local via llama.cpp
 
@@ -444,14 +435,14 @@ or fetched from the web.
 ### Orchestrator
 
 The orchestrator is the long-lived conversational agent. It accumulates `message_history`
-across turns and classifies each turn as direct, clarify, filesystem, web, or complex plan.
+across turns and classifies each turn as either direct or plan.
 
-Before each turn, the shared runtime loads any per-session agent reports and injects them
-as context. It also refreshes and injects a deterministic `/skills` scan, so newly created
-or edited skills are visible on the next run. If chat/report/skill context is sufficient,
-the orchestrator answers directly. Otherwise it returns a typed route decision and Python
-executes the selected route runner once. The specialist agents are not exposed as
-orchestrator tools.
+Before each turn, the shared runtime loads long-term user profile memory and any
+per-session agent reports, then injects them as context. It also refreshes and injects a
+deterministic `/skills` scan, so newly created or edited skills are visible on the next run.
+If chat/memory/report/skill context is sufficient, the orchestrator answers directly.
+Otherwise it returns a typed route decision and Python executes the selected route runner
+once. The specialist agents are not exposed as orchestrator tools.
 
 | Route | Python runner |
 |---|---|
@@ -462,6 +453,10 @@ orchestrator tools.
 The orchestrator does not receive raw filesystem, web, RAG, or specialist toolsets. It never
 reads files or web pages directly, and it does not run a model-driven tool loop after choosing
 a route.
+
+Set `LOCALAGENT_ORCHESTRATOR_USE_XML=true` to make the intake decision use an XML output
+contract such as `<route>plan</route>` instead of the default structured JSON contract. The
+parsed decision still becomes the same internal `OrchestratorDecision` object.
 
 ### fs_agent
 
@@ -655,6 +650,33 @@ deterministically loads `/skills/skill_editing.md` into the task prompt. This is
 hook, not an orchestrator choice, so skill edits receive the editing policy even when the
 model would otherwise miss the policy.
 
+### User memory
+
+Long-term user profile memory is separate from skills and chat transcripts. The CLI stores
+default memory under:
+
+```text
+.memory/default/entry.md
+.memory/default/events.jsonl
+.memory/default/pending.jsonl
+```
+
+The web app stores per-user memory under:
+
+```text
+localagent_state/memory/<user-id>/
+```
+
+`entry.md` is the compact profile injected before each orchestrator turn. `events.jsonl` is
+an append-only audit log of accepted, pending, rejected, and duplicate memory candidates.
+`pending.jsonl` stores useful-but-inferred candidates that were not explicit enough
+to add to `entry.md` automatically.
+
+The post-turn memory hook lets the orchestrator decide whether a user message contains
+durable profile information worth saving. Explicit user-requested memories are added to
+`entry.md`; inferred candidates are logged as pending. Current user messages always
+override stored memory.
+
 ### RAG toolset
 
 | Tool | Purpose |
@@ -686,76 +708,13 @@ the host unless a web route or worker task kind performs search, URL crawl, or a
 
 ## Configuration
 
-Runtime environment variables are loaded from `.env` automatically. Start from
-`.env.example`; real environment variables still take precedence.
+Runtime environment variables are loaded from `.env` automatically. Copy
+`.env.example` to `.env` and edit only the values you need; real environment
+variables still take precedence.
 
-| Variable | Default | Effect |
-|---|---|---|
-| `LOCALAGENT_STATE_DIR` | `./localagent_state` | Web app state directory for SQLite, branch history, reports, and app files |
-| `LOCALAGENT_DB_PATH` | unset | Optional explicit SQLite database path; defaults under `LOCALAGENT_STATE_DIR` |
-| `LOCALAGENT_WEB_DIR` | `web` | Static frontend directory served by FastAPI |
-| `LOCALAGENT_DOCS_DIR` | `./user_docs` | Host directory mounted into the agent as `/docs`; web uploads are stored under `web_uploads/` inside it |
-| `LOCALAGENT_MAX_UPLOAD_BYTES` | `26214400` | Maximum uploaded file size for chat attachments |
-| `LOCALAGENT_SESSION_COOKIE` | `localagent_session` | Browser session cookie name |
-| `LOCALAGENT_COOKIE_SECURE` | `false` | Set true when serving HTTPS so auth cookies require TLS |
-| `LOCALAGENT_SESSION_TTL_SECONDS` | `604800` | Browser session lifetime |
-| `LOCALAGENT_ADMIN_USERNAME` | unset | Optional initial admin username |
-| `LOCALAGENT_ADMIN_PASSWORD` | unset | Optional initial admin password |
-| `LOCALAGENT_MAX_VOICE_AUDIO_BYTES` | `10485760` | Maximum browser voice recording upload size |
-| `LOCALAGENT_BIND` | `127.0.0.1` | Docker Compose host bind address |
-| `LOCALAGENT_PORT` | `8088` | Docker Compose published web port |
-| `LOCALAGENT_MODEL_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible model endpoint used by pydantic-ai and `rag_lib` |
-| `LOCALAGENT_MODEL_API_KEY` | `no-key` | API key sent to the model endpoint |
-| `LOCALAGENT_MCP_URL` | `http://localhost:8000/sse` | MCP web server SSE endpoint |
-| `LOCALAGENT_SKILLS_DIR` | `skills` | Host directory mounted into the agent as `/skills` |
-| `LOCALAGENT_SKILLS_MODE` | `rw` | Access mode for `/skills`; use `ro` to prevent skill writes |
-| `LOCALAGENT_APPROVE_TOOLS` | unset | `always` auto-approves deferred filesystem writes; `never` auto-denies |
-| `LOCALAGENT_MAX_APPROVAL_ROUNDS` | `3` | Maximum approval cycles before stopping the current agent run |
-| `LOCALAGENT_SPEECH_CLI` | `crispasr` | CrispASR executable used only when a speech base URL is set empty for CLI fallback |
-| `LOCALAGENT_ASR_BASE_URL` | `http://localhost:8081/v1` | OpenAI-compatible CrispASR ASR endpoint; set empty to use CLI mode |
-| `LOCALAGENT_ASR_BACKEND` | `qwen3` | CrispASR ASR backend |
-| `LOCALAGENT_ASR_MODEL` | `./models/qwen3-asr-1.7b-q8_0.gguf` | Preferred ASR model path sent in requests/metadata; server uses its loaded model |
-| `LOCALAGENT_ASR_API_KEY` | `no-key` | API key sent to the ASR endpoint |
-| `LOCALAGENT_ASR_TIMEOUT_SECONDS` | `300` | ASR request/subprocess timeout |
-| `LOCALAGENT_ASR_MAX_TOKENS` | `512` | Maximum generated ASR tokens |
-| `LOCALAGENT_ASR_TEMPERATURE` | `0` | Optional ASR sampling temperature |
-| `LOCALAGENT_ASR_RESPONSE_FORMAT` | `json` | CrispASR server response format |
-| `LOCALAGENT_ASR_LANGUAGE` | unset | Optional language passed to CrispASR with `-l`/`language` |
-| `LOCALAGENT_ASR_THREADS` | unset | Optional CrispASR ASR thread count |
-| `LOCALAGENT_ASR_VAD` | unset | Set true to pass `--vad` in ASR CLI mode |
-| `LOCALAGENT_ASR_OUTPUT_JSON` | `1` | Use JSON output for ASR CLI fallback |
-| `LOCALAGENT_TTS_BASE_URL` | `http://localhost:8082/v1` | OpenAI-compatible CrispASR TTS endpoint; set empty to use CLI mode |
-| `LOCALAGENT_TTS_CLI` | `crispasr` | CrispASR executable for TTS CLI fallback |
-| `LOCALAGENT_TTS_BACKEND` | `qwen3-tts-customvoice` | CrispASR TTS backend |
-| `LOCALAGENT_TTS_MODEL` | `./models/qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf` | Preferred TTS model path sent in requests/metadata; server uses its loaded model |
-| `LOCALAGENT_TTS_API_KEY` | `no-key` | API key sent to the TTS endpoint |
-| `LOCALAGENT_TTS_TIMEOUT_SECONDS` | `600` | TTS request/subprocess timeout |
-| `LOCALAGENT_TTS_VOICE` | `vivian` | CrispASR CustomVoice baked speaker name |
-| `LOCALAGENT_TTS_VOICE_DIR` | unset | Optional voice directory for TTS CLI/server modes that need it |
-| `LOCALAGENT_TTS_REF_TEXT` | unset | Reference text for Qwen3-TTS WAV voice cloning in CLI mode |
-| `LOCALAGENT_TTS_CODEC_MODEL` | `./models/qwen3-tts-tokenizer-12hz.gguf` | Qwen3-TTS codec GGUF path for server startup/CLI fallback |
-| `LOCALAGENT_TTS_LANGUAGE` | unset | Optional TTS language hint |
-| `LOCALAGENT_TTS_INSTRUCTIONS` | unset | Optional TTS instruction text |
-| `LOCALAGENT_TTS_RESPONSE_FORMAT` | `wav` | TTS output format |
-| `LOCALAGENT_TTS_TEMPERATURE` | unset | Optional CrispASR TTS sampling temperature |
-| `LOCALAGENT_TTS_SPEED` | unset | Optional CrispASR TTS server speed multiplier |
-| `LOCALAGENT_TTS_THREADS` | unset | Optional CrispASR TTS thread count |
-| `LOCALAGENT_TTS_PLAYER` | auto-detect | Terminal playback command used by `run_agents.py --tts` |
-| `LOCALAGENT_TTS_MIN_CHARS` | `50` | Minimum chunk size for terminal TTS playback |
-| `LOCALAGENT_TTS_MAX_CHARS` | `180` | Maximum chunk size before splitting at a word boundary |
-| `LOCALAGENT_TTS_MIN_SENTENCE_CHARS` | `24` | Minimum complete sentence size allowed to play immediately |
-| `LOCALAGENT_TTS_INITIAL_MAX_CHARS` | `120` | Shorter first chunk target for faster time-to-first-audio |
-| `LOCALAGENT_TTS_PHRASE_BOUNDARY_CHARS` | `90` | Split long sentences at commas/semicolons after this many chars |
-| `OPENAI_API_KEY` | unset | Optional cloud OpenAI key if switching away from local llama.cpp |
-| `ANTHROPIC_API_KEY` | unset | Optional Anthropic key if switching providers |
-
-Key runtime constants:
-
-| Constant | Effect |
-|---|---|
-| `MAX_PARALLEL_TASKS` | Worker concurrency per batch |
-| `MAX_ITERATIONS`  | Reflect → worker loop limit |
-| `MAX_TASKS_PER_PLAN`  | Tasks plan_agent can generate |
+Keep `.env.example` as the canonical list of supported local settings. Runtime
+limits that are not environment-configurable are defined near their owning
+modules in `src/agents/`.
 
 ---
 
@@ -788,12 +747,13 @@ every turn, where `session-title` is a kebab-case slug derived from the first us
 
 The file stores the full `List[ModelMessage]` serialised via pydantic-ai's `TypeAdapter`,
 so it is round-trippable back into a live session. It also stores the report directory used
-for agent report memory.
+for agent report memory and the long-term user memory directory.
 
 ```json
 {
   "session_title": "compare-llm-pricing",
   "report_dir": "chat_history/reports/compare-llm-pricing",
+  "memory_dir": ".memory/default",
   "saved_at": "2025-03-15T10:23:41+00:00",
   "messages": [ ... ]
 }
