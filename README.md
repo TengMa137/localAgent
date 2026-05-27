@@ -178,15 +178,68 @@ For Docker Compose:
 docker compose up --build
 ```
 
-Compose also reads the same `.env` file for `${LOCALAGENT_*}` substitutions.
+Run this from the `localAgent` checkout. Compose expects this sibling layout so
+the app image can include `rag_lib` in the same container and build the MCP web
+server as its own service:
 
-The Compose stack runs:
+```text
+~/codespace/
+├── localAgent/
+├── rag_lib/
+└── mcp_server_local/
+```
+
+Compose reads the same `.env` file for `${LOCALAGENT_*}` substitutions. If your
+local model server runs on the host, keep
+`LOCALAGENT_MODEL_BASE_URL=http://host.docker.internal:8080/v1` for Compose
+instead of the host-development `localhost` URL. The same container networking
+rule applies to speech servers: host-run ASR/TTS servers should use
+`http://host.docker.internal:8081/v1` and `http://host.docker.internal:8082/v1`
+from Docker, not `localhost`.
+
+The Compose stack has two agent entry points:
 
 - `agent-app`: backend, frontend, agent runtime, and in-process `rag_lib`
+- `agent-cli`: optional terminal agent, enabled only through the `cli` Compose profile
 - `mcp-server`: internal-only web/search/arXiv MCP server
 
 By default the app is published at `127.0.0.1:8088` and the MCP server is not
 published to the host. (inspect: lsof -nP -iTCP:8088 -sTCP:LISTEN)
+
+Use one of these commands:
+
+| Goal | Command |
+| --- | --- |
+| Run web app | `docker compose up --build` |
+| Run web app and open browser | `./scripts/docker-web.sh` |
+| Run interactive CLI | `./scripts/docker-cli.sh` |
+| Stop Docker services | `docker compose down` |
+
+The web commands start `agent-app` and `mcp-server`. The CLI command starts an
+interactive `agent-cli` container and also starts `mcp-server` if needed.
+Docker CLI sessions persist chat logs and report memory in `./chat_history/`
+and long-term memory in `./.memory/` on the host.
+
+```bash
+# Web app, then open http://127.0.0.1:8088 manually.
+docker compose up --build
+
+# Web app, wait for health, then open the browser.
+./scripts/docker-web.sh
+
+# Interactive terminal agent.
+./scripts/docker-cli.sh
+```
+
+For the terminal agent, use `docker compose run`, not `docker compose up`.
+The `up` command streams service logs but does not provide a usable interactive
+stdin session. `./scripts/docker-cli.sh` wraps the correct `run --rm agent-cli`
+command.
+
+`docker compose up` itself cannot open a host browser because Compose commands
+run containers, not host desktop actions. `./scripts/docker-web.sh` is a host
+wrapper that starts `agent-app` with Compose, waits for `/health`, then opens
+the configured URL.
 
 ---
 
@@ -727,6 +780,49 @@ web app plus the local MCP web server:
 - `mcp-server`: web search, URL crawling, and arXiv lookup inside the Compose network
 - `agent_state`: persistent volume for the web app SQLite database, branch history, and reports
 
+The app image is built from this repository with `../rag_lib` supplied as a Docker
+BuildKit named context. The MCP server is built from `../mcp_server_local/mcp_web`.
+Keep the sibling checkout layout from the quickstart, then run:
+
+```bash
+docker compose up --build
+```
+
+Docker entry points:
+
+| Goal | Command |
+| --- | --- |
+| Run web app | `docker compose up --build` |
+| Run web app and open browser | `./scripts/docker-web.sh` |
+| Run interactive CLI | `./scripts/docker-cli.sh` |
+| Stop Docker services | `docker compose down` |
+
+To start the web stack and open the page automatically, run:
+
+```bash
+./scripts/docker-web.sh
+```
+
+That default command starts `agent-app` and `mcp-server`. It does not start the
+profile-gated `agent-cli` service. To run the terminal agent in Docker, use:
+
+```bash
+./scripts/docker-cli.sh
+```
+
+Use `run` for interactive CLI sessions. `docker compose --profile cli up agent-cli`
+starts the service and streams logs, but it is not a reliable replacement for
+an attached terminal. The CLI wrapper runs `docker compose run --rm agent-cli`.
+
+Both agent services use the same image, include `rag_lib` in the same container,
+and depend on the same internal MCP server. The integrated stack only includes
+the MCP server service; the standalone MCP repo's `mcp-client` remains in that
+repo under its `test` profile and is not part of this app stack.
+
+Docker CLI sessions bind-mount `./chat_history/` and `./.memory/` so the
+non-root container user can write chat logs, reports, and memory outside the
+image filesystem.
+
 In the Compose network, internal service DNS names replace host-only URLs. For example:
 
 ```text
@@ -734,7 +830,8 @@ LOCALAGENT_MCP_URL=http://mcp-server:8000/sse
 ```
 
 Use `host.docker.internal` only when code running inside a container must reach a service
-running directly on the host, such as a llama.cpp server published on the host machine.
+running directly on the host, such as llama.cpp, ASR, or TTS servers published
+on the host machine.
 
 ---
 

@@ -11,13 +11,13 @@ RUN apt-get update \
 
 WORKDIR /workspace
 
-COPY rag_lib ./rag_lib
-COPY localAgent.worktrees/feature-auth ./localAgent.worktrees/feature-auth
+COPY --from=rag_lib . ./rag_lib
+COPY . ./localAgent
 
-WORKDIR /workspace/localAgent.worktrees/feature-auth
+WORKDIR /workspace/localAgent
 RUN uv sync --no-dev
 
-ENV PYTHONPATH=/workspace/localAgent.worktrees/feature-auth/src \
+ENV PYTHONPATH=/workspace/localAgent/src \
     LOCALAGENT_STATE_DIR=/data/state \
     LOCALAGENT_DOCS_DIR=/data/docs \
     LOCALAGENT_SKILLS_DIR=/data/skills \
@@ -25,7 +25,7 @@ ENV PYTHONPATH=/workspace/localAgent.worktrees/feature-auth/src \
 
 RUN useradd --create-home --uid 10001 app \
     && mkdir -p /data/state /data/docs /data/skills \
-    && chown -R app:app /workspace /data
+    && chown -R app:app /data
 
 USER app
 

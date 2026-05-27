@@ -1,27 +1,42 @@
+x-agent-build: &agent-build
+  context: .
+  dockerfile: Dockerfile
+  additional_contexts:
+    rag_lib: ../rag_lib
+
+x-agent-environment: &agent-environment
+  LOCALAGENT_MCP_URL: http://mcp-server:8000/sse
+  LOCALAGENT_MODEL_BASE_URL: ${LOCALAGENT_MODEL_BASE_URL:-http://host.docker.internal:8080/v1}
+  LOCALAGENT_MODEL_API_KEY: ${LOCALAGENT_MODEL_API_KEY:-no-key}
+  LOCALAGENT_ASR_BASE_URL: ${LOCALAGENT_ASR_BASE_URL:-http://host.docker.internal:8081/v1}
+  LOCALAGENT_TTS_BASE_URL: ${LOCALAGENT_TTS_BASE_URL:-http://host.docker.internal:8082/v1}
+  LOCALAGENT_ADMIN_USERNAME: ${LOCALAGENT_ADMIN_USERNAME:-}
+  LOCALAGENT_ADMIN_PASSWORD: ${LOCALAGENT_ADMIN_PASSWORD:-}
+  LOCALAGENT_COOKIE_SECURE: ${LOCALAGENT_COOKIE_SECURE:-false}
+  LOCALAGENT_STATE_DIR: /data/state
+  LOCALAGENT_DOCS_DIR: /data/docs
+  LOCALAGENT_SKILLS_DIR: /data/skills
+
+x-agent-volumes: &agent-volumes
+  - ./user_docs:/data/docs:ro
+  - ./skills:/data/skills
+  - agent_state:/data/state
+
+x-agent-depends-on: &agent-depends-on
+  mcp-server:
+    condition: service_healthy
+
 services:
   agent-app:
-    build:
-      context: ../..
-      dockerfile: localAgent.worktrees/feature-auth/Dockerfile
-    environment:
-      LOCALAGENT_MCP_URL: http://mcp-server:8000/sse
-      LOCALAGENT_MODEL_BASE_URL: ${LOCALAGENT_MODEL_BASE_URL:-http://host.docker.internal:8080/v1}
-      LOCALAGENT_MODEL_API_KEY: ${LOCALAGENT_MODEL_API_KEY:-no-key}
-      LOCALAGENT_ADMIN_USERNAME: ${LOCALAGENT_ADMIN_USERNAME:-}
-      LOCALAGENT_ADMIN_PASSWORD: ${LOCALAGENT_ADMIN_PASSWORD:-}
-      LOCALAGENT_COOKIE_SECURE: ${LOCALAGENT_COOKIE_SECURE:-false}
-      LOCALAGENT_STATE_DIR: /data/state
-      LOCALAGENT_DOCS_DIR: /data/docs
-      LOCALAGENT_SKILLS_DIR: /data/skills
+    image: localagent-agent:latest
+    build: *agent-build
+    environment: *agent-environment
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${LOCALAGENT_BIND:-127.0.0.1}:${LOCALAGENT_PORT:-8088}:8080"
-    volumes:
-      - ./user_docs:/data/docs:ro
-      - ./skills:/data/skills
-      - agent_state:/data/state
-    depends_on:
-      mcp-server:
-        condition: service_healthy
+    volumes: *agent-volumes
+    depends_on: *agent-depends-on
     networks:
       - agent-network
     restart: unless-stopped
@@ -32,9 +47,32 @@ services:
       retries: 5
       start_period: 20s
 
+  agent-cli:
+    profiles:
+      - cli
+    image: localagent-agent:latest
+    build: *agent-build
+    environment:
+      <<: *agent-environment
+      LOCALAGENT_COOKIE_SECURE: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./user_docs:/data/docs:ro
+      - ./skills:/data/skills
+      - agent_state:/data/state
+      - ./chat_history:/workspace/localAgent/chat_history
+      - ./.memory:/workspace/localAgent/.memory
+    depends_on: *agent-depends-on
+    networks:
+      - agent-network
+    command: [".venv/bin/python", "src/run_agents.py"]
+    stdin_open: true
+    tty: true
+
   mcp-server:
     build:
-      context: ../../mcp_server_local/mcp_web
+      context: ../mcp_server_local/mcp_web
       dockerfile: Dockerfile
     expose:
       - "8000"
@@ -56,6 +94,7 @@ services:
     tmpfs:
       - /tmp:size=512m,mode=1777
       - /home/app/.cache:size=512m,mode=700,uid=10001,gid=10001
+      - /home/app/.crawl4ai:size=512m,mode=700,uid=10001,gid=10001
     shm_size: "512mb"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
