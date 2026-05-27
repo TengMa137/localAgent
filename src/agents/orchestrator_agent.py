@@ -176,6 +176,11 @@ Forwardable answer, and use the notes/report summaries only to check whether
 planned tasks completed, whether coverage is partial, and whether uncertainty
 should be surfaced.
 
+Retrieval has already happened before this pass. If the Forwardable answer has
+any concrete result or useful caveat, do not replace it with a generic
+capability disclaimer such as saying you cannot browse, access the internet, or
+access real-time/current data.
+
 Do not mention internal routing, planning, effort budgets, memory decisions,
 task ledgers, or tool mechanics unless the user asked about them or the ledger
 shows a gap that materially affects the answer.
@@ -569,6 +574,74 @@ def _plan_result_prompt(
     return "\n\n".join(sections)
 
 
+def _extract_forwardable_answer(result: str) -> str | None:
+    """Return the plan handoff answer without orchestration notes."""
+    marker = "Forwardable answer:\n"
+    notes_marker = "\n\nOrchestrator notes:"
+    text = result.strip()
+    if marker in text:
+        text = text.split(marker, 1)[1]
+    if notes_marker in text:
+        text = text.split(notes_marker, 1)[0]
+    answer = text.strip()
+    if not answer or answer == "No answer returned.":
+        return None
+    return answer
+
+
+def _looks_like_retrieval_disclaimer(reply: str) -> bool:
+    """Detect generic capability disclaimers after specialist retrieval ran."""
+    normalized = " ".join(reply.lower().split())
+    if not normalized:
+        return True
+
+    limitation_markers = (
+        "don't have access",
+        "do not have access",
+        "can't access",
+        "cannot access",
+        "unable to access",
+        "lack access",
+        "no access",
+        "can't browse",
+        "cannot browse",
+        "unable to browse",
+        "can't provide real-time",
+        "cannot provide real-time",
+        "unable to provide real-time",
+        "can't provide live",
+        "cannot provide live",
+        "unable to provide live",
+    )
+    retrieval_terms = (
+        "internet",
+        "web",
+        "browse",
+        "real-time",
+        "real time",
+        "realtime",
+        "current",
+        "live",
+        "financial data",
+        "market data",
+        "prices",
+    )
+    return any(marker in normalized for marker in limitation_markers) and any(
+        term in normalized for term in retrieval_terms
+    )
+
+
+def _repair_answer_from_plan_result(
+    response: OrchestratorResponse,
+    plan_result: str,
+) -> OrchestratorResponse:
+    """Fall back to specialist output when the final pass ignores retrieval."""
+    forwardable_answer = _extract_forwardable_answer(plan_result)
+    if forwardable_answer and _looks_like_retrieval_disclaimer(response.reply):
+        return response.model_copy(update={"reply": forwardable_answer})
+    return response
+
+
 async def _response_and_messages(
     decision: OrchestratorDecision,
     message_history: list[ModelMessage],
@@ -606,7 +679,7 @@ async def _response_and_messages(
         indent=0,
         message_history=message_history,
     )
-    response = response_result.output
+    response = _repair_answer_from_plan_result(response_result.output, result)
     if decision.session_title and not response.session_title:
         response = response.model_copy(update={"session_title": decision.session_title})
     return response, response_result.all_messages()

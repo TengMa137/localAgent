@@ -780,6 +780,64 @@ async def test_orchestrator_plan_decision_uses_effort_budget(monkeypatch):
     assert "REPORT FILE: fs-report.md" in answer_prompts[0]
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_plan_answer_falls_back_to_forwardable_research(
+    monkeypatch,
+):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        OrchestratorResponse,
+        _response_and_messages,
+    )
+
+    forwardable = (
+        "Gold price research found a current web result: Rs 15,888 per gram "
+        "for 24K gold, with uncertainty around whether it is a live quote."
+    )
+
+    async def fake_plan_workflow(
+        _objective: str,
+        *,
+        max_tasks: int,
+        max_iterations: int,
+    ) -> str:
+        return (
+            "Forwardable answer:\n"
+            f"{forwardable}\n\n"
+            "Orchestrator notes:\n"
+            "- Execution status: complete-with-uncertainties\n"
+            "- Sources: https://www.goodreturns.in/gold-rates/"
+        )
+
+    async def fake_observable_run(_agent, _prompt, **_kwargs):
+        return SimpleNamespace(
+            output=OrchestratorResponse(
+                reply=(
+                    "I'm sorry, but I don't have access to real-time financial "
+                    "data. Please check a market data website."
+                )
+            ),
+            all_messages=lambda: [],
+        )
+
+    monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
+    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
+    monkeypatch.setattr(orchestrator_agent, "_current_report_dir", lambda: None)
+
+    response, messages = await _response_and_messages(
+        OrchestratorDecision(
+            route="plan",
+            objective="Research current gold prices for today",
+            effort="minimal",
+        ),
+        [],
+    )
+
+    assert response.reply == forwardable
+    assert messages == []
+
+
 def test_save_history_includes_report_dir(tmp_path):
     from run_agents import ChatSession, _save_history
 
