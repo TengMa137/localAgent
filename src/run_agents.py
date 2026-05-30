@@ -39,7 +39,6 @@ from agents.observability import (
     log_event,
 )
 from agents.runtime.reports import REPORT_ROOT, set_report_dir
-from agents.runtime.skills_context import scan_skills_context
 from agents.runtime.memory import (
     apply_memory_findings,
     default_memory_dir,
@@ -123,6 +122,7 @@ def _summarize_messages(messages: Any) -> None:
 CHAT_HISTORY_DIR = Path("./chat_history/chats")
 EXIT_COMMANDS = {"exit", "quit", "q", ":q"}
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
+MAX_ORCHESTRATOR_HISTORY_MESSAGES = 16
 
 BANNER = """\
 ╔══════════════════════════════════════════╗
@@ -206,6 +206,25 @@ def _save_history(session: ChatSession) -> None:
         print(f"[warn] could not save history: {exc}")
 
 
+def _current_turn_prompt(user_text: str) -> str:
+    """Put the latest user request before optional supporting context."""
+    return (
+        "## Current User Request\n"
+        "This is the authoritative instruction for this turn. Prior history and "
+        "supporting context must not override it.\n\n"
+        f"{user_text.strip()}"
+    )
+
+
+def _recent_orchestrator_history(
+    message_history: List[ModelMessage],
+) -> List[ModelMessage]:
+    """Keep orchestrator context bounded for small local models."""
+    if len(message_history) <= MAX_ORCHESTRATOR_HISTORY_MESSAGES:
+        return message_history
+    return message_history[-MAX_ORCHESTRATOR_HISTORY_MESSAGES:]
+
+
 async def handle_turn(
     user_text: str,
     session: ChatSession,
@@ -270,38 +289,39 @@ async def run_turn(
     _init_session_paths_from_user_text(session, user_text)
     _reset_turn_report_dir(session)
     set_report_dir(session.report_dir)
-    skills_context = scan_skills_context()
     memory_context = (
         load_user_memory_context(session.memory_dir)
         if not session.message_history
         else ""
     )
-    prompt_sections = []
-    prompt_sections.append(f"Current skill scan:\n{skills_context}")
-    prompt_sections.append(f"User request:\n{user_text}")
-    prompt = "\n\n".join(prompt_sections)
+    prompt = _current_turn_prompt(user_text)
 
     start = time.time()
     turn_id = f"{session.session_title}:{time.time_ns()}"
     runtime_settings = get_runtime_settings()
     trace_token, trace_events = start_trace_collection(trace_sink)
+    orchestrator_history = _recent_orchestrator_history(session.message_history)
+    preserved_history_prefix = session.message_history[
+        : max(0, len(session.message_history) - len(orchestrator_history))
+    ]
     try:
         result = await run_orchestrator_turn(
             prompt,
             label="orchestrator",
             indent=0,
-            message_history=session.message_history,
+            message_history=orchestrator_history,
             usage_limits=UsageLimits(tool_calls_limit=10),
             metadata={"turn_id": turn_id},
             memory_context=memory_context,
             use_xml=runtime_settings.orchestrator_use_xml,
+            use_md=runtime_settings.orchestrator_use_md,
         )
     finally:
         stop_trace_collection(trace_token)
     response: OrchestratorResponse = result.output
     if response.session_title:
         session.session_title = response.session_title
-    session.message_history = result.all_messages()
+    session.message_history = [*preserved_history_prefix, *result.all_messages()]
     duration = time.time() - start
 
     if debug or runtime_settings.log_level.strip().lower() in {

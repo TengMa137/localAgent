@@ -74,6 +74,74 @@ def test_filesystem_approval_uses_copy_destination(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.asyncio
+async def test_filesystem_duplicate_read_guard_rejects_same_call():
+    from pydantic_ai.exceptions import ModelRetry
+
+    from agents.runtime.context import DuplicateFilesystemReadGuardToolset
+
+    calls: list[tuple[str, dict]] = []
+
+    class Wrapped:
+        async def call_tool(self, name, tool_args, _ctx, _tool):
+            calls.append((name, tool_args))
+            return "ok"
+
+    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    ctx = SimpleNamespace(run_id="run-1", messages=[])
+    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_directory"))
+
+    assert (
+        await guard.call_tool(
+            "list_directory",
+            {"path": "/skills"},
+            ctx,
+            list_tool,
+        )
+        == "ok"
+    )
+    with pytest.raises(ModelRetry):
+        await guard.call_tool(
+            "list_directory",
+            {"path": "/skills"},
+            ctx,
+            list_tool,
+        )
+    assert calls == [("list_directory", {"path": "/skills"})]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_duplicate_read_guard_clears_after_write():
+    from agents.runtime.context import DuplicateFilesystemReadGuardToolset
+
+    class Wrapped:
+        async def call_tool(self, _name, _tool_args, _ctx, _tool):
+            return "ok"
+
+    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    ctx = SimpleNamespace(run_id="run-1", messages=[])
+    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_directory"))
+    write_tool = SimpleNamespace(tool_def=SimpleNamespace(name="write_file"))
+
+    await guard.call_tool("list_directory", {"path": "/skills"}, ctx, list_tool)
+    await guard.call_tool(
+        "write_file",
+        {"path": "/skills/a.md", "content": "x"},
+        ctx,
+        write_tool,
+    )
+
+    assert (
+        await guard.call_tool(
+            "list_directory",
+            {"path": "/skills"},
+            ctx,
+            list_tool,
+        )
+        == "ok"
+    )
+
+
 def test_default_skills_mount_is_writable_with_approval():
     from agents.runtime import context
 
@@ -384,6 +452,75 @@ def test_web_query_guidance_includes_time_sensitive_semantic_guidance():
     assert "avoid adding a bare year" in guidance
 
 
+def test_current_turn_prompt_prioritizes_user_request():
+    from run_agents import _current_turn_prompt
+
+    prompt = _current_turn_prompt("modify the title in the reply")
+
+    assert prompt.startswith("## Current User Request")
+    assert "authoritative instruction" in prompt
+    assert "modify the title" in prompt
+    assert "/skills/fitness/diet.md" not in prompt
+
+
+def test_recent_orchestrator_history_is_bounded():
+    from run_agents import MAX_ORCHESTRATOR_HISTORY_MESSAGES, _recent_orchestrator_history
+
+    messages = [
+        ModelRequest.user_text_prompt(f"message {idx}")
+        for idx in range(MAX_ORCHESTRATOR_HISTORY_MESSAGES + 3)
+    ]
+
+    assert _recent_orchestrator_history(messages) == messages[
+        -MAX_ORCHESTRATOR_HISTORY_MESSAGES:
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_sends_bounded_history_without_dropping_saved_history(
+    monkeypatch, tmp_path
+):
+    import run_agents
+    from agents.orchestrator_agent import OrchestratorResponse
+    from run_agents import ChatSession, MAX_ORCHESTRATOR_HISTORY_MESSAGES, run_turn
+
+    received_history_lengths: list[int] = []
+
+    async def fake_run_orchestrator_turn(prompt, **kwargs):
+        message_history = kwargs.get("message_history") or []
+        received_history_lengths.append(len(message_history))
+        return SimpleNamespace(
+            output=OrchestratorResponse(reply="ok"),
+            decision=SimpleNamespace(memory_findings=[]),
+            delegated=False,
+            all_messages=lambda: [
+                *message_history,
+                ModelRequest.user_text_prompt(prompt),
+            ],
+        )
+
+    monkeypatch.setattr(run_agents, "run_orchestrator_turn", fake_run_orchestrator_turn)
+    monkeypatch.setattr(run_agents, "load_user_memory_context", lambda _memory_dir: "")
+
+    old_messages = [
+        ModelRequest.user_text_prompt(f"message {idx}")
+        for idx in range(MAX_ORCHESTRATOR_HISTORY_MESSAGES + 3)
+    ]
+    session = ChatSession(
+        message_history=old_messages.copy(),
+        session_title="session",
+        history_path=tmp_path / "session.json",
+        report_dir=tmp_path / "reports",
+        memory_dir=tmp_path / "memory",
+    )
+
+    await run_turn("new request", session)
+
+    assert received_history_lengths == [MAX_ORCHESTRATOR_HISTORY_MESSAGES]
+    assert session.message_history[: len(old_messages)] == old_messages
+    assert len(session.message_history) == len(old_messages) + 1
+
+
 def test_orchestrator_decision_requires_route_payload():
     from pydantic import ValidationError
 
@@ -406,6 +543,12 @@ def test_orchestrator_decision_requires_route_payload():
     )
 
 
+def test_orchestrator_deep_effort_caps_iterations_at_three():
+    from agents.orchestrator_agent import _plan_budget
+
+    assert _plan_budget("deep")[1] == 3
+
+
 def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
     from localagent_settings import AgentRuntimeSettings, get_runtime_settings
 
@@ -420,6 +563,7 @@ def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
             [
                 "LOCALAGENT_MEMORY_ENABLED=false",
                 "LOCALAGENT_ORCHESTRATOR_USE_XML=xml",
+                "LOCALAGENT_ORCHESTRATOR_USE_MD=markdown",
                 "LOCALAGENT_SKILLS_MODE=RO",
             ]
         ),
@@ -431,6 +575,7 @@ def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
 
     assert settings.memory_enabled is False
     assert settings.orchestrator_use_xml is True
+    assert settings.orchestrator_use_md is True
     assert settings.skills_mode == "ro"
     get_runtime_settings.cache_clear()
 
@@ -538,6 +683,80 @@ def test_parse_xml_orchestrator_decision_accepts_fenced_document():
     assert decision.reply == "Use general reasoning for stable concepts."
 
 
+def test_parse_md_orchestrator_decision_with_memory():
+    from agents.orchestrator_agent import _parse_md_orchestrator_decision
+
+    decision = _parse_md_orchestrator_decision(
+        """
+# Decision
+## Route
+plan
+## Reply
+none
+## Objective
+Read /docs/notes.md and summarize it.
+## Effort
+minimal
+## Routing Reason
+The request needs local file access.
+## Session Title
+read-notes
+## Memory Findings
+### Finding
+category: preference
+text: User prefers concise answers with direct file references.
+explicit: true
+confidence: 0.95
+sensitivity: low
+reason: User stated a durable response preference.
+"""
+    )
+
+    assert decision.route == "plan"
+    assert decision.objective == "Read /docs/notes.md and summarize it."
+    assert decision.reply is None
+    assert decision.effort == "minimal"
+    assert decision.session_title == "read-notes"
+    assert len(decision.memory_findings) == 1
+    assert decision.memory_findings[0].explicit is True
+
+
+def test_parse_md_orchestrator_decision_preserves_reply_headings():
+    from agents.orchestrator_agent import _parse_md_orchestrator_decision
+
+    decision = _parse_md_orchestrator_decision(
+        """
+# Decision
+## Route
+direct
+## Reply
+Here is the answer.
+
+## Details
+- Keep this heading inside the reply.
+
+# A Top-Level Reply Heading
+More reply text.
+## Objective
+none
+## Effort
+none
+## Routing Reason
+The request can be answered directly.
+## Session Title
+none
+## Memory Findings
+none
+"""
+    )
+
+    assert decision.route == "direct"
+    assert decision.reply is not None
+    assert "## Details" in decision.reply
+    assert "# A Top-Level Reply Heading" in decision.reply
+    assert "## Objective" not in decision.reply
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_turn_uses_xml_output_contract(monkeypatch):
     from agents import orchestrator_agent
@@ -565,6 +784,7 @@ async def test_orchestrator_turn_uses_xml_output_contract(monkeypatch):
         )
 
     monkeypatch.setenv("LOCALAGENT_ORCHESTRATOR_USE_XML", "true")
+    monkeypatch.setenv("LOCALAGENT_ORCHESTRATOR_USE_MD", "false")
     get_runtime_settings.cache_clear()
     monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
 
@@ -572,6 +792,52 @@ async def test_orchestrator_turn_uses_xml_output_contract(monkeypatch):
 
     assert seen["agent"] is orchestrator_agent.orchestrator_xml
     assert "XML output format:" in orchestrator_agent._orchestrator_xml_prompt()
+    assert result.output.reply == "Hello."
+    assert result.decision.route == "direct"
+    assert result.decision.session_title == "hello"
+    get_runtime_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_turn_uses_md_output_contract(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import run_orchestrator_turn
+    from localagent_settings import get_runtime_settings
+
+    seen: dict[str, object] = {}
+
+    async def fake_observable_run(agent, prompt, **_kwargs):
+        seen["agent"] = agent
+        seen["prompt"] = prompt
+        return SimpleNamespace(
+            output="""
+# Decision
+## Route
+direct
+## Reply
+Hello.
+## Objective
+none
+## Effort
+none
+## Routing Reason
+Greeting can be answered directly.
+## Session Title
+hello
+## Memory Findings
+none
+""",
+            all_messages=lambda: [ModelRequest.user_text_prompt(prompt)],
+        )
+
+    monkeypatch.setenv("LOCALAGENT_ORCHESTRATOR_USE_MD", "true")
+    get_runtime_settings.cache_clear()
+    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
+
+    result = await run_orchestrator_turn("hello", use_md=True)
+
+    assert seen["agent"] is orchestrator_agent.orchestrator_md
+    assert "Markdown output format:" in orchestrator_agent._orchestrator_md_prompt()
     assert result.output.reply == "Hello."
     assert result.decision.route == "direct"
     assert result.decision.session_title == "hello"
@@ -608,7 +874,7 @@ async def test_orchestrator_xml_output_repair_retry(monkeypatch):
 
     monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
 
-    result = await run_orchestrator_turn("hello", use_xml=True)
+    result = await run_orchestrator_turn("hello", use_xml=True, use_md=False)
 
     assert len(calls) == 2
     assert "failed XML parsing or schema validation" in calls[1]
@@ -1118,7 +1384,6 @@ async def test_run_turn_clears_report_dir_each_turn(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(run_agents, "run_orchestrator_turn", fake_run_orchestrator_turn)
-    monkeypatch.setattr(run_agents, "scan_skills_context", lambda: "")
     monkeypatch.setattr(run_agents, "load_user_memory_context", lambda _memory_dir: "")
 
     session = ChatSession(
@@ -1173,7 +1438,6 @@ async def test_run_turn_loads_memory_once_as_orchestrator_context(
         )
 
     monkeypatch.setattr(run_agents, "run_orchestrator_turn", fake_run_orchestrator_turn)
-    monkeypatch.setattr(run_agents, "scan_skills_context", lambda: "")
 
     session = ChatSession(
         session_title="session",
@@ -1219,7 +1483,7 @@ def test_skills_context_includes_current_skill_paths():
     assert "fitness/workout.md" in context
 
 
-def test_fs_task_prompt_terminal_missing_file_after_full_index(monkeypatch, tmp_path):
+def test_fs_task_prompt_routes_missing_file_to_recovery(monkeypatch, tmp_path):
     from agents import fs_agent
 
     docs = tmp_path / "docs"
@@ -1232,11 +1496,234 @@ def test_fs_task_prompt_terminal_missing_file_after_full_index(monkeypatch, tmp_
     )
     monkeypatch.setattr(fs_agent, "validator", validator)
 
-    _prompt, analysis = fs_agent._fs_task_prompt("read /docs/not-present.md")
+    prompt, analysis = fs_agent._fs_task_prompt("read /docs/not-present.md")
 
     assert analysis.invalid_paths == ["/docs/not-present.md"]
-    assert analysis.terminal_issues
-    assert "File not found" in analysis.terminal_issues[0].reason
+    assert "Wrong-path recovery policy" in prompt
+    assert "Recovery order" in prompt
+    assert "find_paths over path='/'" in prompt
+    assert "grep_files searches file content only" in prompt
+    assert "ask the user to confirm the exact path" in prompt
+
+
+def test_fs_task_prompt_includes_candidate_paths_for_confirmation(monkeypatch, tmp_path):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "actual.md").write_text("hello")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    prompt, analysis = fs_agent._fs_task_prompt("read /docs/acutal.md")
+
+    assert analysis.invalid_paths == ["/docs/acutal.md"]
+    assert analysis.candidate_paths == ["/docs/actual.md"]
+    assert "Possible replacement path candidates" in prompt
+    assert "- /docs/actual.md" in prompt
+
+
+def test_fs_task_prompt_tells_agent_to_use_resolved_paths_first(monkeypatch, tmp_path):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "actual.md").write_text("hello", encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    prompt, analysis = fs_agent._fs_task_prompt("read /docs/actual.md")
+
+    assert analysis.resolved_paths == ["/docs/actual.md"]
+    assert "perform the requested read, edit, or write directly" in prompt
+    assert "before doing any broad discovery" in prompt
+
+
+def test_fs_path_recovery_guard_allows_read_only_candidate_answer(
+    monkeypatch,
+    tmp_path,
+):
+    from agents import fs_agent
+    from agents.fs_agent import (
+        FsAgentResult,
+        PathAnalysis,
+        _apply_path_recovery_guard,
+    )
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "actual.md").write_text("hello", encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    output = FsAgentResult(
+        answer="The file says hello.",
+        summary="Found a possible file.",
+        paths=["/docs/actual.md"],
+    )
+    guarded = _apply_path_recovery_guard(
+        output,
+        PathAnalysis(
+            invalid_paths=["/skills/agentsystem.md"],
+            candidate_paths=["/docs/actual.md"],
+        ),
+    )
+
+    assert "Answered from likely replacement" in guarded.uncertainties[0]
+    assert "Heads up:" in (guarded.answer or "")
+    assert "could not find /skills/agentsystem.md" in (guarded.answer or "")
+    assert "/docs/actual.md is probably the closest match" in (guarded.answer or "")
+    assert "The file says hello." in (guarded.answer or "")
+
+
+def test_fs_path_recovery_guard_preserves_valid_path_answer(monkeypatch, tmp_path):
+    from agents import fs_agent
+    from agents.fs_agent import (
+        FsAgentResult,
+        PathAnalysis,
+        _apply_path_recovery_guard,
+    )
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.md").write_text("valid", encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    output = FsAgentResult(
+        answer="Summary of /docs/a.md.",
+        summary="Read valid path.",
+        paths=["/docs/a.md"],
+    )
+    guarded = _apply_path_recovery_guard(
+        output,
+        PathAnalysis(
+            resolved_paths=["/docs/a.md"],
+            invalid_paths=["/docs/missing.md"],
+            candidate_paths=["/docs/a.md"],
+        ),
+    )
+
+    assert "Summary of /docs/a.md." in (guarded.answer or "")
+    assert "/docs/a.md is probably the closest match" not in (guarded.answer or "")
+    assert "Handled valid requested path(s): /docs/a.md" in guarded.uncertainties[0]
+
+
+def test_fs_rag_paths_preserve_valid_paths_with_invalid_hint(monkeypatch, tmp_path):
+    from agents import fs_agent
+    from agents.fs_agent import FsAgentResult, PathAnalysis, _rag_paths_for_output
+
+    docs = tmp_path / "docs"
+    nested = docs / "nested"
+    nested.mkdir(parents=True)
+    (docs / "large.md").write_text("valid", encoding="utf-8")
+    (nested / "child.md").write_text("child", encoding="utf-8")
+    (docs / "candidate.md").write_text("candidate", encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    paths = _rag_paths_for_output(
+        FsAgentResult(
+            answer="Summary.",
+            summary="Read valid path.",
+            paths=[
+                "/docs/large.md",
+                "/docs/nested/child.md",
+                "/docs/candidate.md",
+            ],
+            needs_rag=True,
+        ),
+        PathAnalysis(
+            resolved_paths=["/docs/large.md", "/docs/nested"],
+            invalid_paths=["/docs/missing.md"],
+            candidate_paths=["/docs/candidate.md"],
+        ),
+    )
+
+    assert paths == ["/docs/large.md", "/docs/nested", "/docs/nested/child.md"]
+
+
+def test_fs_path_recovery_guard_requires_confirmation_without_candidate_read():
+    from agents.fs_agent import (
+        FsAgentResult,
+        PathAnalysis,
+        _apply_path_recovery_guard,
+    )
+
+    output = FsAgentResult(
+        answer="I found this file.",
+        summary="Found a possible file.",
+        paths=[],
+    )
+    guarded = _apply_path_recovery_guard(
+        output,
+        PathAnalysis(
+            invalid_paths=["/skills/agentsystem.md"],
+            candidate_paths=["/docs/actual.md"],
+        ),
+    )
+
+    assert "Exact-path confirmation is required" in guarded.uncertainties[0]
+    assert "/docs/actual.md" in guarded.uncertainties[0]
+    assert "Please confirm the exact path" in (guarded.answer or "")
+
+
+def test_fs_path_recovery_guard_reports_not_found_without_candidates():
+    from agents.fs_agent import (
+        FsAgentResult,
+        PathAnalysis,
+        _apply_path_recovery_guard,
+    )
+
+    output = FsAgentResult(answer=None, summary="No result.")
+    guarded = _apply_path_recovery_guard(
+        output,
+        PathAnalysis(invalid_paths=["/skills/agentsystem.md"]),
+    )
+
+    assert "could not find the requested file path" in (guarded.answer or "")
+    assert "No plausible replacement path" in guarded.uncertainties[0]
+
+
+def test_fs_path_recovery_guard_ignores_echoed_invalid_output_path():
+    from agents.fs_agent import (
+        FsAgentResult,
+        PathAnalysis,
+        _apply_path_recovery_guard,
+    )
+
+    output = FsAgentResult(
+        answer="Maybe this path.",
+        summary="No result.",
+        paths=["/skills/agentsystem.md"],
+    )
+    guarded = _apply_path_recovery_guard(
+        output,
+        PathAnalysis(invalid_paths=["/skills/agentsystem.md"]),
+    )
+
+    assert "could not find the requested file path" in (guarded.answer or "")
+    assert "Please confirm the exact path" not in (guarded.answer or "")
 
 
 def test_fs_task_prompt_does_not_infer_write_intent(monkeypatch, tmp_path):
@@ -1256,7 +1743,6 @@ def test_fs_task_prompt_does_not_infer_write_intent(monkeypatch, tmp_path):
 
     assert analysis.invalid_paths == []
     assert analysis.resolved_paths == ["/docs/actual.md"]
-    assert analysis.terminal_issues == []
 
 
 def test_fs_usage_limit_error_is_not_reported_as_file_access_problem():

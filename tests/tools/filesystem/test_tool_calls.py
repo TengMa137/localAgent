@@ -17,6 +17,7 @@ def test_filesystem_tools_are_registered(filesystem_toolset):
         "edit_file",
         "search_and_replace",
         "list_files",
+        "find_paths",
         "list_directory",
         "make_directory",
         "grep_files",
@@ -37,6 +38,7 @@ async def test_filesystem_tool_descriptions_name_actual_roots(tools_in_toolset):
     ]
 
     assert any("/data" in description for description in descriptions)
+    assert any("grep_files searches file contents" in description for description in descriptions)
     assert not any("'/mount" in description for description in descriptions)
 
 
@@ -215,6 +217,22 @@ async def test_list_files_can_include_directories_and_depth(filesystem_toolset, 
     )
 
     assert result.files == ["/data/root.txt", "/data/sub"]
+
+
+@pytest.mark.asyncio
+async def test_find_paths_matches_filename_across_readable_root(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "agentsystem.md").write_text("hello")
+    (tmp_path / "other.md").write_text("agentsystem.md in content only")
+
+    result = await filesystem_toolset.call_tool(
+        "find_paths",
+        {"path":"/", "query":"agentsystem.md"},
+        ctx,
+        tools_in_toolset["find_paths"],
+    )
+
+    assert result.files == ["/data/notes/agentsystem.md"]
 
 
 @pytest.mark.asyncio

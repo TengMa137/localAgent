@@ -17,8 +17,8 @@ The agent handles three kinds of requests from a single conversation loop:
 
 The code is intentionally biased toward small local LLMs. Python owns the multi-step workflow,
 route execution, path validation, approval handling, deterministic RAG handoffs, and report
-memory. LLM calls are kept narrow: choose a typed route, plan typed tasks, extract evidence,
-reflect only when needed, and synthesize.
+memory. LLM calls are kept narrow: choose a typed route, plan typed tasks, run focused
+specialists, and synthesize.
 
 Current implementation highlights:
 
@@ -33,7 +33,8 @@ Current implementation highlights:
   or the web app state directory.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
 - Workers are mostly tool-free: Python retrieves evidence, workers extract findings.
-- Reflection is skipped when deterministic completion criteria are already met.
+- The planner no longer runs a reflection pass; it executes planned worker batches
+  within the configured iteration budget, then synthesizes from collected evidence.
 
 ---
 
@@ -479,7 +480,10 @@ tasks: fetching a web page, answering from a local file, or doing a straightforw
 search. The agent avoids asking small models to manage broad tool loops. The
 orchestrator emits a typed route decision only; Python executes the selected
 runner and performs deterministic RAG handoffs when content is large, multi-file,
-or fetched from the web.
+or fetched from the web. The current user request is placed before supporting
+context, orchestrator history is bounded, and filesystem read/discovery tools
+reject identical repeat calls in the same run. User intent is routed by the
+orchestrator and planner, not by regex or keyword heuristics in Python.
 
 ---
 
@@ -490,10 +494,11 @@ or fetched from the web.
 The orchestrator is the long-lived conversational agent. It accumulates `message_history`
 across turns and classifies each turn as either direct or plan.
 
-Before each turn, the shared runtime loads long-term user profile memory and any
-per-session agent reports, then injects them as context. It also refreshes and injects a
-deterministic `/skills` scan, so newly created or edited skills are visible on the next run.
-If chat/memory/report/skill context is sufficient, the orchestrator answers directly.
+Before each turn, the shared runtime loads long-term user profile memory and keeps the
+latest user request as the first prompt section. The orchestrator no longer receives the
+deterministic `/skills` catalog by default; filesystem specialists receive it only after
+the orchestrator has selected a filesystem route. If chat/memory/report context is
+sufficient, the orchestrator answers directly.
 Otherwise it returns a typed route decision and Python executes the selected route runner
 once. The specialist agents are not exposed as orchestrator tools.
 
@@ -510,6 +515,8 @@ a route.
 Set `LOCALAGENT_ORCHESTRATOR_USE_XML=true` to make the intake decision use an XML output
 contract such as `<route>plan</route>` instead of the default structured JSON contract. The
 parsed decision still becomes the same internal `OrchestratorDecision` object.
+Set `LOCALAGENT_ORCHESTRATOR_USE_MD=true` to use a Markdown decision contract with headings
+such as `## Route` and `## Objective`; it is parsed into the same internal object.
 
 ### fs_agent
 
@@ -521,6 +528,17 @@ trigger deterministic RAG over the discovered paths.
 
 Before each fs task, the agent receives the current deterministic `/skills` catalog plus a
 readable file index. This prevents skill-related requests from depending on guessed paths.
+Python preflight checks exact path hints first. If an injected path exists, `fs_agent` is
+instructed to read, edit, or write that exact path before running broad discovery. If the
+exact path does not exist, the prompt carries invalid path hints, deterministic candidates,
+and a recovery order: inspect candidates and the file index, use `find_paths`/`list_files`
+for filename or path discovery across accessible roots, then use `grep_files` only for
+content terms. For read-only recovery, one clear candidate may be used with a short heads-up
+to the user; edits and writes still require exact-path confirmation before touching a
+candidate. If no plausible path exists, the answer is a concise file-not-found result.
+The filesystem runtime also rejects identical repeated read/list/grep/stat calls during the
+same model run, nudging small models to use previous results, switch to targeted
+path/content discovery, or return an uncertainty instead of looping.
 
 Writes and edits still go through the existing `FilesystemValidator` and deferred approval
 policy.
@@ -555,8 +573,8 @@ After the model returns, Python normalizes the plan:
 ### Worker steps
 
 Worker steps are stateless and single-shot. The same worker module handles evidence
-extraction, web-query review, reflection, and synthesis with different system prompts and
-typed output schemas. For extraction, each worker receives one `TaskSpec`,
+extraction, web-query review, synthesis, and summary generation with different system prompts
+and typed output schemas. For extraction, each worker receives one `TaskSpec`,
 but it no longer chooses retrieval tools itself for the normal paths. Python executes retrieval from
 `TaskSpec.kind`:
 
@@ -569,18 +587,19 @@ but it no longer chooses retrieval tools itself for the normal paths. Python exe
 
 Multiple workers run in parallel via `asyncio.gather`, bounded by `MAX_PARALLEL_TASKS`.
 
-The extraction worker only extracts structured findings from retrieved evidence. Reflection
-and synthesis are also one-round worker steps, so workflow observability and usage limits stay
-centralized.
+The extraction worker only extracts structured findings from retrieved evidence. Synthesis is a
+one-round worker step, so workflow observability and usage limits stay centralized.
 
-### Reflect → Synthesise loop
+### Worker → Synthesise loop
 
-Reflection is optional. After each worker batch Python first checks deterministic completion
-criteria. If there are findings and no failures, suggested follow-ups, or blocking uncertainty,
-reflection is skipped. Otherwise a reflect worker step assesses completeness and may propose
-follow-up tasks for the next iteration (up to `MAX_ITERATIONS`). Once complete, a synthesis
-worker step produces the final report and includes the `as_of` date when the task is marked
-time-sensitive.
+The planner executes the normalized task list in worker batches, up to `MAX_ITERATIONS`.
+It does not run a reflection pass or invent follow-up tasks after worker execution. Once the
+planned batches finish or the iteration budget is reached, a synthesis worker step produces
+the final report and includes the `as_of` date when the task is marked time-sensitive. If
+filesystem evidence contains an invalid user path, synthesis answers from the useful
+filesystem result instead of recapping reports: it gives a short path-mismatch heads-up,
+uses a read-only replacement when one was actually inspected, or asks for exact-path
+confirmation before an edit.
 
 ### Agent reports
 
@@ -643,8 +662,9 @@ Available filesystem tools include:
 | `edit_file` | Replace one exact unique text occurrence |
 | `search_and_replace` | Replace exact or regex matches in one file |
 | `list_files` | Recursive glob listing with depth/hidden/result controls |
+| `find_paths` | Filename or virtual-path substring lookup |
 | `list_directory` | Shallow directory listing |
-| `grep_files` | Regex search across readable text files |
+| `grep_files` | Regex search across readable text file contents, not filenames |
 | `stat_path` | Inspect path type, size, mtime, and permissions |
 | `make_directory` | Create an empty directory |
 | `copy_file`, `move_file`, `delete_file` | File management operations |
@@ -693,10 +713,11 @@ returns:
 - `load_skill` — a helper factory kept with the skills toolset for agents that explicitly
   register it; the current normal routes rely on deterministic skill scans instead.
 
-At runtime, `scan_skills_context()` refreshes this index before each orchestrator turn and
-before each filesystem task. The scanner injects exact skill paths such as
-`fitness/diet.md` and `fitness/workout.md` into context, so agents should prefer the scanned
-paths over invented names.
+At runtime, `scan_skills_context()` refreshes this index before each filesystem task, not
+before the orchestrator route decision. The scanner injects exact skill paths such as
+`fitness/diet.md` and `fitness/workout.md` into the filesystem task context, so `fs_agent`
+should prefer the scanned paths over invented names without biasing unrelated requests
+toward `/skills`.
 
 When a filesystem task appears to create, edit, move, copy, or delete skill files, `fs_agent`
 deterministically loads `/skills/skill_editing.md` into the task prompt. This is a Python

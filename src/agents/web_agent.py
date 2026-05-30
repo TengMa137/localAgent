@@ -41,7 +41,7 @@ class WebAgentResult(BaseModel):
 web_agent = Agent(
     model=model,
     output_type=WebAgentResult,
-    output_retries=2,
+    output_retries=3,
     toolsets=[web_toolset],
     system_prompt="""
 You are a web research specialist.

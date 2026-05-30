@@ -61,18 +61,11 @@ KNOWN_SUFFIX_RE = re.compile(
 
 
 @dataclass
-class PathHintIssue:
-    path: str
-    reason: str
-    suggestions: list[str] = field(default_factory=list)
-
-
-@dataclass
 class PathAnalysis:
     invalid_paths: list[str] = field(default_factory=list)
     write_targets: list[str] = field(default_factory=list)
     resolved_paths: list[str] = field(default_factory=list)
-    terminal_issues: list[PathHintIssue] = field(default_factory=list)
+    candidate_paths: list[str] = field(default_factory=list)
 
     def all_path_hints(self) -> list[str]:
         """Return every path hint recorded during preflight."""
@@ -83,6 +76,7 @@ class PathAnalysis:
         self.invalid_paths = _dedupe(self.invalid_paths)
         self.write_targets = _dedupe(self.write_targets)
         self.resolved_paths = _dedupe(self.resolved_paths)
+        self.candidate_paths = _dedupe(self.candidate_paths)
 
 
 @dataclass
@@ -108,13 +102,24 @@ class FsPromptContext:
             f"{report_section}"
             f"{self.skill_policy}\n"
             "Tool-use policy:\n"
+            "- Python preflight has already checked exact path hints against the validator.\n"
+            "- If Resolved exact path hints or Valid write target path hints are listed, perform the requested read, edit, or write directly on those paths before doing any broad discovery.\n"
             "- Use the Readable file index below before calling discovery tools.\n"
-            "- For broad discovery, prefer grep_files or list_files over repeated list_directory calls.\n"
+            "- For broad discovery, prefer find_paths, list_files, or grep_files over repeated list_directory calls.\n"
             "- Do not call list_directory for a directory whose relevant files are already visible in the index.\n"
             "- Only call file tools with paths from resolved path hints, valid write targets, the file index, or a tool result.\n"
             "- Never invent paths. If no matching path exists, report uncertainty instead.\n"
             "- Never read the same path twice in one run.\n"
             "- After reading each relevant candidate file once, stop gathering and produce the result.\n\n"
+            "Wrong-path recovery policy:\n"
+            "- Invalid exact path hints mean the exact path check failed before tool use.\n"
+            "- Do not read, write, stat, or edit invalid exact path hints.\n"
+            "- Recovery order: first use possible replacement candidates and the readable file index; then call find_paths over path='/' for filename/path lookup; then list_files over path='/' when needed; only then use grep_files for content terms. Do not use grep_files for filename lookup; grep_files searches file content only.\n"
+            "- When invalid path hints are present, search all readable roots, not only the invalid hint's original root.\n"
+            "- For read-only requests, if exactly one plausible replacement is clearly the intended file, read it and answer with a short heads-up that the requested path was not found and the replacement path was used.\n"
+            "- For edit/write/delete/move/copy requests, do not modify a replacement candidate silently. Ask the user to confirm the exact path.\n"
+            "- If multiple plausible replacement paths remain, ask the user to confirm the exact path.\n"
+            "- If find_paths/list_files/grep_files/file-index review finds no plausible path, answer that the file was not found under the readable roots.\n\n"
             "Readable file index (actual validator paths):\n"
             f"{self._list(listed_files)}\n"
             f"File index truncated: {len(self.files) > len(listed_files)}\n\n"
@@ -124,6 +129,8 @@ class FsPromptContext:
             f"{self._list(self.analysis.write_targets)}\n\n"
             "Invalid exact path hints from the objective:\n"
             f"{self._list(self.analysis.invalid_paths)}\n\n"
+            "Possible replacement path candidates from deterministic path validation:\n"
+            f"{self._list(self.analysis.candidate_paths)}\n\n"
             "Use resolved paths and possible write targets exactly as listed. "
             "Do not call read/stat on invalid path hints; use the file index and "
             "discovery tools to find the intended file instead.\n\n"
@@ -141,7 +148,12 @@ class FsAgentResult(BaseModel):
         default=None,
         description="A concise answer the orchestrator can forward directly to the user.",
     )
-    summary: str
+    summary: str = Field(
+        description=(
+            "One concise outcome sentence. Do not summarize tool attempts, "
+            "directory listings, or trial-and-error search steps."
+        )
+    )
     paths: list[str] = Field(default_factory=list)
     changes_made: list[str] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
@@ -162,7 +174,7 @@ class FsAgentResult(BaseModel):
 fs_agent = Agent(
     model=model,
     output_type=[FsAgentResult, DeferredToolRequests],
-    output_retries=2,
+    output_retries=3,
     toolsets=[fs_toolset],
     system_prompt="""
 You are a filesystem specialist agent.
@@ -172,10 +184,15 @@ this is a filesystem task, so do not second-guess that routing.
 
 Rules:
   - Use only validator paths under the readable/writable roots in the prompt.
-  - Use the injected file index first; discover uncertain paths with list_files,
-    grep_files, list_directory, and stat only when the index is insufficient.
-  - Prefer list_files or grep_files for broad discovery. list_directory is for
-    immediate child inspection, not recursive search.
+  - Python preflight has already checked exact path hints. If resolved path hints
+    or valid write target hints are present, act on those exact paths first and
+    do not run broad discovery first.
+  - Use the injected file index first for invalid-path recovery; discover
+    uncertain paths with find_paths, list_files, grep_files, list_directory, and
+    stat only when the index is insufficient.
+  - Prefer find_paths or list_files for filename/path discovery. grep_files
+    searches file contents, not filenames. list_directory is for immediate child
+    inspection, not recursive search.
   - Never call read_file/read_image/stat on a path unless it came from the file
     index, resolved path hints, valid write targets, or a prior tool result.
   - Do not read the same file path twice in one run.
@@ -186,7 +203,13 @@ Rules:
   - For image files, use read_image to inspect visual content. Use read_file
     only for text/code files.
   - For writes under /skills, follow the injected skill editing policy.
+  - If invalid path hints or candidate paths are present, keep the user-facing
+    answer short: either answer from one clear read-only replacement with a
+    heads-up, ask for exact-path confirmation, or state file not found.
+  - Never edit, write, delete, move, or copy a replacement candidate unless it was
+    listed as a resolved exact path or valid write target.
   - Put a practical user-facing answer in answer and durable facts in findings.
+    Keep summary/findings focused on useful results, not tool-attempt history.
 """,
 )
 
@@ -309,10 +332,7 @@ class PathPreflight:
 
         suggestions = self._suggest(path)
         self.analysis.invalid_paths.append(path)
-        if self._has_known_suffix(path) and not suggestions:
-            self.analysis.terminal_issues.append(
-                PathHintIssue(path=path, reason=reason, suggestions=suggestions)
-            )
+        self.analysis.candidate_paths.extend(suggestions)
         return self._humanize(path)
 
     def _filename_matches(self, filename: str) -> list[str]:
@@ -427,44 +447,6 @@ def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
     return context.render(), analysis
 
 
-def _format_access_problem_report(
-    *,
-    objective: str,
-    issues: list[PathHintIssue],
-) -> str:
-    """Write and return a terminal path/access problem report."""
-    lines = [
-        "I could not complete the filesystem request because of a file access problem.",
-        "",
-        "What I checked:",
-        "- Scanned every file under the readable validator roots.",
-        "- Considered close filename/path matches for the path mentioned by the user.",
-        f"- {_roots_context()}",
-        "",
-        "Access problem:",
-    ]
-    for issue in issues:
-        lines.append(f"- {issue.path}: {issue.reason}")
-        if issue.suggestions:
-            lines.append("  Possible intended paths: " + ", ".join(issue.suggestions))
-    lines.extend(
-        [
-            "",
-            "No further agent retry can fix this automatically. The path needs to be corrected, made readable/writable in the validator, or changed on disk.",
-        ]
-    )
-    message = "\n".join(lines)
-    write_agent_report(
-        "fs",
-        objective=objective,
-        summary=message,
-        answer=message,
-        uncertainties=[issue.reason for issue in issues],
-        paths=[issue.path for issue in issues],
-    )
-    return message
-
-
 async def _run_fs_agent(prompt: str) -> FsAgentResult:
     """Run the model-backed filesystem specialist once."""
     result = await observable_run(
@@ -481,11 +463,17 @@ async def _run_fs_agent(prompt: str) -> FsAgentResult:
     return result.output
 
 
-async def _add_rag_evidence(objective: str, output: FsAgentResult) -> None:
+async def _add_rag_evidence(
+    objective: str,
+    output: FsAgentResult,
+    *,
+    paths: list[str] | None = None,
+) -> None:
     """Append deterministic local RAG evidence when the agent requests it."""
-    rag_paths = _paths_that_need_rag(output.paths)
+    candidate_paths = output.paths if paths is None else paths
+    rag_paths = _paths_that_need_rag(candidate_paths)
     if output.needs_rag:
-        rag_paths = _dedupe([*rag_paths, *output.paths])
+        rag_paths = _dedupe([*rag_paths, *candidate_paths])
     if not rag_paths:
         return
 
@@ -530,6 +518,152 @@ def _format_success_response(output: FsAgentResult) -> str:
             "Orchestrator notes:\n" + "\n".join(f"- {note}" for note in notes),
         ]
     )
+
+
+def _is_confirmable_output_candidate(path: str, invalid_paths: set[str]) -> bool:
+    if path in invalid_paths:
+        return False
+    try:
+        return validator.resolve(path).exists()
+    except Exception:
+        return False
+
+
+def _is_same_or_child_path(path: str, root: str) -> bool:
+    normalized = path.rstrip("/")
+    normalized_root = root.rstrip("/")
+    return normalized == normalized_root or normalized.startswith(f"{normalized_root}/")
+
+
+def _is_under_any_path(path: str, roots: list[str]) -> bool:
+    return any(_is_same_or_child_path(path, root) for root in roots)
+
+
+def _rag_paths_for_output(output: FsAgentResult, analysis: PathAnalysis) -> list[str]:
+    """Return paths that may feed RAG without using unconfirmed replacements."""
+    if not analysis.invalid_paths:
+        return output.paths
+
+    readable_roots = [
+        path for path in analysis.resolved_paths if validator.can_read(path)
+    ]
+    if not readable_roots:
+        return []
+
+    return _dedupe(
+        [
+            *readable_roots,
+            *(
+                path
+                for path in output.paths
+                if _is_under_any_path(path, readable_roots)
+            ),
+        ]
+    )
+
+
+def _candidate_match_phrase(candidate_paths: list[str]) -> str:
+    if len(candidate_paths) == 1:
+        return f"{candidate_paths[0]} is probably the closest match"
+    return "these paths are possible matches: " + ", ".join(candidate_paths)
+
+
+def _apply_path_recovery_guard(
+    output: FsAgentResult,
+    analysis: PathAnalysis,
+) -> FsAgentResult:
+    """Make invalid-path recovery explicit in the fs handoff."""
+    if not analysis.invalid_paths:
+        return output
+
+    invalid_paths = set(analysis.invalid_paths)
+    requested_valid_paths = _dedupe(
+        [
+            *analysis.resolved_paths,
+            *analysis.write_targets,
+        ]
+    )
+    output_candidate_paths = _dedupe(
+        [
+            path
+            for path in output.paths
+            if _is_confirmable_output_candidate(path, invalid_paths)
+            and not _is_under_any_path(path, requested_valid_paths)
+        ]
+    )
+    candidate_paths = _dedupe(
+        [
+            *(
+                path
+                for path in analysis.candidate_paths
+                if path not in invalid_paths
+                and not _is_under_any_path(path, requested_valid_paths)
+            ),
+            *output_candidate_paths,
+        ]
+    )
+    invalid = ", ".join(analysis.invalid_paths)
+    answer_body = (output.answer or output.summary).strip()
+    useful_requested_path_answer = bool(requested_valid_paths) and bool(
+        answer_body or output.findings or output.changes_made
+    )
+
+    useful_candidate_answer = (
+        bool(output_candidate_paths)
+        and not output.changes_made
+        and bool((output.answer or "").strip() or output.findings)
+    )
+    if useful_requested_path_answer:
+        handled = ", ".join(requested_valid_paths)
+        candidate_note = (
+            f" {_candidate_match_phrase(candidate_paths)}."
+            if candidate_paths
+            else ""
+        )
+        uncertainty = (
+            f"Requested path not found: {invalid}.{candidate_note} "
+            f"Handled valid requested path(s): {handled}."
+        )
+        answer = f"Heads up: I could not find {invalid}.{candidate_note}"
+        if answer_body:
+            answer = f"{answer}\n\n{answer_body}"
+    elif useful_candidate_answer:
+        candidate_phrase = _candidate_match_phrase(output_candidate_paths)
+        uncertainty = (
+            f"Requested path not found: {invalid}. Answered from likely "
+            f"replacement path(s): {', '.join(output_candidate_paths)}."
+        )
+        answer = (
+            f"Heads up: I could not find {invalid}. {candidate_phrase}, so I "
+            f"used it for this answer.\n\n{answer_body}"
+        )
+    elif candidate_paths:
+        candidate_phrase = _candidate_match_phrase(candidate_paths)
+        uncertainty = (
+            f"Invalid path hint(s): {invalid}. Plausible replacement path(s): "
+            f"{', '.join(candidate_paths)}. Exact-path confirmation is required "
+            "before editing or treating a candidate as the target."
+        )
+        answer = (
+            f"I could not find {invalid}. {candidate_phrase}. Please confirm "
+            "the exact path before I edit it or treat it as the target."
+        )
+    else:
+        roots = ", ".join(validator.readable_roots) or "none"
+        uncertainty = (
+            f"Invalid path hint(s): {invalid}. No plausible replacement path was "
+            f"found under readable roots: {roots}."
+        )
+        answer = (
+            f"I could not find the requested file path ({invalid}) under the "
+            f"readable roots: {roots}."
+        )
+
+    updates: dict[str, object] = {
+        "uncertainties": _dedupe([*output.uncertainties, uncertainty]),
+        "answer": answer,
+    }
+    return output.model_copy(update=updates)
 
 
 def _format_exception_report(objective: str, exc: Exception) -> str:
@@ -590,11 +724,6 @@ async def run_fs_task(objective: str) -> str:
         )
     if path_analysis.write_targets:
         _rt(f"[fs_agent] write target hints: {path_analysis.write_targets}", "dim", 1)
-    if path_analysis.terminal_issues:
-        return _format_access_problem_report(
-            objective=objective,
-            issues=path_analysis.terminal_issues,
-        )
 
     try:
         output = await _run_fs_agent(prompt)
@@ -602,7 +731,10 @@ async def run_fs_task(objective: str) -> str:
         _rt(f"[fs_agent] ERROR: {exc}", "red", 1)
         return _format_exception_report(objective, exc)
 
-    await _add_rag_evidence(objective, output)
+    output = _apply_path_recovery_guard(output, path_analysis)
+    rag_paths = _rag_paths_for_output(output, path_analysis)
+    if rag_paths:
+        await _add_rag_evidence(objective, output, paths=rag_paths)
     _write_success_report(objective, output)
 
     if path is not None:

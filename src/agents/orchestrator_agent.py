@@ -26,8 +26,8 @@ Agent roles:
     fs_agent and web/current tasks to web_agent, then returns specialist
     reports to the plan workflow.
 
-  Worker steps — stateless one-shot LLM calls for reflection, synthesis, and
-    conversation summarization.
+  Worker steps — stateless one-shot LLM calls for synthesis and conversation
+    summarization.
 
 Specialist routing:
   fs_agent owns local file discovery/read/write/edit.
@@ -76,8 +76,8 @@ PlanEffort = Literal["none", "minimal", "standard", "deep"]
 EFFORT_BUDGETS: dict[PlanEffort, tuple[int, int]] = {
     "none": (0, 0),
     "minimal": (1, 1),
-    "standard": (3, 1),
-    "deep": (5, 2),
+    "standard": (3, 2),
+    "deep": (5, 3),
 }
 _INITIAL_MEMORY_CONTEXT: ContextVar[str] = ContextVar(
     "orchestrator_initial_memory_context",
@@ -150,21 +150,28 @@ class ParsedOrchestratorDecisionRun:
 orchestrator = Agent(
     model=model,
     output_type=OrchestratorDecision,
-    output_retries=2,
+    output_retries=3,
 )
 
 
 orchestrator_xml = Agent(
     model=model,
     output_type=str,
-    output_retries=0,
+    output_retries=3,
+)
+
+
+orchestrator_md = Agent(
+    model=model,
+    output_type=str,
+    output_retries=3,
 )
 
 
 orchestrator_answer = Agent(
     model=model,
     output_type=OrchestratorResponse,
-    output_retries=1,
+    output_retries=3,
     system_prompt="""
 You are the final answer pass of the orchestrator.
 
@@ -175,6 +182,11 @@ Answer the user's original objective directly and concisely from the
 Forwardable answer, and use the notes/report summaries only to check whether
 planned tasks completed, whether coverage is partial, and whether uncertainty
 should be surfaced.
+
+Do not summarize reports, task ledgers, or trial-and-error search steps back to
+the user. If filesystem recovery found a likely replacement path, give a short
+heads-up like "I couldn't find X; Y looks like the closest match" and then answer
+the user's request or ask for the exact-path confirmation needed for edits.
 
 Retrieval has already happened before this pass. If the Forwardable answer has
 any concrete result or useful caveat, do not replace it with a generic
@@ -357,11 +369,49 @@ session_title, text, and reason.
 """
 
 
-def _orchestrator_prompt(use_xml: bool = False) -> str:
+def _md_output_contract() -> str:
+    return """
+Markdown output format:
+  Return exactly one Markdown decision document. Do not wrap it in a code fence
+  and do not add prose outside these headings.
+
+Required headings:
+# Decision
+## Route
+direct|plan
+## Reply
+Required only for direct routes; write "none" for plan.
+## Objective
+Required only for plan routes; write "none" for direct.
+## Effort
+none|minimal|standard|deep
+## Routing Reason
+One concise sentence for observability.
+## Session Title
+First-turn kebab-case slug max 6 words, otherwise "none".
+## Memory Findings
+none
+
+If memory findings are needed, put one finding block under Memory Findings:
+### Finding
+category: preference|environment|project|identity|instruction|other
+text: One concise durable memory sentence.
+explicit: true|false
+confidence: 0.0 to 1.0
+sensitivity: low|medium|high
+reason: Short audit reason.
+"""
+
+
+def _orchestrator_prompt(use_xml: bool = False, use_md: bool = False) -> str:
     prompt = _orchestrator_prompt_body()
-    prompt = (
-        f"{prompt}\n{_xml_output_contract() if use_xml else _json_output_contract()}"
-    )
+    if use_md:
+        contract = _md_output_contract()
+    elif use_xml:
+        contract = _xml_output_contract()
+    else:
+        contract = _json_output_contract()
+    prompt = f"{prompt}\n{contract}"
     memory_context = _INITIAL_MEMORY_CONTEXT.get().strip()
     if memory_context:
         prompt = (
@@ -380,6 +430,11 @@ def _orchestrator_json_prompt() -> str:
 @orchestrator_xml.system_prompt
 def _orchestrator_xml_prompt() -> str:
     return _orchestrator_prompt(use_xml=True)
+
+
+@orchestrator_md.system_prompt
+def _orchestrator_md_prompt() -> str:
+    return _orchestrator_prompt(use_md=True)
 
 
 def _plan_budget(effort: PlanEffort) -> tuple[int, int]:
@@ -482,6 +537,92 @@ def _parse_xml_orchestrator_decision(output: str) -> OrchestratorDecision:
     )
 
 
+def _md_value_or_none(value: str) -> str | None:
+    stripped = value.strip()
+    if not stripped or stripped.lower() in {"none", "null", "n/a"}:
+        return None
+    return stripped
+
+
+def _parse_md_sections(output: str) -> dict[str, str]:
+    section_names = {
+        "route",
+        "reply",
+        "objective",
+        "effort",
+        "routing_reason",
+        "session_title",
+        "memory_findings",
+    }
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            heading = line[3:].strip().lower().replace(" ", "_")
+            if heading in section_names:
+                current = heading
+                sections.setdefault(current, [])
+                continue
+        if line.strip().lower() == "# decision":
+            continue
+        if current is not None:
+            sections[current].append(raw_line.rstrip())
+    return {key: "\n".join(value).strip() for key, value in sections.items()}
+
+
+def _parse_md_memory_findings(section: str) -> list[MemoryFinding]:
+    text = section.strip()
+    if not text or text.lower() in {"none", "null", "n/a"}:
+        return []
+
+    findings: list[MemoryFinding] = []
+    current: dict[str, Any] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("### "):
+            if current.get("text"):
+                findings.append(MemoryFinding.model_validate(current))
+            current = {}
+            continue
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "explicit":
+            current[key] = _xml_bool(value)
+        elif key == "confidence":
+            current[key] = _xml_float(value)
+        elif key in {"category", "text", "sensitivity", "reason"}:
+            current[key] = value
+    if current.get("text"):
+        findings.append(MemoryFinding.model_validate(current))
+    return findings
+
+
+def _parse_md_orchestrator_decision(output: str) -> OrchestratorDecision:
+    sections = _parse_md_sections(output)
+    route = sections.get("route", "").strip()
+    if not route:
+        raise ValueError("orchestrator Markdown output is missing Route")
+    return OrchestratorDecision.model_validate(
+        {
+            "route": route,
+            "reply": _md_value_or_none(sections.get("reply", "")),
+            "objective": _md_value_or_none(sections.get("objective", "")),
+            "effort": sections.get("effort", "").strip() or "none",
+            "routing_reason": sections.get("routing_reason", "").strip(),
+            "memory_findings": _parse_md_memory_findings(
+                sections.get("memory_findings", "")
+            ),
+            "session_title": _md_value_or_none(sections.get("session_title", "")),
+        }
+    )
+
+
 def _xml_repair_prompt(
     *,
     original_prompt: str,
@@ -511,6 +652,34 @@ def _xml_repair_prompt(
         "  - route=clarify is only for missing user intent or a safety boundary "
         "that must be resolved before useful work can start.\n\n"
         f"{_xml_output_contract()}"
+    )
+
+
+def _md_repair_prompt(
+    *,
+    original_prompt: str,
+    previous_output: str,
+    error: str,
+) -> str:
+    return (
+        "Your previous orchestrator decision failed Markdown parsing or schema "
+        "validation.\n\n"
+        "Validation error:\n"
+        f"{error}\n\n"
+        "Original user prompt to route:\n"
+        f"{original_prompt}\n\n"
+        "Previous invalid output:\n"
+        f"{previous_output[:4000]}\n\n"
+        "Re-evaluate the route from the original prompt. Return only one valid "
+        "Markdown decision document with exactly the required headings.\n\n"
+        "Payload requirements:\n"
+        "  - Route direct requires non-empty Reply and Objective set to none.\n"
+        "  - Route plan requires non-empty Objective and Reply set to none.\n"
+        "  - Route plan is correct when the request needs filesystem, web, URL, "
+        "upload, codebase, or research execution.\n"
+        "  - Route direct is correct when the request can be answered from "
+        "general reasoning, chat history, memory, or reports.\n\n"
+        f"{_md_output_contract()}"
     )
 
 
@@ -553,6 +722,45 @@ async def _run_xml_orchestrator_decision(
     raise RuntimeError("unreachable XML orchestrator retry state")
 
 
+async def _run_md_orchestrator_decision(
+    prompt: str,
+    *,
+    label: str,
+    indent: int,
+    message_history: Optional[list[ModelMessage]],
+    metadata: dict[str, Any] | None,
+    **kwargs: Any,
+) -> Any:
+    current_prompt = prompt
+    current_history = message_history
+    for attempt in range(3):
+        result = await observable_run(
+            orchestrator_md,
+            current_prompt,
+            label=label,
+            indent=indent,
+            message_history=current_history,
+            metadata=metadata,
+            **kwargs,
+        )
+        try:
+            return ParsedOrchestratorDecisionRun(
+                output=_parse_md_orchestrator_decision(result.output),
+                messages=result.all_messages(),
+            )
+        except ValueError as exc:
+            if attempt >= 2:
+                raise
+            current_prompt = _md_repair_prompt(
+                original_prompt=prompt,
+                previous_output=str(result.output),
+                error=str(exc),
+            )
+            current_history = result.all_messages()
+
+    raise RuntimeError("unreachable Markdown orchestrator retry state")
+
+
 def _plan_result_prompt(
     objective: str,
     result: str,
@@ -563,6 +771,10 @@ def _plan_result_prompt(
     sections = [
         "Original objective:\n" + objective,
         "Suggested session title:\n" + (suggested_session_title or "none"),
+        "Final answer rule:\n"
+        "Answer the user from the Forwardable answer. Do not recap report files, "
+        "tool attempts, or orchestration notes unless they change the user-facing "
+        "answer.",
         "Plan workflow result:\n" + result.strip(),
     ]
     report_context = _load_agent_report_summaries(_current_report_dir())
@@ -694,6 +906,7 @@ async def run_orchestrator_turn(
     metadata: dict[str, Any] | None = None,
     memory_context: str | None = None,
     use_xml: bool | None = None,
+    use_md: bool | None = None,
     **kwargs: Any,
 ) -> OrchestratorRunResult:
     """
@@ -706,7 +919,17 @@ async def run_orchestrator_turn(
     memory_token = _INITIAL_MEMORY_CONTEXT.set(memory_context or "")
     try:
         xml_contract = _orchestrator_use_xml() if use_xml is None else use_xml
-        if xml_contract:
+        md_contract = get_runtime_settings().orchestrator_use_md if use_md is None else use_md
+        if md_contract:
+            decision_result = await _run_md_orchestrator_decision(
+                prompt,
+                label=label,
+                indent=indent,
+                message_history=message_history,
+                metadata=metadata,
+                **kwargs,
+            )
+        elif xml_contract:
             decision_result = await _run_xml_orchestrator_decision(
                 prompt,
                 label=label,

@@ -1,7 +1,13 @@
 import pytest
 
 from agents.runtime.query_policy import TaskKind
-from agents.worker import TaskSpec, _run_worker
+from agents.worker import SYNTHESIS_SYSTEM_PROMPT, TaskSpec, _run_worker
+
+
+def test_synthesis_prompt_preserves_filesystem_candidate_confirmation():
+    assert "give a short heads-up" in SYNTHESIS_SYSTEM_PROMPT
+    assert "exact-path confirmation" in SYNTHESIS_SYSTEM_PROMPT
+    assert "file-not-found" in SYNTHESIS_SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio

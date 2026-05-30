@@ -174,6 +174,43 @@ def _collect_matching_files(
                 return
 
 
+def _collect_path_name_matches(
+    resolved: Path,
+    query: str,
+    mount_point: str,
+    mount_root: Path,
+    results: set[str],
+    validator: FilesystemValidator,
+    *,
+    include_directories: bool = False,
+    include_hidden: bool = True,
+    max_results: int | None = None,
+) -> None:
+    """Collect files whose virtual path or basename contains query."""
+    query_normalized = query.replace("\\", "/").strip().lower()
+    if not query_normalized:
+        return
+    for match in resolved.rglob("*"):
+        is_file = match.is_file()
+        is_dir = match.is_dir()
+        if not is_file and not (include_directories and is_dir):
+            continue
+        try:
+            rel = match.relative_to(mount_root)
+        except ValueError:
+            continue
+        if not include_hidden and _is_hidden_path(rel):
+            continue
+        result_path = _format_result_path(mount_point, rel)
+        searchable = f"{match.name.lower()} {result_path.lower()}"
+        if query_normalized not in searchable:
+            continue
+        if validator.can_read(result_path):
+            results.add(result_path)
+            if max_results is not None and len(results) >= max_results:
+                return
+
+
 def _directory_entry(
     path: Path,
     *,
@@ -672,7 +709,8 @@ def make_filesystem_toolset(
         description=(
             "List files matching a glob pattern. "
             f"{read_path_hint} "
-            "Use '/' to list all readable roots."
+            "Use '/' to list all readable roots. Use this or find_paths for "
+            "filename/path discovery; grep_files searches file contents, not filenames."
         )
     )
     async def list_files(
@@ -747,9 +785,77 @@ def make_filesystem_toolset(
 
     @toolset.tool(
         description=(
+            "Find readable files by filename or virtual path substring. "
+            f"{read_path_hint} "
+            "Use this for path/name lookup such as 'agentsystem.md'. This does "
+            "not search file contents; use grep_files for content search."
+        )
+    )
+    async def find_paths(
+        ctx: RunContext,
+        query: str,
+        path: str = "/",
+        include_directories: bool = False,
+        include_hidden: bool = True,
+        max_results: int | None = 50,
+    ) -> ListFilesResult:
+        """Find files or directories by virtual path/name substring."""
+        if not query.strip():
+            raise ValueError("query must not be empty")
+        if max_results is not None and max_results < 1:
+            raise ValueError("max_results must be >= 1")
+
+        matching_paths: set[str] = set()
+        if path in ("/", ".", ""):
+            for root_virtual in filesystem_validator.readable_roots:
+                mount_point, resolved, _ = filesystem_validator.get_path_config(
+                    root_virtual, op="read"
+                )
+                mount_root = filesystem_validator.get_mount_root(mount_point)
+                if not resolved.exists():
+                    continue
+                _collect_path_name_matches(
+                    resolved,
+                    query,
+                    mount_point,
+                    mount_root,
+                    matching_paths,
+                    filesystem_validator,
+                    include_directories=include_directories,
+                    include_hidden=include_hidden,
+                    max_results=max_results,
+                )
+                if max_results is not None and len(matching_paths) >= max_results:
+                    break
+        else:
+            mount_point, resolved, _ = filesystem_validator.get_path_config(
+                path, op="read"
+            )
+            mount_root = filesystem_validator.get_mount_root(mount_point)
+            _collect_path_name_matches(
+                resolved,
+                query,
+                mount_point,
+                mount_root,
+                matching_paths,
+                filesystem_validator,
+                include_directories=include_directories,
+                include_hidden=include_hidden,
+                max_results=max_results,
+            )
+
+        files = sorted(matching_paths)
+        if max_results is not None:
+            files = files[:max_results]
+        return ListFilesResult(files=files, count=len(files))
+
+    @toolset.tool(
+        description=(
             "Search readable text files for a regular expression. "
             f"{read_path_hint} "
-            "Use file_pattern to limit files, e.g. '**/*.py'."
+            "Use file_pattern to limit files, e.g. '**/*.py'. This searches "
+            "file contents only, not filenames; use find_paths or list_files "
+            "for path/name lookup."
         )
     )
     async def grep_files(

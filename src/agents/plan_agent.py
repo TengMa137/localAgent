@@ -10,7 +10,6 @@ from .worker import (
     TaskSpec,
     _run_workers_limited,
     MAX_PARALLEL_TASKS,
-    run_reflect_worker,
     run_synthesis_worker,
 )
 from .runtime.query_policy import (
@@ -29,7 +28,7 @@ from .runtime.reports import (
 from tools.filesystem.text_ops import read_text_with_policy
 
 MAX_TASKS_PER_PLAN = 5
-MAX_ITERATIONS = 2
+MAX_ITERATIONS = 3
 MAX_PLAN_PREVIEW_CHARS = 4000
 MAX_HANDOFF_ITEMS = 5
 MAX_HANDOFF_ITEM_CHARS = 180
@@ -43,7 +42,7 @@ class PlanOutput(BaseModel):
 plan_agent = Agent(
     model=model,
     output_type=PlanOutput,
-    output_retries=2,
+    output_retries=3,
 )
 
 
@@ -73,6 +72,11 @@ Rule 1 — Web/real-time objectives ALWAYS need tasks.
 
 Rule 2 — File objectives: preview first, then decide honestly.
   Use the provided file previews.
+  Python has already resolved exact readable paths where possible. Do not infer
+  local-file intent from keywords; use the orchestrator objective and resolved
+  paths. If the objective explicitly asks filesystem work but no path resolved,
+  create one local_rag task with empty relevant_files so fs_agent can validate,
+  grep, and list accessible roots.
   Set initial_answer ONLY if ALL of these are true:
     a) The preview contains a complete, direct answer (not just related content)
     b) No web lookup is needed to validate or supplement it
@@ -122,7 +126,6 @@ class SessionState(BaseModel):
     uncertainties: list[str] = Field(default_factory=list)
     suggested_next_steps: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
-    confidence: str = "unknown"
 
 
 def _dedupe(items: Iterable[str]) -> list[str]:
@@ -138,7 +141,7 @@ def _update_state(
     for t, r in zip(tasks, results):
         state.completed_tasks.append(t.objective)
         if r.get("status") == "failed":
-            # Still record it as attempted so reflect doesn't re-spawn it
+            # Still record it as attempted so final handoff shows coverage.
             state.uncertainties.append(f"Worker failed for: {t.objective}")
             continue
         state.findings.extend(r.get("key_findings", []))
@@ -158,15 +161,6 @@ def _limit_tasks(
 ) -> list[TaskSpec]:
     done = set(completed)
     return [t for t in tasks if t.objective not in done][:k]
-
-
-def _state_summary(state: SessionState) -> str:
-    return (
-        f"Findings ({len(state.findings)}): {state.findings[:5]}\n"
-        f"Uncertainties: {state.uncertainties[:3]}\n"
-        f"Suggested next steps: {state.suggested_next_steps[:3]}\n"
-        f"Confidence: {state.confidence}"
-    )
 
 
 def _brief_handoff_text(text: str, limit: int = MAX_HANDOFF_ITEM_CHARS) -> str:
@@ -535,33 +529,6 @@ def _normalize_plan(
     ).normalize(plan_output)
 
 
-def _needs_reflect(state: SessionState, results: list[dict[str, Any]]) -> bool:
-    """Decide whether reflection is needed after a worker batch."""
-    return (
-        any(r.get("status") == "failed" for r in results)
-        or bool(state.suggested_next_steps)
-        or (bool(state.uncertainties) and not state.findings)
-    )
-
-
-def _record_reflection_uncertainty(
-    state: SessionState,
-    *,
-    confidence: str,
-    objective_complete: bool,
-    reason: str,
-) -> None:
-    """Record why the plan stopped without a confident reflection pass."""
-    notes: list[str] = []
-    if confidence != "high":
-        notes.append(f"Reflection confidence was {confidence}.")
-    if not objective_complete:
-        notes.append("Reflection did not mark the objective complete.")
-    notes.append(reason)
-    state.uncertainties.append(" ".join(notes))
-    state.uncertainties = _dedupe(state.uncertainties)
-
-
 @dataclass
 class PlannerInput:
     """Prepared prompt context for the planner model."""
@@ -660,21 +627,18 @@ async def _run_research_loop(
     max_tasks: int = MAX_TASKS_PER_PLAN,
     max_iterations: int = MAX_ITERATIONS,
 ) -> bool:
-    """Run worker batches and optional reflection until evidence is sufficient."""
+    """Run planned worker batches within the execution budget."""
     max_tasks = max(1, min(max_tasks, MAX_TASKS_PER_PLAN))
     max_iterations = max(1, min(max_iterations, MAX_ITERATIONS))
     used_current_info = False
-    state_plan = _limit_tasks(
-        tasks,
-        state.completed_tasks,
-        max_tasks,
-    )
-    _rt(f"[plan_agent] spawning {len(state_plan)} tasks", "yellow")
+    planned_tasks = tasks[:max_tasks]
+    _rt(f"[plan_agent] spawning {len(planned_tasks)} tasks", "yellow")
 
     for iteration in range(max_iterations):
-        if not state_plan:
+        pending = _limit_tasks(planned_tasks, state.completed_tasks, max_tasks)
+        if not pending:
             break
-        batch = state_plan[:MAX_PARALLEL_TASKS]
+        batch = pending[:MAX_PARALLEL_TASKS]
         used_current_info = used_current_info or any(
             task.requires_current_info for task in batch
         )
@@ -686,81 +650,14 @@ async def _run_research_loop(
         results = await _run_workers_limited(batch)
         _update_state(state, batch, results)
 
-        if state.findings and not _needs_reflect(state, results):
-            _rt("[reflect] skipped — deterministic completion criteria met", "green")
-            break
-
-        _rt(
-            f"[reflect] assessing completeness (confidence so far: {state.confidence})",
-            "dim",
+    remaining = _limit_tasks(planned_tasks, state.completed_tasks, max_tasks)
+    if remaining:
+        state.uncertainties.append(
+            "Research loop stopped before all planned tasks completed due to "
+            f"the iteration budget. Pending tasks: "
+            f"{', '.join(task.objective for task in remaining)}"
         )
-
-        reflect = await run_reflect_worker(
-            objective=objective,
-            state_summary=_state_summary(state),
-            label=f"reflect:iter{iteration + 1}",
-            indent=1,
-        )
-        state.confidence = reflect.confidence
-        _rt(
-            f"[reflect] complete={reflect.objective_complete} confidence={state.confidence}",
-            "dim",
-        )
-
-        confident = reflect.confidence == "high"
-        if reflect.objective_complete and state.findings and confident:
-            _rt("[reflect] objective complete — moving to synthesis", "green")
-            break
-        if reflect.objective_complete and not state.findings:
-            _rt(
-                "[reflect] ignored complete=true because no findings were collected",
-                "yellow",
-            )
-        if not confident:
-            _rt(
-                f"[reflect] confidence {reflect.confidence} — looking for follow-up work",
-                "yellow",
-            )
-
-        if iteration + 1 >= max_iterations:
-            _record_reflection_uncertainty(
-                state,
-                confidence=reflect.confidence,
-                objective_complete=reflect.objective_complete,
-                reason="No planning iterations remain.",
-            )
-            break
-
-        if not reflect.next_tasks:
-            _record_reflection_uncertainty(
-                state,
-                confidence=reflect.confidence,
-                objective_complete=reflect.objective_complete,
-                reason="Reflection returned no follow-up tasks.",
-            )
-            break
-
-        follow_up = _normalize_plan(
-            PlanOutput(tasks=reflect.next_tasks),
-            objective=objective,
-            matched_files=matched_files,
-            as_of=as_of,
-            max_tasks=max_tasks,
-        )
-        state_plan = _limit_tasks(
-            follow_up.tasks,
-            state.completed_tasks,
-            max_tasks,
-        )
-        if not state_plan:
-            _record_reflection_uncertainty(
-                state,
-                confidence=reflect.confidence,
-                objective_complete=reflect.objective_complete,
-                reason="Reflection follow-up tasks were already completed.",
-            )
-            break
-        _rt(f"[reflect] spawning {len(state_plan)} follow-up tasks", "yellow")
+        state.uncertainties = _dedupe(state.uncertainties)
 
     return used_current_info
 

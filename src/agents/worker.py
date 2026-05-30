@@ -1,7 +1,7 @@
+from datetime import datetime, timezone
 import asyncio
 import uuid
-from typing import Any, Dict, List, Literal, Optional, TypeVar
-from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
@@ -18,7 +18,6 @@ from .observability import observable_run, _rt, task_log_store, TaskLog
 MAX_PARALLEL_TASKS = 3
 MAX_TOOL_CALLS = 10
 T = TypeVar("T", bound=BaseModel)
-ConfidenceLevel = Literal["low", "high"]
 
 
 class TaskSpec(BaseModel):
@@ -42,60 +41,12 @@ class TaskSpec(BaseModel):
         return values
 
 
-class ReflectionOutput(BaseModel):
-    objective_complete: bool
-    confidence: ConfidenceLevel
-    next_tasks: List[TaskSpec]
-
-    @model_validator(mode="before")
-    @classmethod
-    def coerce_fields(cls, values: Any) -> Any:
-        if not isinstance(values, dict):
-            return values
-        if values.get("next_tasks") is None:
-            values["next_tasks"] = []
-        values["confidence"] = cls._coerce_confidence(values.get("confidence"))
-        return values
-
-    @staticmethod
-    def _coerce_confidence(value: Any) -> ConfidenceLevel:
-        """Accept old numeric confidence while keeping the model schema simple."""
-        if isinstance(value, bool):
-            return "high" if value else "low"
-        if isinstance(value, (int, float)):
-            return "high" if value >= 0.5 else "low"
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"high", "confident", "sufficient", "true", "1"}:
-                return "high"
-            if normalized in {"low", "uncertain", "insufficient", "false", "0"}:
-                return "low"
-        return "low"
-
-
 class SynthesisOutput(BaseModel):
     report: str
 
 
 class HistorySummaryOutput(BaseModel):
     summary: str
-
-
-REFLECT_SYSTEM_PROMPT = """
-Given current findings and uncertainties decide:
-
-  - objective_complete: true if the question can be answered confidently
-  - confidence: "high" or "low"
-  - next_tasks: concrete follow-ups if incomplete; empty if done
-
-Use confidence="high" only when the available evidence is enough to answer the
-objective. Use confidence="low" when important evidence is missing, ambiguous,
-stale, failed, or only partially relevant.
-If confidence="low", set objective_complete=false unless the evidence fully
-answers the objective despite minor caveats. Provide next_tasks whenever more
-retrieval could materially improve confidence.
-Avoid repeating tasks already listed as completed.
-"""
 
 
 SYNTHESIS_SYSTEM_PROMPT = """
@@ -105,8 +56,16 @@ Requirements:
   - Clear conclusion up front
   - Key findings grouped logically
   - Uncertainties stated explicitly
+  - Answer the user's question; do not recap report files, worker mechanics, or
+    trial-and-error search steps
   - If Time sensitive is true, include the As of date in the answer
   - Evidence-backed tone
+  - If filesystem evidence says an invalid path has plausible replacement
+    candidates, give a short heads-up such as "I couldn't find X; Y looks like
+    the closest match" before answering from a read-only candidate or asking for
+    exact-path confirmation before an edit
+  - If filesystem evidence says no plausible path exists, return that file-not-found
+    result without inventing another path
 
 Do not hallucinate citations or sources.
 """
@@ -134,7 +93,7 @@ async def _run_structured_worker(
         model=model,
         system_prompt=system_prompt,
         output_type=output_type,
-        output_retries=2,
+        output_retries=3,
     )
     return await observable_run(
         worker,
@@ -287,23 +246,6 @@ async def _run_workers_limited(tasks: List[TaskSpec]) -> List[Dict[str, Any]]:
             return await _run_worker(t)
 
     return await asyncio.gather(*[_run(t) for t in tasks])
-
-
-async def run_reflect_worker(
-    *,
-    objective: str,
-    state_summary: str,
-    label: str,
-    indent: int = 1,
-) -> ReflectionOutput:
-    result = await _run_structured_worker(
-        prompt=f"Original objective: {objective}\n{state_summary}",
-        system_prompt=REFLECT_SYSTEM_PROMPT,
-        output_type=ReflectionOutput,
-        label=label,
-        indent=indent,
-    )
-    return result.output
 
 
 async def run_synthesis_worker(

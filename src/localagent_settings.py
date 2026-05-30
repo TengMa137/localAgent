@@ -28,6 +28,7 @@ class AgentRuntimeSettings(LocalAgentSettings):
     memory_dir: Path = Path(".memory")
     memory_enabled: bool = True
     orchestrator_use_xml: bool = False
+    orchestrator_use_md: bool = False
     approve_tools: str = ""
     max_approval_rounds: int = 3
     log_level: str = ""
@@ -37,6 +38,13 @@ class AgentRuntimeSettings(LocalAgentSettings):
     @classmethod
     def parse_orchestrator_use_xml(cls, value: Any) -> Any:
         if isinstance(value, str) and value.strip().lower() == "xml":
+            return True
+        return value
+
+    @field_validator("orchestrator_use_md", mode="before")
+    @classmethod
+    def parse_orchestrator_use_md(cls, value: Any) -> Any:
+        if isinstance(value, str) and value.strip().lower() in {"md", "markdown"}:
             return True
         return value
 

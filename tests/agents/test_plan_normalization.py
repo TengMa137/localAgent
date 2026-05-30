@@ -11,7 +11,7 @@ from agents.plan_agent import (
     _normalize_plan,
 )
 from agents.runtime.query_policy import TaskKind, extract_urls, infer_task_kind
-from agents.worker import ReflectionOutput, TaskSpec
+from agents.worker import TaskSpec
 
 
 def test_query_policy_extracts_urls():
@@ -357,50 +357,25 @@ def test_plan_handoff_keeps_compact_task_ledger():
 
 
 @pytest.mark.asyncio
-async def test_research_loop_runs_followups_when_reflection_confidence_is_low(
-    monkeypatch,
-):
+async def test_research_loop_runs_planned_batches_without_reflection(monkeypatch):
     from agents import plan_agent
 
     worker_batches: list[list[str]] = []
 
     async def fake_workers(tasks):
         worker_batches.append([task.objective for task in tasks])
-        if len(worker_batches) == 1:
-            return [
-                {
-                    "status": "ok",
-                    "key_findings": [],
-                    "uncertainties": ["Need more evidence."],
-                    "suggested_next_steps": [],
-                    "cited_node_ids": [],
-                }
-            ]
         return [
             {
                 "status": "ok",
-                "key_findings": ["Follow-up evidence."],
+                "key_findings": [f"Evidence for {task.objective}"],
                 "uncertainties": [],
                 "suggested_next_steps": [],
                 "cited_node_ids": [],
             }
+            for task in tasks
         ]
 
-    async def fake_reflect(**_kwargs):
-        return ReflectionOutput(
-            objective_complete=False,
-            confidence="low",
-            next_tasks=[
-                TaskSpec(
-                    kind=TaskKind.WEB_SEARCH,
-                    objective="Run a targeted follow-up search",
-                    query="targeted follow-up",
-                )
-            ],
-        )
-
     monkeypatch.setattr(plan_agent, "_run_workers_limited", fake_workers)
-    monkeypatch.setattr(plan_agent, "run_reflect_worker", fake_reflect)
 
     state = SessionState(user_query="answer carefully")
     used_current_info = await _run_research_loop(
@@ -408,38 +383,43 @@ async def test_research_loop_runs_followups_when_reflection_confidence_is_low(
         matched_files=[],
         as_of="now",
         state=state,
-        tasks=[TaskSpec(kind=TaskKind.WEB_SEARCH, objective="Initial search")],
+        tasks=[
+            TaskSpec(kind=TaskKind.WEB_SEARCH, objective=f"Planned task {idx}")
+            for idx in range(5)
+        ],
     )
 
-    assert worker_batches == [["Initial search"], ["Run a targeted follow-up search"]]
-    assert state.findings == ["Follow-up evidence."]
-    assert used_current_info is True
+    assert worker_batches == [
+        ["Planned task 0", "Planned task 1", "Planned task 2"],
+        ["Planned task 3", "Planned task 4"],
+    ]
+    assert state.findings == [
+        "Evidence for Planned task 0",
+        "Evidence for Planned task 1",
+        "Evidence for Planned task 2",
+        "Evidence for Planned task 3",
+        "Evidence for Planned task 4",
+    ]
+    assert used_current_info is False
 
 
 @pytest.mark.asyncio
-async def test_research_loop_records_low_confidence_when_no_followup(monkeypatch):
+async def test_research_loop_records_pending_tasks_after_iteration_budget(monkeypatch):
     from agents import plan_agent
 
-    async def fake_workers(_tasks):
+    async def fake_workers(tasks):
         return [
             {
                 "status": "ok",
-                "key_findings": [],
-                "uncertainties": ["Important gap remains."],
+                "key_findings": [f"Evidence for {task.objective}"],
+                "uncertainties": [],
                 "suggested_next_steps": [],
                 "cited_node_ids": [],
             }
+            for task in tasks
         ]
 
-    async def fake_reflect(**_kwargs):
-        return ReflectionOutput(
-            objective_complete=False,
-            confidence="low",
-            next_tasks=[],
-        )
-
     monkeypatch.setattr(plan_agent, "_run_workers_limited", fake_workers)
-    monkeypatch.setattr(plan_agent, "run_reflect_worker", fake_reflect)
 
     state = SessionState(user_query="answer carefully")
     used_current_info = await _run_research_loop(
@@ -450,31 +430,23 @@ async def test_research_loop_records_low_confidence_when_no_followup(monkeypatch
         tasks=[
             TaskSpec(
                 kind=TaskKind.WEB_SEARCH,
-                objective="Initial search",
-                requires_current_info=True,
+                objective=f"Planned task {idx}",
+                requires_current_info=idx == 0,
             )
+            for idx in range(5)
         ],
+        max_iterations=1,
     )
 
     assert used_current_info is True
-    assert any("Reflection confidence was low" in note for note in state.uncertainties)
-    assert any("returned no follow-up tasks" in note for note in state.uncertainties)
-
-
-def test_reflection_output_coerces_legacy_numeric_confidence():
-    assert (
-        ReflectionOutput(
-            objective_complete=False,
-            confidence=0.2,
-            next_tasks=[],
-        ).confidence
-        == "low"
-    )
-    assert (
-        ReflectionOutput(
-            objective_complete=True,
-            confidence=0.9,
-            next_tasks=[],
-        ).confidence
-        == "high"
+    assert state.completed_tasks == [
+        "Planned task 0",
+        "Planned task 1",
+        "Planned task 2",
+    ]
+    assert any(
+        "iteration budget" in uncertainty
+        and "Planned task 3" in uncertainty
+        and "Planned task 4" in uncertainty
+        for uncertainty in state.uncertainties
     )
