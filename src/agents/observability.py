@@ -37,6 +37,11 @@ _trace_events: ContextVar[list[dict[str, Any]] | None] = ContextVar(
 )
 _trace_sink: ContextVar[Any] = ContextVar("localagent_trace_sink", default=None)
 _SYNTHETIC_OUTPUT_TOOLS = {"final_result"}
+_VOLATILE_TRACE_KINDS = {"text_delta", "thinking_delta", "tool_args_delta"}
+MAX_COLLECTED_TRACE_EVENTS = 600
+MAX_TRACE_FIELD_CHARS = 2000
+MAX_TASK_LOGS = 200
+MAX_TASK_LOG_FIELD_CHARS = 4000
 
 
 @dataclass(frozen=True)
@@ -116,17 +121,49 @@ def stop_trace_collection(token: tuple[Any, Any]) -> None:
 
 
 def _record_trace(event: dict[str, Any]) -> None:
-    events = _trace_events.get()
-    if events is None:
-        return
     payload = {
         "ts": datetime.now(timezone.utc).isoformat(),
-        **event,
+        **_compact_trace_payload(event),
     }
-    events.append(payload)
     sink = _trace_sink.get()
+    if payload.get("kind") in _VOLATILE_TRACE_KINDS:
+        if sink is not None:
+            sink(payload)
+        return
+
+    events = _trace_events.get()
+    if events is None:
+        if sink is not None:
+            sink(payload)
+        return
+    if len(events) >= MAX_COLLECTED_TRACE_EVENTS:
+        if events and events[-1].get("message") == "Trace event cap reached.":
+            return
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": "status",
+            "label": "runtime",
+            "message": "Trace event cap reached.",
+        }
+        events.append(payload)
+        if sink is not None:
+            sink(payload)
+        return
     if sink is not None:
         sink(payload)
+    events.append(payload)
+
+
+def _trim_text(value: Any, limit: int = MAX_TRACE_FIELD_CHARS) -> Any:
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return value[: limit - 14].rstrip() + "...<truncated>"
+
+
+def _compact_trace_payload(event: dict[str, Any]) -> dict[str, Any]:
+    return {key: _trim_text(value) for key, value in event.items()}
 
 
 async def observable_run(
@@ -622,7 +659,18 @@ class TaskLog(BaseModel):
     finished_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return self.model_dump()
+        return _compact_task_log(self.model_dump())
+
+
+def _compact_task_log(log: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("objective", "summary", "error"):
+        if key in log:
+            log[key] = _trim_text(log[key], MAX_TASK_LOG_FIELD_CHARS)
+    for key in ("key_findings", "uncertainties", "suggested_next_steps", "cited_node_ids"):
+        values = log.get(key)
+        if isinstance(values, list):
+            log[key] = [_trim_text(value, MAX_TASK_LOG_FIELD_CHARS) for value in values[:20]]
+    return log
 
 
 class TaskLogStore:
@@ -631,6 +679,8 @@ class TaskLogStore:
 
     def save(self, log: TaskLog) -> None:
         self._store[log.task_id] = log.to_dict()
+        while len(self._store) > MAX_TASK_LOGS:
+            self._store.pop(next(iter(self._store)))
 
     def get(self, task_id: str) -> Optional[Dict[str, Any]]:
         return self._store.get(task_id)

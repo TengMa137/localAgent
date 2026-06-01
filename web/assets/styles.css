@@ -794,6 +794,19 @@ select {
   scrollbar-color: var(--border-2) transparent;
 }
 
+.history-truncation-notice {
+  max-width: 680px;
+  margin: 0 auto 22px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--ink-2) 80%, transparent);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .message {
   display: grid;
   gap: 6px;
@@ -1029,6 +1042,11 @@ select {
   color: var(--text-3);
   font-family: var(--font-mono);
   font-size: 12px;
+}
+
+.message .bubble.streaming-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .message .bubble pre {

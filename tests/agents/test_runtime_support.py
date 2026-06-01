@@ -187,8 +187,18 @@ def test_fs_preflight_keeps_unmatched_known_suffix_filename():
     assert "missing config yaml" in sanitized
 
 
-def test_fs_task_prompt_includes_file_index_and_write_targets():
+def test_fs_task_prompt_includes_file_index_and_write_targets(monkeypatch):
     from agents import fs_agent
+
+    monkeypatch.setattr(
+        fs_agent,
+        "_readable_file_index",
+        lambda: [
+            "/skills/fitness/diet.md",
+            "/skills/fitness/workout.md",
+            "/skills/skill_editing.md",
+        ],
+    )
 
     prompt, analysis = fs_agent._fs_task_prompt(
         "summarize the /skills/local-fitness-skills file"
@@ -205,9 +215,9 @@ def test_fs_task_prompt_includes_file_index_and_write_targets():
     prompt, analysis = fs_agent._fs_task_prompt(
         "create /skills/fitness/movement_recovery.md."
     )
-    assert analysis.invalid_paths == []
+    assert analysis.invalid_paths == ["/skills/fitness/movement_recovery.md"]
     assert analysis.write_targets == ["/skills/fitness/movement_recovery.md"]
-    assert "Valid write target path hints" in prompt
+    assert "Potential new writable path hints" in prompt
     assert "- /skills/fitness/movement_recovery.md" in prompt
     assert "Skill editing policy hook" in prompt
     assert "Source: /skills/skill_editing.md" in prompt
@@ -563,7 +573,6 @@ def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
             [
                 "LOCALAGENT_MEMORY_ENABLED=false",
                 "LOCALAGENT_ORCHESTRATOR_USE_XML=xml",
-                "LOCALAGENT_ORCHESTRATOR_USE_MD=markdown",
                 "LOCALAGENT_SKILLS_MODE=RO",
             ]
         ),
@@ -575,7 +584,6 @@ def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
 
     assert settings.memory_enabled is False
     assert settings.orchestrator_use_xml is True
-    assert settings.orchestrator_use_md is True
     assert settings.skills_mode == "ro"
     get_runtime_settings.cache_clear()
 
@@ -612,6 +620,7 @@ def test_env_example_contains_only_supported_settings():
         "LOCALAGENT_ADMIN_USERNAME",
         "LOCALAGENT_ADMIN_PASSWORD",
         "LOCALAGENT_MAX_VOICE_AUDIO_BYTES",
+        "LOCALAGENT_AGENT_TURN_TIMEOUT_SECONDS",
     }
     compose_keys = {"LOCALAGENT_BIND", "LOCALAGENT_PORT"}
 
@@ -624,7 +633,7 @@ def test_env_example_contains_only_supported_settings():
     assert speech_keys <= env_keys
 
 
-def test_parse_xml_orchestrator_decision_with_memory():
+def test_parse_xml_orchestrator_decision_with_simple_fields():
     from agents.orchestrator_agent import _parse_xml_orchestrator_decision
 
     decision = _parse_xml_orchestrator_decision(
@@ -634,18 +643,6 @@ def test_parse_xml_orchestrator_decision_with_memory():
   <reply></reply>
   <objective>Read /docs/notes.md and summarize it.</objective>
   <effort>minimal</effort>
-  <routing_reason>The request needs local file access.</routing_reason>
-  <session_title>read-notes</session_title>
-  <memory_findings>
-    <finding>
-      <category>preference</category>
-      <text>User prefers concise answers with direct file references.</text>
-      <explicit>true</explicit>
-      <confidence>0.95</confidence>
-      <sensitivity>low</sensitivity>
-      <reason>User stated a durable response preference.</reason>
-    </finding>
-  </memory_findings>
 </decision>
 """
     )
@@ -654,10 +651,8 @@ def test_parse_xml_orchestrator_decision_with_memory():
     assert decision.objective == "Read /docs/notes.md and summarize it."
     assert decision.reply is None
     assert decision.effort == "minimal"
-    assert decision.session_title == "read-notes"
-    assert len(decision.memory_findings) == 1
-    assert decision.memory_findings[0].explicit is True
-    assert decision.memory_findings[0].confidence == 0.95
+    assert decision.session_title is None
+    assert decision.memory_findings == []
 
 
 def test_parse_xml_orchestrator_decision_accepts_fenced_document():
@@ -671,9 +666,6 @@ def test_parse_xml_orchestrator_decision_accepts_fenced_document():
   <reply><![CDATA[Use general reasoning for stable concepts.]]></reply>
   <objective></objective>
   <effort>none</effort>
-  <routing_reason><![CDATA[No retrieval is needed.]]></routing_reason>
-  <session_title></session_title>
-  <memory_findings/>
 </decision>
 ```
 """
@@ -681,80 +673,6 @@ def test_parse_xml_orchestrator_decision_accepts_fenced_document():
 
     assert decision.route == "direct"
     assert decision.reply == "Use general reasoning for stable concepts."
-
-
-def test_parse_md_orchestrator_decision_with_memory():
-    from agents.orchestrator_agent import _parse_md_orchestrator_decision
-
-    decision = _parse_md_orchestrator_decision(
-        """
-# Decision
-## Route
-plan
-## Reply
-none
-## Objective
-Read /docs/notes.md and summarize it.
-## Effort
-minimal
-## Routing Reason
-The request needs local file access.
-## Session Title
-read-notes
-## Memory Findings
-### Finding
-category: preference
-text: User prefers concise answers with direct file references.
-explicit: true
-confidence: 0.95
-sensitivity: low
-reason: User stated a durable response preference.
-"""
-    )
-
-    assert decision.route == "plan"
-    assert decision.objective == "Read /docs/notes.md and summarize it."
-    assert decision.reply is None
-    assert decision.effort == "minimal"
-    assert decision.session_title == "read-notes"
-    assert len(decision.memory_findings) == 1
-    assert decision.memory_findings[0].explicit is True
-
-
-def test_parse_md_orchestrator_decision_preserves_reply_headings():
-    from agents.orchestrator_agent import _parse_md_orchestrator_decision
-
-    decision = _parse_md_orchestrator_decision(
-        """
-# Decision
-## Route
-direct
-## Reply
-Here is the answer.
-
-## Details
-- Keep this heading inside the reply.
-
-# A Top-Level Reply Heading
-More reply text.
-## Objective
-none
-## Effort
-none
-## Routing Reason
-The request can be answered directly.
-## Session Title
-none
-## Memory Findings
-none
-"""
-    )
-
-    assert decision.route == "direct"
-    assert decision.reply is not None
-    assert "## Details" in decision.reply
-    assert "# A Top-Level Reply Heading" in decision.reply
-    assert "## Objective" not in decision.reply
 
 
 @pytest.mark.asyncio
@@ -775,16 +693,12 @@ async def test_orchestrator_turn_uses_xml_output_contract(monkeypatch):
   <reply>Hello.</reply>
   <objective></objective>
   <effort>none</effort>
-  <routing_reason>Greeting can be answered directly.</routing_reason>
-  <session_title>hello</session_title>
-  <memory_findings/>
 </decision>
 """,
             all_messages=lambda: [ModelRequest.user_text_prompt(prompt)],
         )
 
     monkeypatch.setenv("LOCALAGENT_ORCHESTRATOR_USE_XML", "true")
-    monkeypatch.setenv("LOCALAGENT_ORCHESTRATOR_USE_MD", "false")
     get_runtime_settings.cache_clear()
     monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
 
@@ -794,53 +708,7 @@ async def test_orchestrator_turn_uses_xml_output_contract(monkeypatch):
     assert "XML output format:" in orchestrator_agent._orchestrator_xml_prompt()
     assert result.output.reply == "Hello."
     assert result.decision.route == "direct"
-    assert result.decision.session_title == "hello"
-    get_runtime_settings.cache_clear()
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_turn_uses_md_output_contract(monkeypatch):
-    from agents import orchestrator_agent
-    from agents.orchestrator_agent import run_orchestrator_turn
-    from localagent_settings import get_runtime_settings
-
-    seen: dict[str, object] = {}
-
-    async def fake_observable_run(agent, prompt, **_kwargs):
-        seen["agent"] = agent
-        seen["prompt"] = prompt
-        return SimpleNamespace(
-            output="""
-# Decision
-## Route
-direct
-## Reply
-Hello.
-## Objective
-none
-## Effort
-none
-## Routing Reason
-Greeting can be answered directly.
-## Session Title
-hello
-## Memory Findings
-none
-""",
-            all_messages=lambda: [ModelRequest.user_text_prompt(prompt)],
-        )
-
-    monkeypatch.setenv("LOCALAGENT_ORCHESTRATOR_USE_MD", "true")
-    get_runtime_settings.cache_clear()
-    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
-
-    result = await run_orchestrator_turn("hello", use_md=True)
-
-    assert seen["agent"] is orchestrator_agent.orchestrator_md
-    assert "Markdown output format:" in orchestrator_agent._orchestrator_md_prompt()
-    assert result.output.reply == "Hello."
-    assert result.decision.route == "direct"
-    assert result.decision.session_title == "hello"
+    assert result.decision.session_title is None
     get_runtime_settings.cache_clear()
 
 
@@ -862,9 +730,6 @@ async def test_orchestrator_xml_output_repair_retry(monkeypatch):
   <reply>Repaired.</reply>
   <objective></objective>
   <effort>none</effort>
-  <routing_reason>Direct answer after repair.</routing_reason>
-  <session_title></session_title>
-  <memory_findings/>
 </decision>
 """
         return SimpleNamespace(
@@ -874,7 +739,7 @@ async def test_orchestrator_xml_output_repair_retry(monkeypatch):
 
     monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
 
-    result = await run_orchestrator_turn("hello", use_xml=True, use_md=False)
+    result = await run_orchestrator_turn("hello", use_xml=True)
 
     assert len(calls) == 2
     assert "failed XML parsing or schema validation" in calls[1]
@@ -900,9 +765,6 @@ async def test_orchestrator_xml_retries_schema_invalid_payload(monkeypatch):
   <reply></reply>
   <objective><![CDATA[Read all available fitness skills.]]></objective>
   <effort>minimal</effort>
-  <routing_reason><![CDATA[Invalid direct payload with objective.]]></routing_reason>
-  <session_title>available-fitness-skills</session_title>
-  <memory_findings/>
 </decision>
 """
         else:
@@ -912,9 +774,6 @@ async def test_orchestrator_xml_retries_schema_invalid_payload(monkeypatch):
   <reply></reply>
   <objective><![CDATA[Read all fitness skills and list all important points.]]></objective>
   <effort>minimal</effort>
-  <routing_reason><![CDATA[The request needs filesystem retrieval.]]></routing_reason>
-  <session_title>fitness-skills-summary</session_title>
-  <memory_findings/>
 </decision>
 """
         return SimpleNamespace(
@@ -989,12 +848,10 @@ async def test_orchestrator_plan_decision_uses_effort_budget(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import (
         OrchestratorDecision,
-        OrchestratorResponse,
         _response_and_messages,
     )
 
     calls: list[tuple[str, int, int]] = []
-    answer_prompts: list[str] = []
 
     async def fake_plan_workflow(
         objective: str,
@@ -1009,41 +866,25 @@ async def test_orchestrator_plan_decision_uses_effort_budget(monkeypatch):
             "Orchestrator notes:\n- Detailed findings in plan-report.md: 1 item(s)"
         )
 
-    async def fake_observable_run(_agent, prompt, **_kwargs):
-        answer_prompts.append(prompt)
-        return SimpleNamespace(
-            output=OrchestratorResponse(reply="Final answer."),
-            all_messages=lambda: [],
-        )
+    async def fake_observable_run(*_args, **_kwargs):
+        raise AssertionError("plan route must not run a final answer LLM pass")
 
     monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
     monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
-    monkeypatch.setattr(
-        orchestrator_agent,
-        "_load_agent_report_summaries",
-        lambda _report_dir: "REPORT FILE: fs-report.md\nSummary:\nRead notes.",
-    )
-    monkeypatch.setattr(orchestrator_agent, "_current_report_dir", lambda: None)
 
     response, messages = await _response_and_messages(
         OrchestratorDecision(
             route="plan",
             objective="read notes.md",
             effort="minimal",
-            session_title="read-notes",
         ),
         [],
     )
 
-    assert response.reply == "Final answer."
+    assert response.reply == "Read result for read notes.md."
     assert messages == []
-    assert response.session_title == "read-notes"
+    assert response.session_title is None
     assert calls == [("read notes.md", 1, 1)]
-    assert "Suggested session title:\nread-notes" in answer_prompts[0]
-    assert "Forwardable answer:" in answer_prompts[0]
-    assert "Orchestrator notes:" in answer_prompts[0]
-    assert "Compact session report summaries" in answer_prompts[0]
-    assert "REPORT FILE: fs-report.md" in answer_prompts[0]
 
 
 @pytest.mark.asyncio
@@ -1053,7 +894,6 @@ async def test_orchestrator_plan_answer_falls_back_to_forwardable_research(
     from agents import orchestrator_agent
     from agents.orchestrator_agent import (
         OrchestratorDecision,
-        OrchestratorResponse,
         _response_and_messages,
     )
 
@@ -1076,20 +916,11 @@ async def test_orchestrator_plan_answer_falls_back_to_forwardable_research(
             "- Sources: https://www.goodreturns.in/gold-rates/"
         )
 
-    async def fake_observable_run(_agent, _prompt, **_kwargs):
-        return SimpleNamespace(
-            output=OrchestratorResponse(
-                reply=(
-                    "I'm sorry, but I don't have access to real-time financial "
-                    "data. Please check a market data website."
-                )
-            ),
-            all_messages=lambda: [],
-        )
+    async def fake_observable_run(*_args, **_kwargs):
+        raise AssertionError("plan route must not run a final answer LLM pass")
 
     monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
     monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
-    monkeypatch.setattr(orchestrator_agent, "_current_report_dir", lambda: None)
 
     response, messages = await _response_and_messages(
         OrchestratorDecision(
@@ -1102,6 +933,159 @@ async def test_orchestrator_plan_answer_falls_back_to_forwardable_research(
 
     assert response.reply == forwardable
     assert messages == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_plan_route_persists_only_visible_turn(monkeypatch):
+    from agents import orchestrator_agent
+    from agents import structured_retry
+    from agents.orchestrator_agent import OrchestratorDecision, run_orchestrator_turn
+
+    previous = ModelRequest.user_text_prompt("previous")
+
+    async def fake_observable_run(_agent, prompt, **kwargs):
+        assert kwargs.get("message_history") == [previous]
+        return SimpleNamespace(
+            output=OrchestratorDecision(
+                route="plan",
+                objective="read notes",
+                effort="minimal",
+            ),
+            all_messages=lambda: [
+                *kwargs.get("message_history"),
+                ModelRequest.user_text_prompt(prompt),
+            ],
+        )
+
+    async def fake_plan_workflow(*_args, **_kwargs):
+        return (
+            "Forwardable answer:\n"
+            "Visible final answer.\n\n"
+            "Orchestrator notes:\n"
+            "- internal note"
+        )
+
+    monkeypatch.setattr(structured_retry, "observable_run", fake_observable_run)
+    monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
+
+    result = await run_orchestrator_turn(
+        "current prompt",
+        message_history=[previous],
+        use_xml=False,
+    )
+
+    assert result.output.reply == "Visible final answer."
+    assert len(result.all_messages()) == 3
+    assert result.all_messages()[0] == previous
+    assert "current prompt" in str(result.all_messages()[1])
+    assert "Visible final answer." in str(result.all_messages()[2])
+    assert "Orchestrator notes" not in str(result.all_messages())
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_xml_retry_does_not_accumulate_invalid_history(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import _run_xml_orchestrator_decision
+
+    previous = ModelRequest.user_text_prompt("previous")
+    histories = []
+    prompts: list[str] = []
+
+    async def fake_observable_run(_agent, prompt, **kwargs):
+        prompts.append(prompt)
+        histories.append(kwargs.get("message_history"))
+        if len(histories) == 1:
+            return SimpleNamespace(
+                output="not a valid XML decision",
+                all_messages=lambda: [
+                    previous,
+                    ModelRequest.user_text_prompt("invalid model output"),
+                ],
+            )
+        assert "Previous invalid output:" not in prompt
+        return SimpleNamespace(
+            output=(
+                "<decision>"
+                "<route>direct</route>"
+                "<reply>ok</reply>"
+                "<objective></objective>"
+                "<effort>none</effort>"
+                "</decision>"
+            ),
+            all_messages=lambda: [previous, ModelRequest.user_text_prompt(prompt)],
+        )
+
+    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
+
+    result = await _run_xml_orchestrator_decision(
+        "current prompt",
+        label="orchestrator",
+        indent=0,
+        message_history=[previous],
+        metadata=None,
+    )
+
+    assert result.output.route == "direct"
+    assert result.output.reply == "ok"
+    assert histories == [[previous], [previous]]
+    assert "current prompt" in prompts[1]
+    assert "Previous invalid output:" not in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_manual_structured_retry_does_not_replay_invalid_output(monkeypatch):
+    from agents import structured_retry
+    from agents.orchestrator_agent import OrchestratorDecision
+    from agents.structured_retry import observable_run_with_manual_validation_retries
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    previous = ModelRequest.user_text_prompt("previous")
+    prompts: list[str] = []
+    histories: list[list[object] | None] = []
+
+    async def fake_observable_run(_agent, prompt, **kwargs):
+        prompts.append(prompt)
+        histories.append(kwargs.get("message_history"))
+        if len(prompts) == 1:
+            raise UnexpectedModelBehavior(
+                "Exceeded maximum retries (0) for output validation"
+            )
+        return SimpleNamespace(
+            output=OrchestratorDecision(route="direct", reply="ok"),
+            all_messages=lambda: [previous, ModelRequest.user_text_prompt(prompt)],
+        )
+
+    monkeypatch.setattr(structured_retry, "observable_run", fake_observable_run)
+
+    result = await observable_run_with_manual_validation_retries(
+        object(),
+        "current prompt",
+        output_type=OrchestratorDecision,
+        output_name="OrchestratorDecision",
+        label="orchestrator",
+        message_history=[previous],
+        attempts=2,
+    )
+
+    assert result.output.reply == "ok"
+    assert histories == [[previous], [previous]]
+    assert prompts[0] == "current prompt"
+    assert "current prompt" in prompts[1]
+    assert "invalid response is intentionally omitted" in prompts[1]
+    assert "Previous invalid output:" not in prompts[1]
+
+
+def test_agent_output_validation_retries_are_disabled():
+    from agents.fs_agent import fs_agent
+    from agents.orchestrator_agent import orchestrator, orchestrator_xml
+    from agents.plan_agent import plan_agent
+    from agents.web_agent import web_agent
+
+    assert orchestrator._max_result_retries == 0
+    assert orchestrator_xml._max_result_retries == 0
+    assert plan_agent._max_result_retries == 0
+    assert fs_agent._max_result_retries == 0
+    assert web_agent._max_result_retries == 0
 
 
 def test_save_history_includes_report_dir(tmp_path):
@@ -1525,6 +1509,39 @@ def test_fs_task_prompt_includes_candidate_paths_for_confirmation(monkeypatch, t
     assert analysis.candidate_paths == ["/docs/actual.md"]
     assert "Possible replacement path candidates" in prompt
     assert "- /docs/actual.md" in prompt
+
+
+def test_fs_task_prompt_finds_cross_root_candidate_for_missing_writable_path(
+    monkeypatch,
+    tmp_path,
+):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    skills = tmp_path / "skills"
+    docs.mkdir()
+    skills.mkdir()
+    (docs / "agentsystem.md").write_text("hello", encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[
+                Mount(host_path=docs, mount_point="/docs", mode="ro"),
+                Mount(host_path=skills, mount_point="/skills", mode="rw"),
+            ]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    prompt, analysis = fs_agent._fs_task_prompt("summarize /skills/agentsystem.md")
+
+    assert analysis.invalid_paths == ["/skills/agentsystem.md"]
+    assert analysis.write_targets == ["/skills/agentsystem.md"]
+    assert analysis.candidate_paths == ["/docs/agentsystem.md"]
+    assert "Potential new writable path hints" in prompt
+    assert "- /skills/agentsystem.md" in prompt
+    assert "Possible replacement path candidates" in prompt
+    assert "- /docs/agentsystem.md" in prompt
+    assert "read that candidate first instead of listing directories" in prompt
 
 
 def test_fs_task_prompt_tells_agent_to_use_resolved_paths_first(monkeypatch, tmp_path):

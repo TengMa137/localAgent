@@ -19,7 +19,8 @@ from .runtime.query_policy import (
     infer_task_kind,
 )
 
-from .observability import _rt, observable_run
+from .observability import _rt
+from .structured_retry import observable_run_with_manual_validation_retries
 from .runtime.reports import (
     current_report_dir,
     load_agent_report_summaries,
@@ -42,7 +43,7 @@ class PlanOutput(BaseModel):
 plan_agent = Agent(
     model=model,
     output_type=PlanOutput,
-    output_retries=3,
+    output_retries=0,
 )
 
 
@@ -221,7 +222,7 @@ def _format_plan_handoff(
     as_of: str,
     time_sensitive: bool,
 ) -> str:
-    """Return a compact final handoff for the orchestrator answer pass."""
+    """Return a compact final handoff for the orchestrator's user-visible reply."""
     completed = set(state.completed_tasks)
     pending_tasks = [
         task.objective for task in planned_tasks if task.objective not in completed
@@ -577,16 +578,14 @@ class PlannerInput:
 
 async def _run_planner(prompt: str) -> PlanOutput:
     """Run plan_agent and validate its structured output."""
-    plan_result = await observable_run(
+    plan_result = await observable_run_with_manual_validation_retries(
         plan_agent,
         prompt,
+        output_type=PlanOutput,
+        output_name="PlanOutput",
         label="plan_agent",
         indent=1,
     )
-    if not isinstance(plan_result.output, PlanOutput):
-        raise RuntimeError(
-            f"plan_agent returned unexpected output: {type(plan_result.output).__name__}"
-        )
     return plan_result.output
 
 

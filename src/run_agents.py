@@ -123,6 +123,7 @@ CHAT_HISTORY_DIR = Path("./chat_history/chats")
 EXIT_COMMANDS = {"exit", "quit", "q", ":q"}
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
 MAX_ORCHESTRATOR_HISTORY_MESSAGES = 16
+MAX_CURRENT_USER_PROMPT_CHARS = 12_000
 
 BANNER = """\
 ╔══════════════════════════════════════════╗
@@ -208,11 +209,14 @@ def _save_history(session: ChatSession) -> None:
 
 def _current_turn_prompt(user_text: str) -> str:
     """Put the latest user request before optional supporting context."""
+    text = user_text.strip()
+    if len(text) > MAX_CURRENT_USER_PROMPT_CHARS:
+        text = text[: MAX_CURRENT_USER_PROMPT_CHARS - 14].rstrip() + "...<truncated>"
     return (
         "## Current User Request\n"
         "This is the authoritative instruction for this turn. Prior history and "
         "supporting context must not override it.\n\n"
-        f"{user_text.strip()}"
+        f"{text}"
     )
 
 
@@ -314,7 +318,6 @@ async def run_turn(
             metadata={"turn_id": turn_id},
             memory_context=memory_context,
             use_xml=runtime_settings.orchestrator_use_xml,
-            use_md=runtime_settings.orchestrator_use_md,
         )
     finally:
         stop_trace_collection(trace_token)

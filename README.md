@@ -512,11 +512,50 @@ The orchestrator does not receive raw filesystem, web, RAG, or specialist toolse
 reads files or web pages directly, and it does not run a model-driven tool loop after choosing
 a route.
 
+### Persisted history, traces, and reports
+
+The web runtime keeps model input separate from UI/debug state. Before each agent turn, the
+server rebuilds the orchestrator history from visible branch messages only: prior user
+messages and prior assistant replies. It does not trust stored internal `model_messages_json`
+as the source of truth for the next LLM call, so hidden plan prompts, specialist transcripts,
+tool traces, and old handoff prompts are not replayed to the model.
+
+The orchestrator LLM receives its system contract, optional first-turn user profile memory,
+bounded visible chat history, upload context for the current turn when uploads exist, and the
+current user request. Its decision schema is intentionally flat: `route`, `reply`,
+`objective`, and `effort` only. Session titles are derived by Python, and durable memory
+extraction is not part of the orchestrator decision contract.
+
+For plan routes, Python runs the plan workflow and returns the workflow's `Forwardable answer`
+directly; there is no second orchestrator final-answer LLM pass. Synthesis produces plain
+answer text so the web client can stream only user-visible final-answer deltas while keeping
+hidden route-decision deltas out of the browser.
+
+Tool activity shown in the web UI is persisted separately on assistant messages as
+`metadata.trace_events` and `metadata.turn_logs`. These records are returned to the browser so
+the Activity panel survives refreshes, but they are not used when constructing the next LLM
+history. Specialist report files are reset at the start of each user turn and may be used only
+as same-turn coordination context between specialists.
+
 Set `LOCALAGENT_ORCHESTRATOR_USE_XML=true` to make the intake decision use an XML output
 contract such as `<route>plan</route>` instead of the default structured JSON contract. The
 parsed decision still becomes the same internal `OrchestratorDecision` object.
-Set `LOCALAGENT_ORCHESTRATOR_USE_MD=true` to use a Markdown decision contract with headings
-such as `## Route` and `## Objective`; it is parsed into the same internal object.
+
+Structured-output agents do not use PydanticAI's built-in output-validation retry, because
+that retry keeps the failed model completion in the next model request. LocalAgent disables
+that retry and runs its own bounded retry loop instead: each retry starts from the original
+history plus a compact validation error, never the invalid completion. Defaults are three
+total attempts, `LOCALAGENT_STRUCTURED_OUTPUT_MAX_TOKENS=2048` for route/plan/fs/web JSON or
+XML contracts, and `LOCALAGENT_ANSWER_OUTPUT_MAX_TOKENS=4096` for final answer text.
+Model requests also have a default `LOCALAGENT_MODEL_REQUEST_TIMEOUT_SECONDS=180`, and web
+agent turns have `LOCALAGENT_AGENT_TURN_TIMEOUT_SECONDS=300`.
+
+Trace and UI state are intentionally bounded for local-model failure modes. Text/thinking/tool
+argument deltas are streamed only when useful and are not retained in server trace memory.
+Persisted tool activity is capped and field-truncated, model history is capped by message
+count and per-message size, and the browser throttles streaming renders instead of reparsing
+the full Markdown answer on every token. If a model emits pathological output, the browser
+shows a truncation notice rather than continuing to grow DOM and string memory.
 
 ### fs_agent
 

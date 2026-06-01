@@ -11,6 +11,6 @@ Makefile
 chat_history/
 /.memory/
 localagent_state/
-user_docs/web_uploads/
+user_docs/
 *.egg-info/
 *.od*

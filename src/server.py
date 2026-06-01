@@ -50,6 +50,7 @@ from server_app.chat_store import (
     prompt_with_session_context,
     rows_to_model_history,
     session_upload_context,
+    visible_message_count,
     visible_message_rows,
 )
 from server_app.schemas import (
@@ -63,6 +64,8 @@ from server_app.schemas import (
     UpdateUserRequest,
 )
 from server_app.serializers import (
+    MAX_ADMIN_MESSAGE_CHARS,
+    MAX_PUBLIC_MESSAGE_CHARS,
     compact_trace_events,
     compact_turn_logs,
     message_metadata,
@@ -70,6 +73,7 @@ from server_app.serializers import (
     public_chat_session,
     public_message,
     public_user,
+    trim_message_content,
 )
 from server_app.utils import (
     clean_filename,
@@ -97,6 +101,7 @@ class Settings(BaseSettings):
     admin_username: str = ""
     admin_password: str = ""
     max_voice_audio_bytes: int = 10 * 1024 * 1024
+    agent_turn_timeout_seconds: float = 300
 
     model_config = SettingsConfigDict(
         env_prefix="LOCALAGENT_",
@@ -120,10 +125,22 @@ LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_ATTEMPTS = 8
 TEXT_PREVIEW_LIMIT = 1_000_000
 DEFAULT_VOICE_MIME_TYPE = "audio/webm"
+TRACE_RUNNING_PERSIST_INTERVAL_SECONDS = 0.75
+TRACE_RUNNING_PERSIST_EVERY_EVENTS = 10
+MAX_AGENT_ERROR_CHARS = 4000
+MAX_CHAT_MESSAGES_RETURNED = 100
+MAX_ADMIN_CHAT_SESSIONS_RETURNED = 300
 
 ph = PasswordHasher()
 _login_attempts: dict[str, list[float]] = {}
 _agent_locks: dict[str, asyncio.Lock] = {}
+
+
+def _trim_error_text(text: Any, limit: int = MAX_AGENT_ERROR_CHARS) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[: limit - 14].rstrip() + "...<truncated>"
 
 
 @asynccontextmanager
@@ -547,6 +564,48 @@ def _empty_new_chat_for_user(
     ).fetchone()
 
 
+def _public_chat_messages(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    *,
+    session_id: str,
+    user_id: int,
+    active_branch_id: str,
+    content_limit: int | None = MAX_PUBLIC_MESSAGE_CHARS,
+) -> list[dict[str, Any]]:
+    messages = [public_message(row, content_limit=content_limit) for row in rows]
+    return decorate_branch_variants(
+        conn,
+        messages,
+        session_id=session_id,
+        user_id=user_id,
+        active_branch_id=active_branch_id,
+    )
+
+
+def _public_assistant_payload(
+    *,
+    message_id: int,
+    content: str,
+    created_at: str,
+    branch_id: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    display_content, truncated, original_length = trim_message_content(content)
+    payload: dict[str, Any] = {
+        "id": message_id,
+        "role": "assistant",
+        "content": display_content,
+        "created_at": created_at,
+        "branch_id": branch_id,
+        "metadata": metadata,
+    }
+    if truncated:
+        payload["content_truncated"] = True
+        payload["content_original_length"] = original_length
+    return payload
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -783,10 +842,17 @@ def list_all_chat_sessions(
             JOIN users u ON u.id = s.user_id
             WHERE s.archived_at IS NULL
             ORDER BY s.updated_at DESC
-            """
+            LIMIT ?
+            """,
+            (MAX_ADMIN_CHAT_SESSIONS_RETURNED + 1,),
         ).fetchall()
+        truncated = len(rows) > MAX_ADMIN_CHAT_SESSIONS_RETURNED
+        rows = rows[:MAX_ADMIN_CHAT_SESSIONS_RETURNED]
         _audit(conn, admin["id"], "admin_list_chat_sessions", {})
-        return {"sessions": [public_chat_session(row) for row in rows]}
+        return {
+            "sessions": [public_chat_session(row) for row in rows],
+            "truncated": truncated,
+        }
 
 
 @app.get("/api/admin/chat/sessions/{session_id}")
@@ -805,10 +871,24 @@ def get_any_chat_session(
         ).fetchone()
         if not session:
             raise HTTPException(status_code=404, detail="Chat session not found.")
+        total_messages = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM chat_messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["c"]
+        )
         messages = conn.execute(
-            "SELECT id, role, content, metadata_json, created_at, branch_id, fork_parent_id, variant_number FROM chat_messages WHERE session_id = ? ORDER BY id",
-            (session_id,),
+            """
+            SELECT id, role, content, metadata_json, created_at, branch_id, fork_parent_id, variant_number
+            FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (session_id, MAX_CHAT_MESSAGES_RETURNED),
         ).fetchall()
+        messages = list(reversed(messages))
+        messages_truncated = total_messages > len(messages)
         _audit(
             conn,
             admin["id"],
@@ -817,7 +897,12 @@ def get_any_chat_session(
         )
         return {
             "session": public_chat_session(session),
-            "messages": [public_message(row) for row in messages],
+            "messages": [
+                public_message(row, content_limit=MAX_ADMIN_MESSAGE_CHARS)
+                for row in messages
+            ],
+            "messages_truncated": messages_truncated,
+            "total_messages": total_messages,
         }
 
 
@@ -901,8 +986,17 @@ def get_chat_session(
         session = _load_chat_for_user(conn, session_id, user["id"])
         mark_stale_running_messages(conn, session_id, user["id"], _agent_locks)
         branch = active_branch(conn, session, user["id"])
-        message_rows = visible_message_rows(conn, session_id, user["id"], branch["id"])
-        messages = [public_message(row) for row in message_rows]
+        total_messages = visible_message_count(
+            conn, session_id, user["id"], branch["id"]
+        )
+        message_rows = visible_message_rows(
+            conn,
+            session_id,
+            user["id"],
+            branch["id"],
+            limit=MAX_CHAT_MESSAGES_RETURNED,
+        )
+        messages_truncated = total_messages > len(message_rows)
         return {
             "session": {
                 "id": session["id"],
@@ -911,13 +1005,15 @@ def get_chat_session(
                 "created_at": session["created_at"],
                 "updated_at": session["updated_at"],
             },
-            "messages": decorate_branch_variants(
+            "messages": _public_chat_messages(
                 conn,
-                messages,
+                message_rows,
                 session_id=session_id,
                 user_id=user["id"],
                 active_branch_id=branch["id"],
             ),
+            "messages_truncated": messages_truncated,
+            "total_messages": total_messages,
         }
 
 
@@ -1124,8 +1220,17 @@ def activate_chat_branch(
             "chat_branch_activate",
             {"session_id": session_id, "branch_id": branch["id"]},
         )
-        message_rows = visible_message_rows(conn, session_id, user["id"], branch["id"])
-        messages = [public_message(row) for row in message_rows]
+        total_messages = visible_message_count(
+            conn, session_id, user["id"], branch["id"]
+        )
+        message_rows = visible_message_rows(
+            conn,
+            session_id,
+            user["id"],
+            branch["id"],
+            limit=MAX_CHAT_MESSAGES_RETURNED,
+        )
+        messages_truncated = total_messages > len(message_rows)
         return {
             "session": {
                 "id": session["id"],
@@ -1134,13 +1239,15 @@ def activate_chat_branch(
                 "created_at": session["created_at"],
                 "updated_at": now,
             },
-            "messages": decorate_branch_variants(
+            "messages": _public_chat_messages(
                 conn,
-                messages,
+                message_rows,
                 session_id=session_id,
                 user_id=user["id"],
                 active_branch_id=branch["id"],
             ),
+            "messages_truncated": messages_truncated,
+            "total_messages": total_messages,
         }
 
 
@@ -1294,10 +1401,21 @@ async def _execute_chat_message(
                     "UPDATE chat_sessions SET title = ? WHERE id = ? AND user_id = ?",
                     (turn_title, session_id, user["id"]),
                 )
+            visible_history_json = messages_to_json(
+                rows_to_model_history(
+                    visible_message_rows(
+                        conn,
+                        session_id,
+                        user["id"],
+                        branch["id"],
+                        before_message_id=user_message_id,
+                    )
+                )
+            )
             agent_session = _chat_session_for_agent(
                 session,
                 user["id"],
-                model_messages_json=branch["model_messages_json"],
+                model_messages_json=visible_history_json,
                 branch_id=branch["id"],
             )
             agent_session.session_title = turn_title
@@ -1311,6 +1429,8 @@ async def _execute_chat_message(
             )
 
         persisted_trace_events: list[dict[str, Any]] = []
+        last_trace_persist_at = 0.0
+        trace_events_since_persist = 0
 
         def persist_assistant_message(
             status: str,
@@ -1335,26 +1455,43 @@ async def _execute_chat_message(
                     )
 
         def wrapped_trace_sink(event: dict[str, Any]) -> None:
+            nonlocal last_trace_persist_at, trace_events_since_persist
             compact = compact_trace_events([event])
             if compact:
                 persisted_trace_events.append(compact[0])
-                persist_assistant_message("running")
+                persisted_trace_events[:] = compact_trace_events(persisted_trace_events)
+                trace_events_since_persist += 1
+                now_monotonic = time.monotonic()
+                should_persist = (
+                    trace_events_since_persist >= TRACE_RUNNING_PERSIST_EVERY_EVENTS
+                    or now_monotonic - last_trace_persist_at
+                    >= TRACE_RUNNING_PERSIST_INTERVAL_SECONDS
+                )
+                if should_persist:
+                    persist_assistant_message("running")
+                    last_trace_persist_at = now_monotonic
+                    trace_events_since_persist = 0
             if trace_sink is not None:
                 trace_sink(event)
 
         agent_prompt = prompt_with_session_context(content, uploads)
         try:
-            response, model_messages, turn_logs, trace_events = await run_turn(
-                agent_prompt,
-                agent_session,
-                debug=False,
-                trace_sink=wrapped_trace_sink,
-            )
+            async with asyncio.timeout(settings.agent_turn_timeout_seconds):
+                response, model_messages, turn_logs, trace_events = await run_turn(
+                    agent_prompt,
+                    agent_session,
+                    debug=False,
+                    trace_sink=wrapped_trace_sink,
+                )
         except asyncio.CancelledError:
             persist_assistant_message("failed", "Agent run cancelled.")
             raise
+        except TimeoutError:
+            error_text = "Agent run failed: timed out before completing."
+            persist_assistant_message("failed", error_text)
+            raise RuntimeError(error_text) from None
         except Exception as exc:
-            error_text = f"Agent run failed: {exc}"
+            error_text = _trim_error_text(f"Agent run failed: {exc}")
             persist_assistant_message("failed", error_text)
             raise
 
@@ -1412,14 +1549,13 @@ async def _execute_chat_message(
             _audit(conn, user["id"], "chat_message", {"session_id": session_id})
 
         return {
-            "message": {
-                "id": assistant_message_id,
-                "role": "assistant",
-                "content": assistant_text,
-                "created_at": now,
-                "branch_id": branch["id"],
-                "metadata": metadata,
-            },
+            "message": _public_assistant_payload(
+                message_id=assistant_message_id,
+                content=assistant_text,
+                created_at=now,
+                branch_id=branch["id"],
+                metadata=metadata,
+            ),
             "user_message_id": user_message_id,
             "session": {
                 "id": session_id,
@@ -1443,6 +1579,7 @@ async def stream_message(
 ) -> StreamingResponse:
     async def events():
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
+        streamed_answer = False
 
         def enqueue(item: dict[str, Any]) -> None:
             try:
@@ -1451,10 +1588,9 @@ async def stream_message(
                 pass
 
         def sink(event: dict[str, Any]) -> None:
-            if event.get("kind") == "text_delta" and event.get("label") in {
-                "orchestrator",
-                "orchestrator:answer",
-            }:
+            nonlocal streamed_answer
+            if event.get("kind") == "text_delta" and event.get("label") == "synthesis":
+                streamed_answer = True
                 enqueue({"type": "text_delta", "content": event.get("content") or ""})
                 return
             compact = compact_trace_events([event])
@@ -1466,12 +1602,19 @@ async def stream_message(
                 payload = await _execute_chat_message(
                     session_id, body.content, user, trace_sink=sink
                 )
+                if not streamed_answer and payload["message"]["content"]:
+                    enqueue(
+                        {
+                            "type": "text_delta",
+                            "content": payload["message"]["content"],
+                        }
+                    )
                 await queue.put(
                     {"type": "replace", "content": payload["message"]["content"]}
                 )
                 await queue.put({"type": "done", "data": payload})
             except Exception as exc:
-                await queue.put({"type": "error", "error": str(exc)})
+                await queue.put({"type": "error", "error": _trim_error_text(exc)})
 
         task = asyncio.create_task(run_and_signal())
         try:

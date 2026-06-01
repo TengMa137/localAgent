@@ -12,7 +12,7 @@ from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import UsageLimits
 
-from .observability import _rt, observable_run
+from .observability import _rt
 from .runtime.context import fs_toolset, model, validator
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
 from .runtime.reports import (
@@ -22,6 +22,7 @@ from .runtime.reports import (
     write_agent_report,
 )
 from .runtime.skills_context import scan_skills_context
+from .structured_retry import observable_run_with_manual_validation_retries
 from tools.filesystem.text_ops import read_text_with_policy
 from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 
@@ -103,18 +104,20 @@ class FsPromptContext:
             f"{self.skill_policy}\n"
             "Tool-use policy:\n"
             "- Python preflight has already checked exact path hints against the validator.\n"
-            "- If Resolved exact path hints or Valid write target path hints are listed, perform the requested read, edit, or write directly on those paths before doing any broad discovery.\n"
+            "- If Resolved exact path hints are listed, perform the requested read, edit, or write directly on those paths before doing any broad discovery.\n"
+            "- Potential new writable path hints are nonexistent paths under writable roots. Use them only when the objective clearly asks to create or write a new file at that exact path. For reading, summarizing, inspecting, or editing an existing file, treat them as missing paths and use wrong-path recovery.\n"
             "- Use the Readable file index below before calling discovery tools.\n"
             "- For broad discovery, prefer find_paths, list_files, or grep_files over repeated list_directory calls.\n"
             "- Do not call list_directory for a directory whose relevant files are already visible in the index.\n"
-            "- Only call file tools with paths from resolved path hints, valid write targets, the file index, or a tool result.\n"
+            "- Only call file tools with paths from resolved path hints, potential new writable path hints for create/write tasks, the file index, or a tool result.\n"
             "- Never invent paths. If no matching path exists, report uncertainty instead.\n"
             "- Never read the same path twice in one run.\n"
             "- After reading each relevant candidate file once, stop gathering and produce the result.\n\n"
             "Wrong-path recovery policy:\n"
             "- Invalid exact path hints mean the exact path check failed before tool use.\n"
-            "- Do not read, write, stat, or edit invalid exact path hints.\n"
+            "- Do not read or stat invalid exact path hints. Do not edit, delete, move, or copy them as existing files.\n"
             "- Recovery order: first use possible replacement candidates and the readable file index; then call find_paths over path='/' for filename/path lookup; then list_files over path='/' when needed; only then use grep_files for content terms. Do not use grep_files for filename lookup; grep_files searches file content only.\n"
+            "- If exactly one possible replacement path candidate is listed and the objective does not require modifying files, read that candidate first instead of listing directories.\n"
             "- When invalid path hints are present, search all readable roots, not only the invalid hint's original root.\n"
             "- For read-only requests, if exactly one plausible replacement is clearly the intended file, read it and answer with a short heads-up that the requested path was not found and the replacement path was used.\n"
             "- For edit/write/delete/move/copy requests, do not modify a replacement candidate silently. Ask the user to confirm the exact path.\n"
@@ -125,15 +128,16 @@ class FsPromptContext:
             f"File index truncated: {len(self.files) > len(listed_files)}\n\n"
             "Resolved exact path hints from the objective:\n"
             f"{self._list(self.analysis.resolved_paths)}\n\n"
-            "Valid write target path hints from the objective:\n"
+            "Potential new writable path hints from the objective:\n"
             f"{self._list(self.analysis.write_targets)}\n\n"
             "Invalid exact path hints from the objective:\n"
             f"{self._list(self.analysis.invalid_paths)}\n\n"
             "Possible replacement path candidates from deterministic path validation:\n"
             f"{self._list(self.analysis.candidate_paths)}\n\n"
-            "Use resolved paths and possible write targets exactly as listed. "
-            "Do not call read/stat on invalid path hints; use the file index and "
-            "discovery tools to find the intended file instead.\n\n"
+            "Use resolved paths exactly as listed. Use potential new writable "
+            "paths only for create/write tasks. Do not call read/stat on invalid "
+            "path hints; use possible replacements, the file index, and discovery "
+            "tools to find the intended file instead.\n\n"
             f"Objective: {self.sanitized_objective}"
         )
 
@@ -174,7 +178,7 @@ class FsAgentResult(BaseModel):
 fs_agent = Agent(
     model=model,
     output_type=[FsAgentResult, DeferredToolRequests],
-    output_retries=3,
+    output_retries=0,
     toolsets=[fs_toolset],
     system_prompt="""
 You are a filesystem specialist agent.
@@ -185,8 +189,11 @@ this is a filesystem task, so do not second-guess that routing.
 Rules:
   - Use only validator paths under the readable/writable roots in the prompt.
   - Python preflight has already checked exact path hints. If resolved path hints
-    or valid write target hints are present, act on those exact paths first and
-    do not run broad discovery first.
+    are present, act on those exact paths first and do not run broad discovery
+    first.
+  - Potential new writable path hints are nonexistent paths under writable
+    roots. Use them only when the objective clearly asks to create or write a new
+    file at that exact path. Do not treat them as existing files.
   - Use the injected file index first for invalid-path recovery; discover
     uncertain paths with find_paths, list_files, grep_files, list_directory, and
     stat only when the index is insufficient.
@@ -194,10 +201,11 @@ Rules:
     searches file contents, not filenames. list_directory is for immediate child
     inspection, not recursive search.
   - Never call read_file/read_image/stat on a path unless it came from the file
-    index, resolved path hints, valid write targets, or a prior tool result.
+    index, resolved path hints, or a prior tool result.
   - Do not read the same file path twice in one run.
   - Do not invent paths. Use exact paths from the prompt only when they are
-    listed as resolved paths or possible write targets.
+    listed as resolved paths, or as potential new writable paths for a create or
+    write task.
   - For directories, many files, or truncated reads, set needs_rag=true and
     include the relevant paths.
   - For image files, use read_image to inspect visual content. Use read_file
@@ -207,7 +215,8 @@ Rules:
     answer short: either answer from one clear read-only replacement with a
     heads-up, ask for exact-path confirmation, or state file not found.
   - Never edit, write, delete, move, or copy a replacement candidate unless it was
-    listed as a resolved exact path or valid write target.
+    listed as a resolved exact path, or as a potential new writable path for a
+    create or write task.
   - Put a practical user-facing answer in answer and durable facts in findings.
     Keep summary/findings focused on useful results, not tool-attempt history.
 """,
@@ -316,23 +325,29 @@ class PathPreflight:
         if resolved.exists():
             self.analysis.resolved_paths.append(path)
             return None
-        if self._is_write_target(path):
-            self.analysis.write_targets.append(path)
-            return None
-        return self._record_invalid(
+        return self._record_missing(
             path,
             "File not found after checking every readable file and considering close filename matches.",
         )
 
     def _record_invalid(self, path: str, reason: str) -> str | None:
         """Record an invalid path hint and return its searchable replacement."""
-        if self._is_write_target(path):
-            self.analysis.write_targets.append(path)
-            return None
-
         suggestions = self._suggest(path)
         self.analysis.invalid_paths.append(path)
         self.analysis.candidate_paths.extend(suggestions)
+        return self._humanize(path)
+
+    def _record_missing(self, path: str, reason: str) -> str | None:
+        """Record a missing readable path, including possible new write targets."""
+        suggestions = self._suggest(path)
+        self.analysis.invalid_paths.append(path)
+        if self._is_write_target(path):
+            self.analysis.write_targets.append(path)
+        self.analysis.candidate_paths.extend(suggestions)
+        if suggestions:
+            return self._humanize(path)
+        if self._is_write_target(path):
+            return None
         return self._humanize(path)
 
     def _filename_matches(self, filename: str) -> list[str]:
@@ -341,10 +356,12 @@ class PathPreflight:
 
     def _suggest(self, path: str, *, limit: int = 5) -> list[str]:
         """Find close readable path suggestions for an invalid hint."""
+        basename_matches = self._filename_matches(PurePosixPath(path).name)
         parents = {str(PurePosixPath(file_path).parent) for file_path in self.files}
-        return get_close_matches(
+        close_matches = get_close_matches(
             path, [*self.files, *sorted(parents)], n=limit, cutoff=0.68
         )
+        return _dedupe([*basename_matches, *close_matches])[:limit]
 
     @staticmethod
     def _normalize(path: str) -> str:
@@ -449,17 +466,15 @@ def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
 
 async def _run_fs_agent(prompt: str) -> FsAgentResult:
     """Run the model-backed filesystem specialist once."""
-    result = await observable_run(
+    result = await observable_run_with_manual_validation_retries(
         fs_agent,
         prompt,
+        output_type=FsAgentResult,
+        output_name="FsAgentResult",
         label="fs_agent",
         indent=1,
         usage_limits=UsageLimits(tool_calls_limit=20),
     )
-    if not isinstance(result.output, FsAgentResult):
-        raise RuntimeError(
-            f"fs_agent returned unexpected output: {type(result.output).__name__}"
-        )
     return result.output
 
 

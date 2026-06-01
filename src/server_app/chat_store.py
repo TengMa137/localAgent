@@ -30,14 +30,26 @@ def messages_to_json(messages: list[ModelMessage]) -> str:
     return json_dumps(_MSG_ADAPTER.dump_python(messages, mode="json"))
 
 
+MAX_MODEL_HISTORY_MESSAGES = 16
+MAX_MODEL_HISTORY_MESSAGE_CHARS = 6000
+
+
+def _history_text(text: str) -> str:
+    if len(text) <= MAX_MODEL_HISTORY_MESSAGE_CHARS:
+        return text
+    return text[: MAX_MODEL_HISTORY_MESSAGE_CHARS - 14].rstrip() + "...<truncated>"
+
+
 def rows_to_model_history(rows: list[sqlite3.Row]) -> list[ModelMessage]:
     history: list[ModelMessage] = []
     for row in rows:
         if row["role"] == "user":
-            history.append(ModelRequest.user_text_prompt(row["content"]))
+            history.append(ModelRequest.user_text_prompt(_history_text(row["content"])))
         elif row["content"]:
-            history.append(ModelResponse(parts=[TextPart(content=row["content"])]))
-    return history
+            history.append(
+                ModelResponse(parts=[TextPart(content=_history_text(row["content"]))])
+            )
+    return history[-MAX_MODEL_HISTORY_MESSAGES:]
 
 
 def mark_stale_running_messages(
@@ -119,29 +131,100 @@ def visible_message_rows(
     branch_id: str,
     *,
     before_message_id: int | None = None,
+    limit: int | None = None,
 ) -> list[sqlite3.Row]:
     branch = load_branch_for_user(conn, session_id, branch_id, user_id)
+    rows = _branch_message_rows(
+        conn,
+        session_id=session_id,
+        user_id=user_id,
+        branch_id=branch_id,
+        before_message_id=before_message_id,
+        limit=limit,
+    )
+    remaining = None if limit is None else max(0, limit - len(rows))
     prefix: list[sqlite3.Row] = []
     if branch["parent_id"] and branch["fork_parent_message_id"]:
-        prefix = visible_message_rows(
+        if remaining is None or remaining > 0:
+            prefix = visible_message_rows(
+                conn,
+                session_id,
+                user_id,
+                branch["parent_id"],
+                before_message_id=branch["fork_parent_message_id"],
+                limit=remaining,
+            )
+    return [*prefix, *rows]
+
+
+def visible_message_count(
+    conn: sqlite3.Connection,
+    session_id: str,
+    user_id: int,
+    branch_id: str,
+    *,
+    before_message_id: int | None = None,
+) -> int:
+    branch = load_branch_for_user(conn, session_id, branch_id, user_id)
+    where = "session_id = ? AND user_id = ? AND branch_id = ?"
+    params: list[Any] = [session_id, user_id, branch_id]
+    if before_message_id is not None:
+        where += " AND id < ?"
+        params.append(before_message_id)
+    total = int(
+        conn.execute(
+            f"SELECT COUNT(*) AS c FROM chat_messages WHERE {where}",
+            params,
+        ).fetchone()["c"]
+    )
+    if branch["parent_id"] and branch["fork_parent_message_id"]:
+        total += visible_message_count(
             conn,
             session_id,
             user_id,
             branch["parent_id"],
             before_message_id=branch["fork_parent_message_id"],
         )
+    return total
+
+
+def _branch_message_rows(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    user_id: int,
+    branch_id: str,
+    before_message_id: int | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    where = "session_id = ? AND user_id = ? AND branch_id = ?"
+    params: list[Any] = [session_id, user_id, branch_id]
+    if before_message_id is not None:
+        where += " AND id < ?"
+        params.append(before_message_id)
+    if limit is None:
+        return conn.execute(
+            f"""
+            SELECT id, role, content, metadata_json, created_at, branch_id, fork_parent_id, variant_number
+            FROM chat_messages
+            WHERE {where}
+            ORDER BY id
+            """,
+            params,
+        ).fetchall()
+    if limit <= 0:
+        return []
     rows = conn.execute(
-        """
+        f"""
         SELECT id, role, content, metadata_json, created_at, branch_id, fork_parent_id, variant_number
         FROM chat_messages
-        WHERE session_id = ? AND user_id = ? AND branch_id = ?
-        ORDER BY id
+        WHERE {where}
+        ORDER BY id DESC
+        LIMIT ?
         """,
-        (session_id, user_id, branch_id),
+        (*params, limit),
     ).fetchall()
-    if before_message_id is not None:
-        rows = [row for row in rows if row["id"] < before_message_id]
-    return [*prefix, *rows]
+    return list(reversed(rows))
 
 
 def decorate_branch_variants(

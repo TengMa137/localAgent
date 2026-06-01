@@ -52,6 +52,8 @@ const state = {
   voiceRecorder: null,
   voiceStream: null,
   voiceRecording: false,
+  streamingResponse: false,
+  autoFollowStream: true,
   voiceSupported: typeof navigator !== "undefined"
     && Boolean(navigator.mediaDevices?.getUserMedia)
     && typeof window !== "undefined"
@@ -59,6 +61,124 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+const MESSAGE_BOTTOM_STICKINESS_PX = 96;
+const MAX_RENDERED_MESSAGE_CHARS = 120000;
+const MAX_TEXT_PREVIEW_CHARS = 200000;
+const MAX_SSE_BUFFER_CHARS = 1000000;
+const MAX_PENDING_TRACE_EVENTS = 500;
+const MAX_TRACE_FIELD_DISPLAY_CHARS = 800;
+const MAX_CLIENT_MESSAGES = 100;
+const MAX_UPLOAD_BATCH_FILES = 10;
+const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
+const MAX_VOICE_RECORDING_SECONDS = 75;
+const STREAM_RENDER_INTERVAL_MS = 100;
+const STREAM_IDLE_TIMEOUT_MS = 180000;
+const STREAM_TOTAL_TIMEOUT_MS = 600000;
+const TRUNCATED_OUTPUT_NOTICE = "\n\n[Output truncated in the browser because it exceeded the display safety limit.]";
+const TRUNCATED_PREVIEW_NOTICE = "\n\n[Preview truncated in the browser because it exceeded the display safety limit.]";
+const TRUNCATED_TRACE_NOTICE = "\n[Trace field truncated.]";
+
+function isMessagesNearBottom() {
+  const el = $("messages");
+  if (!el) return true;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= MESSAGE_BOTTOM_STICKINESS_PX;
+}
+
+function scrollMessagesToBottom() {
+  const el = $("messages");
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+}
+
+function maybeScrollMessagesToBottom(shouldStick) {
+  if (shouldStick) scrollMessagesToBottom();
+}
+
+function shouldFollowMessagesBottom() {
+  return (!state.streamingResponse || state.autoFollowStream) && isMessagesNearBottom();
+}
+
+function stopStreamingAutoFollow() {
+  if (!state.streamingResponse) return;
+  state.autoFollowStream = false;
+}
+
+function displayMessageContent(content) {
+  const text = String(content || "");
+  if (text.length <= MAX_RENDERED_MESSAGE_CHARS) return text;
+  return text.slice(0, MAX_RENDERED_MESSAGE_CHARS - TRUNCATED_OUTPUT_NOTICE.length) + TRUNCATED_OUTPUT_NOTICE;
+}
+
+function displayPreviewContent(content) {
+  const text = String(content || "");
+  if (text.length <= MAX_TEXT_PREVIEW_CHARS) return text;
+  return text.slice(0, MAX_TEXT_PREVIEW_CHARS - TRUNCATED_PREVIEW_NOTICE.length) + TRUNCATED_PREVIEW_NOTICE;
+}
+
+function truncateUiText(value, limit, notice = TRUNCATED_TRACE_NOTICE) {
+  const text = String(value || "");
+  if (text.length <= limit) return text;
+  return text.slice(0, Math.max(0, limit - notice.length)).trimEnd() + notice;
+}
+
+function capTraceEvents(events) {
+  if (!Array.isArray(events) || events.length <= MAX_PENDING_TRACE_EVENTS) {
+    return events || [];
+  }
+  return events.slice(-MAX_PENDING_TRACE_EVENTS);
+}
+
+function sanitizeTraceEventForUi(event) {
+  const source = event || {};
+  return {
+    ts: source.ts || "",
+    kind: truncateUiText(source.kind || "status", 80, ""),
+    label: truncateUiText(source.label || "agent", 120, ""),
+    tool_name: truncateUiText(source.tool_name || "", 160, ""),
+    tool_call_id: truncateUiText(source.tool_call_id || "", 160, ""),
+    args: truncateUiText(source.args || "", MAX_TRACE_FIELD_DISPLAY_CHARS),
+    output: truncateUiText(source.output || "", MAX_TRACE_FIELD_DISPLAY_CHARS),
+  };
+}
+
+function sanitizeTurnLogForUi(log) {
+  const source = log || {};
+  return {
+    ...source,
+    objective: truncateUiText(source.objective || "", 2000, TRUNCATED_OUTPUT_NOTICE),
+    summary: truncateUiText(source.summary || "", 2000, TRUNCATED_OUTPUT_NOTICE),
+    error: truncateUiText(source.error || "", 2000, TRUNCATED_OUTPUT_NOTICE),
+  };
+}
+
+function sanitizeMessageForUi(message) {
+  const metadata = message?.metadata ? { ...message.metadata } : undefined;
+  if (metadata?.trace_events) {
+    metadata.trace_events = capTraceEvents(metadata.trace_events.map(sanitizeTraceEventForUi));
+  }
+  if (metadata?.turn_logs) {
+    metadata.turn_logs = metadata.turn_logs.slice(0, 12).map(sanitizeTurnLogForUi);
+  }
+  return {
+    ...message,
+    content: displayMessageContent(message?.content),
+    metadata,
+  };
+}
+
+function sanitizeMessagesForUi(messages) {
+  return (messages || []).slice(-MAX_CLIENT_MESSAGES).map(sanitizeMessageForUi);
+}
+
+function stableHash(value) {
+  const text = String(value || "");
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
 
 function csrfToken() {
   const match = document.cookie
@@ -98,21 +218,43 @@ async function api(path, options = {}) {
 }
 
 async function streamApi(path, payload, onEvent) {
-  const response = await fetch(path, {
-    method: "POST",
-    credentials: "same-origin",
-    headers: {
-      "Content-Type": "application/json",
-      "X-CSRF-Token": csrfToken(),
-    },
-    body: JSON.stringify(payload),
-  });
+  const controller = new AbortController();
+  let idleTimer = null;
+  const totalTimer = window.setTimeout(() => controller.abort(), STREAM_TOTAL_TIMEOUT_MS);
+  const resetIdleTimer = () => {
+    if (idleTimer) window.clearTimeout(idleTimer);
+    idleTimer = window.setTimeout(() => controller.abort(), STREAM_IDLE_TIMEOUT_MS);
+  };
+  const clearStreamTimers = () => {
+    window.clearTimeout(totalTimer);
+    if (idleTimer) window.clearTimeout(idleTimer);
+  };
+  resetIdleTimer();
+  let response = null;
+  try {
+    response = await fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken(),
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    clearStreamTimers();
+    if (error.name === "AbortError") throw new Error("Agent stream timed out.");
+    throw error;
+  }
   if (response.status === 401) {
+    clearStreamTimers();
     showLogin();
     throw new Error("Not authenticated");
   }
   if (!response.ok || !response.body) {
     const data = await response.json().catch(() => ({}));
+    clearStreamTimers();
     throw new Error(data.detail || data.error || "Request failed");
   }
 
@@ -121,29 +263,43 @@ async function streamApi(path, payload, onEvent) {
   let buffer = "";
   let finalData = null;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      resetIdleTimer();
+      buffer += decoder.decode(value, { stream: true });
+      if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+        throw new Error("Streaming response exceeded the browser safety limit.");
+      }
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
 
-    for (const part of parts) {
-      const line = part.split("\n").find((item) => item.startsWith("data: "));
-      if (!line) continue;
-      const event = JSON.parse(line.slice(6));
-      if (event.type === "trace") {
-        onEvent(event.event);
-      } else if (event.type === "text_delta") {
-        onEvent({ kind: "answer_delta", content: event.content || "" });
-      } else if (event.type === "replace") {
-        onEvent({ kind: "answer_replace", content: event.content || "" });
-      } else if (event.type === "done") {
-        finalData = event.data;
-      } else if (event.type === "error") {
-        throw new Error(event.error || "Request failed");
+      for (const part of parts) {
+        const line = part.split("\n").find((item) => item.startsWith("data: "));
+        if (!line) continue;
+        const event = JSON.parse(line.slice(6));
+        if (event.type === "trace") {
+          onEvent(event.event);
+        } else if (event.type === "text_delta") {
+          onEvent({ kind: "answer_delta", content: event.content || "" });
+        } else if (event.type === "replace") {
+          onEvent({ kind: "answer_replace", content: event.content || "" });
+        } else if (event.type === "done") {
+          finalData = event.data;
+        } else if (event.type === "error") {
+          throw new Error(event.error || "Request failed");
+        }
       }
     }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("Agent stream timed out.");
+    }
+    throw error;
+  } finally {
+    clearStreamTimers();
+    await reader.cancel().catch(() => {});
   }
 
   if (!finalData) {
@@ -153,9 +309,10 @@ async function streamApi(path, payload, onEvent) {
 }
 
 function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = text || "";
-  return div.innerHTML;
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function escapeAttr(text) {
@@ -406,7 +563,30 @@ function displayRole(role) {
   return role === "admin" ? "admin" : "normal user";
 }
 
+function clearRunningPoll() {
+  if (!state.runningPollTimer) return;
+  clearInterval(state.runningPollTimer);
+  state.runningPollTimer = null;
+}
+
+function clearAppRuntimeState() {
+  clearRunningPoll();
+  stopVoiceStream();
+  state.voiceRecorder = null;
+  state.voiceRecording = false;
+  state.streamingResponse = false;
+  state.autoFollowStream = true;
+  state.messages = [];
+  state.files = { uploads: [], reports: [] };
+  state.pendingAttachments = [];
+  $("messages").textContent = "";
+  $("admin-chat-list").textContent = "";
+  $("admin-chat-detail").textContent = "";
+  $("file-preview-body").textContent = "";
+}
+
 function showLogin(message = "") {
+  clearAppRuntimeState();
   $("login-view").hidden = false;
   $("app-view").hidden = true;
   $("login-error").textContent = message;
@@ -534,9 +714,11 @@ async function deleteSession(id, title = "this chat") {
 }
 
 function createMessageElement(message) {
+  message = sanitizeMessageForUi(message);
   const row = document.createElement("article");
   row.className = `message ${message.role}`;
   row.dataset.messageId = message.id || "";
+  row.__messageSignature = messageSignature(message);
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
@@ -545,7 +727,7 @@ function createMessageElement(message) {
     bubble.classList.add("streaming");
     bubble.textContent = "Working...";
   } else {
-    bubble.innerHTML = formatMessage(message.content);
+    bubble.innerHTML = formatMessage(displayMessageContent(message.content));
   }
 
   const attachments = message.attachments || message.metadata?.attachments || [];
@@ -561,6 +743,25 @@ function createMessageElement(message) {
   }
   renderActivity(row, message.metadata || {});
   return row;
+}
+
+function messageSignature(message) {
+  const metadata = message.metadata || {};
+  const trace = metadata.trace_events || [];
+  const lastTrace = trace.length ? traceEventKey(trace[trace.length - 1]) : "";
+  const logs = (metadata.turn_logs || []).slice(0, 12).map(sanitizeTurnLogForUi);
+  return [
+    message.id || "",
+    message.role || "",
+    message.content_truncated ? "truncated" : "",
+    String(message.content || "").length,
+    stableHash(message.content || ""),
+    metadata.status || "",
+    trace.length,
+    lastTrace,
+    logs.length,
+    stableHash(logs.map((log) => `${log.status || ""}:${log.objective || ""}:${log.summary || ""}:${log.error || ""}`).join("|")),
+  ].join("|");
 }
 
 function createUserMessageControls(message, bubble) {
@@ -669,7 +870,10 @@ async function activateBranch(branchId) {
         body: "{}",
       }
     );
-    renderMessages(data.messages || []);
+    renderMessages(data.messages || [], {
+      historyTruncated: data.messages_truncated,
+      totalMessages: data.total_messages,
+    });
     await refreshSessions();
     await refreshFiles();
   } finally {
@@ -696,8 +900,8 @@ async function forkFromUserMessage(messageId, content) {
 }
 
 function renderActivity(row, metadata) {
-  const logs = metadata.turn_logs || [];
-  const traceEvents = metadata.trace_events || [];
+  const logs = (metadata.turn_logs || []).slice(0, 12).map(sanitizeTurnLogForUi);
+  const traceEvents = capTraceEvents((metadata.trace_events || []).map(sanitizeTraceEventForUi));
   const visibleLogs = logs.filter((log) => log.objective || log.summary || log.error);
   const visibleTrace = traceEvents.filter((event) => {
     return ["model_request", "model_tools", "tool_call", "tool_result", "tool_call_start"].includes(event.kind);
@@ -707,6 +911,9 @@ function renderActivity(row, metadata) {
   const traceMap = row.__activityTraceEvents;
   for (const event of visibleTrace) {
     traceMap.set(traceEventKey(event), event);
+    while (traceMap.size > MAX_PENDING_TRACE_EVENTS) {
+      traceMap.delete(traceMap.keys().next().value);
+    }
   }
 
   const existing = row.querySelector(".activity");
@@ -758,15 +965,14 @@ function renderActivity(row, metadata) {
 }
 
 function traceEventKey(event) {
-  return [
+  const identity = [
     event.ts || "",
     event.kind || "",
     event.label || "",
     event.tool_call_id || "",
     event.tool_name || "",
-    event.args || "",
-    event.output || "",
   ].join("|");
+  return `${identity}|${stableHash(`${event.args || ""}|${event.output || ""}`)}`;
 }
 
 function cssEscape(value) {
@@ -795,7 +1001,7 @@ function createTraceEventElement(event, key = "") {
   }
 
   const body = document.createElement("code");
-  body.textContent = event.output || event.args || "";
+  body.textContent = truncateUiText(event.output || event.args || "", MAX_TRACE_FIELD_DISPLAY_CHARS);
 
   item.append(label, title);
   if (body.textContent) item.appendChild(body);
@@ -806,17 +1012,23 @@ function mergeTraceEvents(...lists) {
   const merged = new Map();
   for (const list of lists) {
     for (const event of list || []) {
-      merged.set(traceEventKey(event), event);
+      const compact = sanitizeTraceEventForUi(event);
+      merged.set(traceEventKey(compact), compact);
+      while (merged.size > MAX_PENDING_TRACE_EVENTS) {
+        merged.delete(merged.keys().next().value);
+      }
     }
   }
   return [...merged.values()];
 }
 
-function renderMessages(messages) {
-  state.messages = messages;
+function renderMessages(messages, options = {}) {
+  const stickToBottom = options.stickToBottom ?? true;
+  const safeMessages = sanitizeMessagesForUi(messages);
+  state.messages = safeMessages;
   const el = $("messages");
   el.textContent = "";
-  if (!messages.length) {
+  if (!safeMessages.length) {
     el.appendChild(createMessageElement({
       role: "assistant",
       content: "Start a new conversation, or upload files to add local context.",
@@ -824,29 +1036,51 @@ function renderMessages(messages) {
     updateRunningPoll([]);
     return;
   }
-  for (const message of messages) {
+  syncHistoryNotice(el, options, safeMessages.length);
+  for (const message of safeMessages) {
     el.appendChild(createMessageElement(message));
   }
-  el.scrollTop = el.scrollHeight;
-  updateRunningPoll(messages);
+  maybeScrollMessagesToBottom(stickToBottom);
+  updateRunningPoll(safeMessages);
 }
 
-function updateMessagesInPlace(messages) {
+function syncHistoryNotice(container, options, renderedCount) {
+  const existing = container.querySelector(".history-truncation-notice");
+  if (!options.historyTruncated) {
+    if (existing) existing.remove();
+    return;
+  }
+  const total = Number(options.totalMessages || 0);
+  const hidden = Math.max(0, total - renderedCount);
+  const text = hidden
+    ? `${hidden} older message${hidden === 1 ? "" : "s"} hidden to keep this tab responsive.`
+    : "Older messages hidden to keep this tab responsive.";
+  const notice = existing || document.createElement("div");
+  notice.className = "history-truncation-notice";
+  notice.textContent = text;
+  if (!existing) container.prepend(notice);
+}
+
+function updateMessagesInPlace(messages, options = {}) {
+  const safeMessages = sanitizeMessagesForUi(messages);
   const el = $("messages");
   const rows = [...el.querySelectorAll(".message[data-message-id]")];
   const rowsById = new Map(rows.map((row) => [row.dataset.messageId, row]));
-  const canPatch = messages.length === rows.length
-    && messages.every((message) => message.id && rowsById.has(String(message.id)));
+  const canPatch = safeMessages.length === rows.length
+    && safeMessages.every((message) => message.id && rowsById.has(String(message.id)));
   if (!canPatch) {
-    renderMessages(messages);
+    renderMessages(safeMessages, { ...options, stickToBottom: shouldFollowMessagesBottom() });
     return;
   }
 
-  state.messages = messages;
-  for (const message of messages) {
+  const stickToBottom = shouldFollowMessagesBottom();
+  state.messages = safeMessages;
+  syncHistoryNotice(el, options, safeMessages.length);
+  for (const message of safeMessages) {
     updateMessageElement(rowsById.get(String(message.id)), message);
   }
-  updateRunningPoll(messages);
+  maybeScrollMessagesToBottom(stickToBottom);
+  updateRunningPoll(safeMessages);
 }
 
 function updateRunningPoll(messages = []) {
@@ -863,7 +1097,10 @@ function updateRunningPoll(messages = []) {
     if (!state.activeSessionId) return;
     try {
       const data = await api(`/api/chat/sessions/${encodeURIComponent(state.activeSessionId)}`);
-      updateMessagesInPlace(data.messages);
+      updateMessagesInPlace(data.messages, {
+        historyTruncated: data.messages_truncated,
+        totalMessages: data.total_messages,
+      });
       const stillRunning = data.messages.some((message) => message.role === "assistant" && message.metadata?.status === "running");
       if (!stillRunning && state.runningPollTimer) {
         clearInterval(state.runningPollTimer);
@@ -881,12 +1118,16 @@ function updateRunningPoll(messages = []) {
 function appendLocalMessage(role, content, attachments = []) {
   const row = createMessageElement({ role, content, attachments });
   $("messages").appendChild(row);
-  $("messages").scrollTop = $("messages").scrollHeight;
+  scrollMessagesToBottom();
   return row;
 }
 
 function updateMessageElement(row, message) {
   if (!row || !message) return;
+  message = sanitizeMessageForUi(message);
+  const signature = messageSignature(message);
+  if (row.__messageSignature === signature) return;
+  row.__messageSignature = signature;
   const bubble = row.querySelector(".bubble");
   if (bubble) {
     if (message.metadata?.status === "running" && !message.content) {
@@ -894,7 +1135,8 @@ function updateMessageElement(row, message) {
       bubble.textContent = "Working...";
     } else {
       bubble.classList.remove("streaming");
-      bubble.innerHTML = formatMessage(message.content || "");
+      bubble.classList.remove("streaming-text");
+      bubble.innerHTML = formatMessage(displayMessageContent(message.content || ""));
     }
   }
   renderActivity(row, message.metadata || {});
@@ -940,7 +1182,10 @@ async function loadSession(id) {
   state.activeSessionId = id;
   state.pendingAttachments = [];
   renderSessions();
-  renderMessages(data.messages);
+  renderMessages(data.messages, {
+    historyTruncated: data.messages_truncated,
+    totalMessages: data.total_messages,
+  });
   await refreshFiles();
   renderComposerAttachments();
 }
@@ -980,6 +1225,45 @@ async function sendMessage(content) {
   pendingBubble.textContent = "Working...";
   const pendingMetadata = { trace_events: [] };
   let streamedContent = "";
+  let streamTruncated = false;
+  let streamRenderTimer = null;
+  const clearStreamRenderTimer = () => {
+    if (!streamRenderTimer) return;
+    window.clearTimeout(streamRenderTimer);
+    streamRenderTimer = null;
+  };
+  const appendStreamDelta = (delta) => {
+    if (!delta || streamTruncated) return;
+    const nextLength = streamedContent.length + delta.length;
+    if (nextLength > MAX_RENDERED_MESSAGE_CHARS) {
+      const contentLimit = Math.max(0, MAX_RENDERED_MESSAGE_CHARS - TRUNCATED_OUTPUT_NOTICE.length);
+      const base = streamedContent.slice(0, contentLimit).trimEnd();
+      const remaining = Math.max(0, contentLimit - base.length);
+      streamedContent = `${base}${delta.slice(0, remaining)}${TRUNCATED_OUTPUT_NOTICE}`;
+      streamTruncated = true;
+      return;
+    }
+    streamedContent += delta;
+  };
+  const renderStreamContent = (force = false) => {
+    if (!force && streamRenderTimer) return;
+    const render = () => {
+      streamRenderTimer = null;
+      const stickToBottom = shouldFollowMessagesBottom();
+      pendingBubble.classList.remove("streaming");
+      pendingBubble.classList.add("streaming-text");
+      pendingBubble.textContent = streamedContent || "Working...";
+      maybeScrollMessagesToBottom(stickToBottom);
+    };
+    if (force) {
+      clearStreamRenderTimer();
+      render();
+      return;
+    }
+    streamRenderTimer = window.setTimeout(render, STREAM_RENDER_INTERVAL_MS);
+  };
+  state.streamingResponse = true;
+  state.autoFollowStream = true;
   setBusy(true);
   try {
     const data = await streamApi(
@@ -987,44 +1271,57 @@ async function sendMessage(content) {
       { content },
       (event) => {
         if (event.kind === "answer_delta") {
-          streamedContent += event.content || "";
-          pendingBubble.classList.remove("streaming");
-          pendingBubble.innerHTML = formatMessage(streamedContent);
-          $("messages").scrollTop = $("messages").scrollHeight;
+          appendStreamDelta(event.content || "");
+          renderStreamContent();
           return;
         }
         if (event.kind === "answer_replace") {
-          streamedContent = event.content || streamedContent;
+          const stickToBottom = shouldFollowMessagesBottom();
+          streamedContent = displayMessageContent(event.content || streamedContent);
+          streamTruncated = streamedContent.endsWith(TRUNCATED_OUTPUT_NOTICE);
+          clearStreamRenderTimer();
           pendingBubble.classList.remove("streaming");
+          pendingBubble.classList.remove("streaming-text");
           pendingBubble.innerHTML = formatMessage(streamedContent);
-          $("messages").scrollTop = $("messages").scrollHeight;
+          maybeScrollMessagesToBottom(stickToBottom);
           return;
         }
-        pendingMetadata.trace_events.push(event);
+        const stickToBottom = shouldFollowMessagesBottom();
+        pendingMetadata.trace_events.push(sanitizeTraceEventForUi(event));
+        pendingMetadata.trace_events = capTraceEvents(pendingMetadata.trace_events);
         renderActivity(pending, pendingMetadata);
+        maybeScrollMessagesToBottom(stickToBottom);
       }
     );
+    renderStreamContent(true);
     if (data?.message) {
-      data.message.metadata = {
-        ...(data.message.metadata || {}),
+      const safeMessage = sanitizeMessageForUi(data.message);
+      safeMessage.metadata = {
+        ...(safeMessage.metadata || {}),
         trace_events: mergeTraceEvents(
           pendingMetadata.trace_events,
-          data.message.metadata?.trace_events || []
+          safeMessage.metadata?.trace_events || []
         ),
       };
-      const replacement = createMessageElement(data.message);
+      const replacement = createMessageElement(safeMessage);
+      const stickToBottom = shouldFollowMessagesBottom();
       pending.replaceWith(replacement);
+      maybeScrollMessagesToBottom(stickToBottom);
     } else {
       await loadSession(state.activeSessionId);
     }
     await refreshSessions();
     await refreshFiles();
   } catch (error) {
+    clearStreamRenderTimer();
     await loadSession(state.activeSessionId).catch(() => {
       const bubble = pending.querySelector(".bubble");
       bubble.textContent = error.message;
     });
   } finally {
+    clearStreamRenderTimer();
+    state.streamingResponse = false;
+    state.autoFollowStream = true;
     setBusy(false);
   }
 }
@@ -1104,6 +1401,10 @@ function fileIcon(filename) {
 
 async function uploadSelectedFile(file) {
   if (!file) return;
+  if (file.size > MAX_UPLOAD_FILE_BYTES) {
+    $("upload-status").textContent = `${file.name} is larger than ${formatBytes(MAX_UPLOAD_FILE_BYTES)}.`;
+    return;
+  }
   if (!state.activeSessionId) {
     await createSession();
   }
@@ -1128,7 +1429,11 @@ async function uploadSelectedFile(file) {
 }
 
 async function uploadSelectedFiles(files) {
-  for (const file of files) {
+  const selected = [...files].slice(0, MAX_UPLOAD_BATCH_FILES);
+  if (files.length > MAX_UPLOAD_BATCH_FILES) {
+    $("upload-status").textContent = `Only the first ${MAX_UPLOAD_BATCH_FILES} files were queued.`;
+  }
+  for (const file of selected) {
     await uploadSelectedFile(file);
   }
 }
@@ -1167,10 +1472,29 @@ function createWavVoiceRecorder(stream) {
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   const silentGain = audioContext.createGain();
   const chunks = [];
+  const maxSamples = Math.floor(audioContext.sampleRate * MAX_VOICE_RECORDING_SECONDS);
+  let capturedSamples = 0;
+  let limitReached = false;
+  let stopped = false;
   silentGain.gain.value = 0;
 
   processor.onaudioprocess = (event) => {
-    chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    if (stopped || limitReached) return;
+    const input = event.inputBuffer.getChannelData(0);
+    const remaining = maxSamples - capturedSamples;
+    if (remaining <= 0) {
+      limitReached = true;
+      window.setTimeout(() => stopVoiceInput(), 0);
+      return;
+    }
+    const samples = input.length > remaining ? input.slice(0, remaining) : input;
+    chunks.push(new Float32Array(samples));
+    capturedSamples += samples.length;
+    if (capturedSamples >= maxSamples) {
+      limitReached = true;
+      $("upload-status").textContent = `Recording stopped at ${MAX_VOICE_RECORDING_SECONDS} seconds.`;
+      window.setTimeout(() => stopVoiceInput(), 0);
+    }
   };
   source.connect(processor);
   processor.connect(silentGain);
@@ -1180,12 +1504,15 @@ function createWavVoiceRecorder(stream) {
   return {
     async stop() {
       const sampleRate = audioContext.sampleRate;
+      stopped = true;
       processor.onaudioprocess = null;
       source.disconnect();
       processor.disconnect();
       silentGain.disconnect();
       await audioContext.close().catch(() => {});
-      return encodeWavBlob(chunks, sampleRate);
+      const blob = encodeWavBlob(chunks, sampleRate);
+      chunks.length = 0;
+      return blob;
     },
   };
 }
@@ -1352,7 +1679,7 @@ function renderPreviewBody(item, data) {
   if (data.is_text) {
     const pre = document.createElement("pre");
     pre.className = "file-preview-text";
-    pre.textContent = data.content || "";
+    pre.textContent = displayPreviewContent(data.content || "");
     body.appendChild(pre);
     return;
   }
@@ -1692,6 +2019,12 @@ async function refreshAdminChats() {
     $("admin-chat-detail").textContent = "";
     return;
   }
+  if (data.truncated) {
+    const notice = document.createElement("p");
+    notice.className = "admin-empty";
+    notice.textContent = "Showing the most recent chat sessions.";
+    list.appendChild(notice);
+  }
   for (const session of sessions) {
     const button = document.createElement("button");
     button.className = "admin-chat-item";
@@ -1728,13 +2061,23 @@ async function loadAdminChat(id) {
     return;
   }
 
+  if (data.messages_truncated) {
+    const notice = document.createElement("p");
+    notice.className = "admin-empty";
+    const hidden = Math.max(0, Number(data.total_messages || 0) - data.messages.length);
+    notice.textContent = hidden
+      ? `Showing newest messages. ${hidden} older message${hidden === 1 ? "" : "s"} hidden.`
+      : "Showing newest messages.";
+    detail.appendChild(notice);
+  }
+
   for (const message of data.messages) {
     const row = document.createElement("article");
     row.className = "admin-chat-message";
     const role = document.createElement("span");
     role.textContent = message.role === "user" ? "User" : "Local Agent";
     const content = document.createElement("p");
-    content.textContent = message.content;
+    content.textContent = displayMessageContent(message.content);
     row.append(role, content);
     detail.appendChild(row);
   }
@@ -1792,6 +2135,10 @@ $("create-user-form").addEventListener("submit", async (event) => {
 });
 
 $("new-chat").addEventListener("click", createSession);
+
+$("messages").addEventListener("wheel", stopStreamingAutoFollow, { passive: true });
+$("messages").addEventListener("touchstart", stopStreamingAutoFollow, { passive: true });
+$("messages").addEventListener("pointerdown", stopStreamingAutoFollow);
 
 $("composer").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1883,6 +2230,9 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown", " "].includes(event.key)) {
+    stopStreamingAutoFollow();
+  }
   if (event.key === "Escape") {
     closeAttachmentPreview();
     closeUploadMenu();

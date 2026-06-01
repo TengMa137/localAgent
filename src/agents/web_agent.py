@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.usage import UsageLimits
 
-from .observability import observable_run
+from .structured_retry import observable_run_with_manual_validation_retries
 from .runtime.context import _now, model, web_toolset
 from .runtime.query_policy import extract_arxiv_ids, extract_urls
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
@@ -41,7 +41,7 @@ class WebAgentResult(BaseModel):
 web_agent = Agent(
     model=model,
     output_type=WebAgentResult,
-    output_retries=3,
+    output_retries=0,
     toolsets=[web_toolset],
     system_prompt="""
 You are a web research specialist.
@@ -130,9 +130,11 @@ async def run_web_task(objective: str) -> str:
     prompt = f"{_web_query_guidance(objective)}\n\nObjective: {objective}"
     if report_memory:
         prompt = f"Concise prior session report memory:\n{report_memory}\n\n{prompt}"
-    result = await observable_run(
+    result = await observable_run_with_manual_validation_retries(
         web_agent,
         prompt,
+        output_type=WebAgentResult,
+        output_name="WebAgentResult",
         label="web_agent",
         indent=1,
         usage_limits=UsageLimits(tool_calls_limit=10),

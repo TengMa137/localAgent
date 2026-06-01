@@ -344,7 +344,86 @@ def test_first_message_can_use_agent_generated_chat_title(monkeypatch, tmp_path)
         assert response.json()["session"]["title"] == "agent-named-chat"
 
 
-def test_stream_forwards_final_answer_pass_text_delta(monkeypatch, tmp_path):
+def test_agent_history_is_rebuilt_from_visible_branch_messages(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    captured_histories = []
+
+    async def fake_run_turn(user_text, session, debug=False, trace_sink=None):
+        captured_histories.append(str(session.message_history))
+        reply = f"answer {len(captured_histories)}"
+        return (
+            SimpleNamespace(reply=reply),
+            [
+                *session.message_history,
+                server.ModelRequest.user_text_prompt(user_text),
+                server.ModelResponse(parts=[server.TextPart(content=reply)]),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "history test"},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+        first = client.post(
+            f"/api/chat/sessions/{chat_id}/messages",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "first question"},
+        )
+        assert first.status_code == 200
+
+        polluted_history = server.messages_to_json(
+            [
+                server.ModelRequest.user_text_prompt(
+                    "Original objective:\ninternal\n\nPlan workflow result:\nhidden"
+                )
+            ]
+        )
+        with server.db() as conn:
+            conn.execute(
+                "UPDATE chat_sessions SET model_messages_json = ? WHERE id = ?",
+                (polluted_history, chat_id),
+            )
+            conn.execute(
+                """
+                UPDATE chat_branches
+                SET model_messages_json = ?
+                WHERE session_id = ? AND id = 'main'
+                """,
+                (polluted_history, chat_id),
+            )
+
+        second = client.post(
+            f"/api/chat/sessions/{chat_id}/messages",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "second question"},
+        )
+        assert second.status_code == 200
+
+    assert captured_histories[0] == "[]"
+    assert "first question" in captured_histories[1]
+    assert "answer 1" in captured_histories[1]
+    assert "Original objective" not in captured_histories[1]
+    assert "Plan workflow result" not in captured_histories[1]
+
+
+def test_stream_does_not_forward_hidden_orchestrator_text_delta(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
 
     class FakeResponse:
@@ -355,8 +434,8 @@ def test_stream_forwards_final_answer_pass_text_delta(monkeypatch, tmp_path):
             trace_sink(
                 {
                     "kind": "text_delta",
-                    "label": "orchestrator:answer",
-                    "content": "streamed final chunk",
+                    "label": "orchestrator",
+                    "content": "hidden route decision text",
                 }
             )
         return (
@@ -399,8 +478,124 @@ def test_stream_forwards_final_answer_pass_text_delta(monkeypatch, tmp_path):
             body = "".join(response.iter_text())
 
     assert "text_delta" in body
-    assert "streamed final chunk" in body
+    assert "hidden route decision text" not in body
     assert "final answer" in body
+
+
+def test_stream_forwards_synthesis_text_delta(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    class FakeResponse:
+        reply = "streamed final answer"
+
+    async def fake_run_turn(user_text, session, debug=False, trace_sink=None):
+        if trace_sink is not None:
+            trace_sink(
+                {
+                    "kind": "text_delta",
+                    "label": "synthesis",
+                    "content": "streamed ",
+                }
+            )
+            trace_sink(
+                {
+                    "kind": "text_delta",
+                    "label": "synthesis",
+                    "content": "final answer",
+                }
+            )
+        return (
+            FakeResponse(),
+            [
+                *session.message_history,
+                server.ModelRequest.user_text_prompt(user_text),
+                server.ModelResponse(
+                    parts=[server.TextPart(content="streamed final answer")]
+                ),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "stream synthesis test"},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+        with client.stream(
+            "POST",
+            f"/api/chat/sessions/{chat_id}/messages/stream",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "plan question"},
+        ) as response:
+            assert response.status_code == 200
+            body = "".join(response.iter_text())
+
+    assert "streamed " in body
+    assert "final answer" in body
+    assert "replace" in body
+
+
+def test_trace_event_compaction_preserves_all_tool_activity(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    events = [
+        {
+            "kind": "tool_call",
+            "label": "fs_agent",
+            "tool_name": "read_file",
+            "tool_call_id": str(index),
+            "args": f'{{"path": "/docs/{index}.md"}}',
+        }
+        for index in range(120)
+    ]
+    events.extend(
+        [
+            {"kind": "text_delta", "label": "orchestrator", "content": "answer"},
+            {"kind": "tool_args_delta", "label": "fs_agent", "args_delta": "x"},
+        ]
+    )
+
+    compact = server.compact_trace_events(events)
+
+    assert len(compact) == 120
+    assert {event["kind"] for event in compact} == {"tool_call"}
+    assert compact[0]["tool_call_id"] == "0"
+    assert compact[-1]["tool_call_id"] == "119"
+
+
+def test_trace_event_compaction_caps_pathological_activity(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    events = [
+        {
+            "kind": "tool_result",
+            "label": "fs_agent",
+            "tool_name": "read_file",
+            "tool_call_id": str(index),
+            "output": "x" * 5000,
+        }
+        for index in range(600)
+    ]
+
+    compact = server.compact_trace_events(events)
+
+    assert len(compact) <= 500
+    assert len(compact[0]["output"]) < 2100
 
 
 def test_user_can_transcribe_voice_input(monkeypatch, tmp_path):
@@ -982,3 +1177,85 @@ def test_stale_running_message_is_marked_failed_on_session_load(monkeypatch, tmp
         message = response.json()["messages"][0]
         assert message["metadata"]["status"] == "failed"
         assert message["content"] == "Agent run stopped before completing."
+
+
+def test_chat_session_detail_returns_bounded_message_tail(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "bounded history"},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+
+        with server.db() as conn:
+            now = server._utc_now()
+            for index in range(server.MAX_CHAT_MESSAGES_RETURNED + 5):
+                conn.execute(
+                    """
+                    INSERT INTO chat_messages (
+                        session_id, user_id, branch_id, role, content, created_at
+                    )
+                    VALUES (?, 1, 'main', 'user', ?, ?)
+                    """,
+                    (chat_id, f"message {index}", now),
+                )
+
+        response = client.get(f"/api/chat/sessions/{chat_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["messages_truncated"] is True
+        assert data["total_messages"] == server.MAX_CHAT_MESSAGES_RETURNED + 5
+        assert len(data["messages"]) == server.MAX_CHAT_MESSAGES_RETURNED
+        assert data["messages"][0]["content"] == "message 5"
+
+
+def test_chat_session_detail_truncates_oversized_message_content(
+    monkeypatch, tmp_path
+):
+    server = _load_server(monkeypatch, tmp_path)
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "bounded content"},
+        )
+        assert create_chat.status_code == 200
+        chat_id = create_chat.json()["session"]["id"]
+        content = "x" * (server.MAX_PUBLIC_MESSAGE_CHARS + 500)
+
+        with server.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_messages (
+                    session_id, user_id, branch_id, role, content, created_at
+                )
+                VALUES (?, 1, 'main', 'assistant', ?, ?)
+                """,
+                (chat_id, content, server._utc_now()),
+            )
+
+        response = client.get(f"/api/chat/sessions/{chat_id}")
+        assert response.status_code == 200
+        message = response.json()["messages"][0]
+        assert message["content_truncated"] is True
+        assert message["content_original_length"] == len(content)
+        assert len(message["content"]) <= server.MAX_PUBLIC_MESSAGE_CHARS

@@ -13,6 +13,10 @@ from .fs_agent import run_fs_task
 from .web_agent import run_web_task
 
 from .observability import observable_run, _rt, task_log_store, TaskLog
+from .structured_retry import (
+    answer_model_settings,
+    observable_run_with_manual_validation_retries,
+)
 
 
 MAX_PARALLEL_TASKS = 3
@@ -39,10 +43,6 @@ class TaskSpec(BaseModel):
                 if values.get(field) is None:
                     values[field] = []
         return values
-
-
-class SynthesisOutput(BaseModel):
-    report: str
 
 
 class HistorySummaryOutput(BaseModel):
@@ -93,11 +93,13 @@ async def _run_structured_worker(
         model=model,
         system_prompt=system_prompt,
         output_type=output_type,
-        output_retries=3,
+        output_retries=0,
     )
-    return await observable_run(
+    return await observable_run_with_manual_validation_retries(
         worker,
         prompt,
+        output_type=output_type,
+        output_name=output_type.__name__,
         label=label,
         indent=indent,
         message_history=message_history,
@@ -259,7 +261,14 @@ async def run_synthesis_worker(
     label: str = "synthesis",
     indent: int = 1,
 ) -> str:
-    result = await _run_structured_worker(
+    worker = Agent(
+        model=model,
+        system_prompt=SYNTHESIS_SYSTEM_PROMPT,
+        output_type=str,
+        output_retries=0,
+    )
+    result = await observable_run(
+        worker,
         prompt=(
             f"Question: {question}\n"
             f"As of: {as_of}\n"
@@ -268,9 +277,9 @@ async def run_synthesis_worker(
             f"Uncertainties: {uncertainties}\n"
             f"Sources: {sources}"
         ),
-        system_prompt=SYNTHESIS_SYSTEM_PROMPT,
-        output_type=SynthesisOutput,
         label=label,
         indent=indent,
+        usage_limits=UsageLimits(tool_calls_limit=MAX_TOOL_CALLS),
+        **answer_model_settings(),
     )
-    return result.output.report
+    return result.output
