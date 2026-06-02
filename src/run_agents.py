@@ -15,7 +15,6 @@ import argparse
 import asyncio
 import json
 import re
-import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -38,7 +37,6 @@ from agents.observability import (
     _is_synthetic_output_tool,
     log_event,
 )
-from agents.runtime.reports import REPORT_ROOT, set_report_dir
 from agents.runtime.memory import (
     apply_memory_findings,
     default_memory_dir,
@@ -139,7 +137,6 @@ class ChatSession:
     message_history: List[ModelMessage] = field(default_factory=list)
     session_title: Optional[str] = None
     history_path: Optional[Path] = None
-    report_dir: Optional[Path] = None
     memory_dir: Optional[Path] = field(default_factory=default_memory_dir)
 
 
@@ -162,20 +159,6 @@ def _resolve_history_path(slug: str) -> Path:
     return CHAT_HISTORY_DIR / f"{slug}-{ts}.json"
 
 
-def _reset_report_dir(report_dir: Path) -> None:
-    """Start one user turn with report memory from this run only."""
-    if report_dir.exists():
-        shutil.rmtree(report_dir)
-    report_dir.mkdir(parents=True, exist_ok=True)
-
-
-def _reset_turn_report_dir(session: ChatSession) -> None:
-    """Clear specialist reports so each user turn starts from scratch."""
-    if session.report_dir is None:
-        return
-    _reset_report_dir(session.report_dir)
-
-
 def _init_session_paths_from_user_text(session: ChatSession, user_text: str) -> None:
     if session.history_path is not None:
         return
@@ -185,7 +168,6 @@ def _init_session_paths_from_user_text(session: ChatSession, user_text: str) -> 
     )
     session.history_path = _resolve_history_path(slug)
     session.session_title = session.history_path.stem
-    session.report_dir = REPORT_ROOT / session.session_title
 
 
 def _save_history(session: ChatSession) -> None:
@@ -195,7 +177,6 @@ def _save_history(session: ChatSession) -> None:
         session.history_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "session_title": session.session_title,
-            "report_dir": str(session.report_dir) if session.report_dir else None,
             "memory_dir": str(session.memory_dir) if session.memory_dir else None,
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "messages": _MSG_ADAPTER.dump_python(session.message_history, mode="json"),
@@ -291,8 +272,6 @@ async def run_turn(
     without scraping stdout.
     """
     _init_session_paths_from_user_text(session, user_text)
-    _reset_turn_report_dir(session)
-    set_report_dir(session.report_dir)
     memory_context = (
         load_user_memory_context(session.memory_dir)
         if not session.message_history

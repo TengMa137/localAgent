@@ -10,11 +10,6 @@ from .structured_retry import observable_run_with_manual_validation_retries
 from .runtime.context import _now, model, web_toolset
 from .runtime.query_policy import extract_arxiv_ids, extract_urls
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
-from .runtime.reports import (
-    current_report_dir,
-    load_agent_report_summaries,
-    write_agent_report,
-)
 
 
 class WebAgentResult(BaseModel):
@@ -77,9 +72,7 @@ def _format_orchestrator_response(output: WebAgentResult) -> str:
     if output.urls:
         notes.append("Sources: " + ", ".join(_dedupe(output.urls)))
     if output.findings:
-        notes.append(
-            f"Detailed findings in web-report.md: {len(output.findings)} item(s)"
-        )
+        notes.append(f"Detailed findings: {len(output.findings)} item(s)")
     if output.uncertainties:
         notes.append("Uncertainties: " + "; ".join(_dedupe(output.uncertainties)))
 
@@ -126,10 +119,7 @@ async def run_web_task(objective: str) -> str:
     current docs, package/API changes, arXiv/DOI lookup, or web source
     selection is needed. Crawled content is indexed into the shared RAG store.
     """
-    report_memory = load_agent_report_summaries(current_report_dir())
     prompt = f"{_web_query_guidance(objective)}\n\nObjective: {objective}"
-    if report_memory:
-        prompt = f"Concise prior session report memory:\n{report_memory}\n\n{prompt}"
     result = await observable_run_with_manual_validation_retries(
         web_agent,
         prompt,
@@ -148,15 +138,5 @@ async def run_web_task(objective: str) -> str:
         )
     else:
         output.uncertainties.append("No URLs were selected or crawled.")
-
-    write_agent_report(
-        "web",
-        objective=objective,
-        summary=output.summary,
-        answer=output.answer,
-        findings=output.findings,
-        sources=output.urls,
-        uncertainties=output.uncertainties,
-    )
 
     return _format_orchestrator_response(output)

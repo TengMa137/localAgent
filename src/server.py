@@ -7,7 +7,6 @@ import shutil
 import sqlite3
 import time
 from contextlib import asynccontextmanager, contextmanager, suppress
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -79,7 +78,6 @@ from server_app.utils import (
     clean_filename,
     is_text_preview,
     json_dumps,
-    row_has,
     slugish,
     sqlite_lastrowid,
     utc_now,
@@ -464,7 +462,6 @@ def _chat_session_for_agent(
     branch_id: str = "main",
 ) -> ChatSession:
     history_dir = STATE_DIR / "history" / str(user_id)
-    report_dir = STATE_DIR / "reports" / str(user_id) / row["id"] / branch_id
     return ChatSession(
         message_history=messages_from_json(
             model_messages_json
@@ -473,7 +470,6 @@ def _chat_session_for_agent(
         ),
         session_title=row["title"],
         history_path=history_dir / f"{row['id']}-{branch_id}.json",
-        report_dir=report_dir,
         memory_dir=STATE_DIR / "memory" / str(user_id),
     )
 
@@ -492,49 +488,6 @@ def _load_chat_file_for_user(
     if not row:
         raise HTTPException(status_code=404, detail="File not found.")
     return row
-
-
-def _list_session_reports(session: sqlite3.Row, user_id: int) -> list[dict[str, Any]]:
-    branch_id = (
-        session["active_branch_id"] if row_has(session, "active_branch_id") else "main"
-    )
-    report_dir = _chat_session_for_agent(
-        session, user_id, branch_id=branch_id
-    ).report_dir
-    if report_dir is None or not report_dir.exists():
-        return []
-    reports: list[dict[str, Any]] = []
-    for path in sorted(report_dir.glob("*-report.md")):
-        stat = path.stat()
-        reports.append(
-            {
-                "name": path.name,
-                "size_bytes": stat.st_size,
-                "updated_at": datetime.fromtimestamp(
-                    stat.st_mtime, tz=timezone.utc
-                ).isoformat(),
-            }
-        )
-    return reports
-
-
-def _session_report_path(session: sqlite3.Row, user_id: int, report_name: str) -> Path:
-    name = Path(report_name).name
-    if name != report_name or not name.endswith("-report.md"):
-        raise HTTPException(status_code=404, detail="Report not found.")
-    branch_id = (
-        session["active_branch_id"] if row_has(session, "active_branch_id") else "main"
-    )
-    report_dir = _chat_session_for_agent(
-        session, user_id, branch_id=branch_id
-    ).report_dir
-    if report_dir is None:
-        raise HTTPException(status_code=404, detail="Report not found.")
-    path = (report_dir / name).resolve()
-    root = report_dir.resolve()
-    if not path.is_file() or not path.is_relative_to(root):
-        raise HTTPException(status_code=404, detail="Report not found.")
-    return path
 
 
 def _empty_new_chat_for_user(
@@ -1022,7 +975,7 @@ def list_chat_files(
     session_id: str, user: sqlite3.Row = Depends(current_user)
 ) -> dict[str, Any]:
     with db() as conn:
-        session = _load_chat_for_user(conn, session_id, user["id"])
+        _load_chat_for_user(conn, session_id, user["id"])
         uploads = conn.execute(
             """
             SELECT *
@@ -1034,7 +987,6 @@ def list_chat_files(
         ).fetchall()
         return {
             "uploads": [public_chat_file(row) for row in uploads],
-            "reports": _list_session_reports(session, user["id"]),
         }
 
 
@@ -1138,25 +1090,6 @@ def get_chat_file_raw(
     return FileResponse(path, media_type=media_type, filename=row["filename"])
 
 
-@app.get("/api/chat/sessions/{session_id}/reports/{report_name}")
-def get_chat_report(
-    session_id: str, report_name: str, user: sqlite3.Row = Depends(current_user)
-) -> dict[str, Any]:
-    with db() as conn:
-        session = _load_chat_for_user(conn, session_id, user["id"])
-    path = _session_report_path(session, user["id"], report_name)
-    return {
-        "report": {
-            "name": path.name,
-            "size_bytes": path.stat().st_size,
-            "updated_at": datetime.fromtimestamp(
-                path.stat().st_mtime, tz=timezone.utc
-            ).isoformat(),
-        },
-        "content": path.read_text(encoding="utf-8", errors="replace"),
-    }
-
-
 @app.patch("/api/chat/sessions/{session_id}")
 def rename_chat_session(
     session_id: str, body: RenameChatRequest, user: sqlite3.Row = Depends(current_user)
@@ -1182,7 +1115,6 @@ def delete_chat_session(
             "SELECT stored_name FROM chat_files WHERE session_id = ? AND user_id = ?",
             (session_id, user["id"]),
         ).fetchall()
-        report_dir = STATE_DIR / "reports" / str(user["id"]) / session_id
         conn.execute(
             "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
             (session_id, user["id"]),
@@ -1192,8 +1124,6 @@ def delete_chat_session(
     upload_dir = WEB_UPLOAD_ROOT / str(user["id"]) / session_id
     if upload_rows and upload_dir.exists():
         shutil.rmtree(upload_dir, ignore_errors=True)
-    if report_dir is not None and report_dir.exists():
-        shutil.rmtree(report_dir, ignore_errors=True)
     return {"ok": True}
 
 

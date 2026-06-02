@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import asyncio
 import uuid
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
@@ -9,19 +9,32 @@ from pydantic_ai.usage import UsageLimits
 
 from .runtime.context import model, _now
 from .runtime.query_policy import TaskKind
+from .runtime.turn_context import EvidenceItem
 from .fs_agent import run_fs_task
 from .web_agent import run_web_task
 
 from .observability import observable_run, _rt, task_log_store, TaskLog
-from .structured_retry import (
-    answer_model_settings,
-    observable_run_with_manual_validation_retries,
-)
+from .structured_retry import answer_model_settings
 
 
 MAX_PARALLEL_TASKS = 3
 MAX_TOOL_CALLS = 10
-T = TypeVar("T", bound=BaseModel)
+UNUSEFUL_ANSWER_PREFIXES = (
+    "i could not find",
+    "i couldn't find",
+    "i could not complete",
+    "i couldn't complete",
+    "i couldn't produce",
+    "i could not produce",
+    "please confirm the exact path",
+)
+UNUSEFUL_ANSWER_PHRASES = (
+    "no answer returned",
+    "no urls were selected or crawled",
+    "file-not-found",
+    "not found under the readable roots",
+    "every retrieval/extraction task failed",
+)
 
 
 class TaskSpec(BaseModel):
@@ -45,18 +58,14 @@ class TaskSpec(BaseModel):
         return values
 
 
-class HistorySummaryOutput(BaseModel):
-    summary: str
-
-
 SYNTHESIS_SYSTEM_PROMPT = """
-Produce a final well-structured research report.
+Produce a final well-structured answer.
 
 Requirements:
   - Clear conclusion up front
   - Key findings grouped logically
   - Uncertainties stated explicitly
-  - Answer the user's question; do not recap report files, worker mechanics, or
+  - Answer the user's question; do not recap worker mechanics or
     trial-and-error search steps
   - If Time sensitive is true, include the As of date in the answer
   - Evidence-backed tone
@@ -69,59 +78,6 @@ Requirements:
 
 Do not hallucinate citations or sources.
 """
-
-
-HISTORY_SUMMARY_SYSTEM_PROMPT = """
-Summarise the research conversation.
-
-Preserve: decisions made, evidence found, tasks spawned, open questions.
-Omit: small-talk, retries, raw tool output.
-Output plain prose, no lists, no headers.
-"""
-
-
-async def _run_structured_worker(
-    *,
-    prompt: str,
-    system_prompt: str,
-    output_type: type[T],
-    label: str,
-    indent: int,
-    message_history: Optional[list] = None,
-):
-    worker = Agent(
-        model=model,
-        system_prompt=system_prompt,
-        output_type=output_type,
-        output_retries=0,
-    )
-    return await observable_run_with_manual_validation_retries(
-        worker,
-        prompt,
-        output_type=output_type,
-        output_name=output_type.__name__,
-        label=label,
-        indent=indent,
-        message_history=message_history,
-        usage_limits=UsageLimits(tool_calls_limit=MAX_TOOL_CALLS),
-    )
-
-
-async def run_history_summary_worker(
-    *,
-    message_history: list,
-    label: str = "summarise",
-    indent: int = 0,
-) -> str:
-    result = await _run_structured_worker(
-        prompt="Summarise this research conversation:",
-        system_prompt=HISTORY_SUMMARY_SYSTEM_PROMPT,
-        output_type=HistorySummaryOutput,
-        label=label,
-        indent=indent,
-        message_history=message_history,
-    )
-    return result.output.summary
 
 
 def _build_specialist_objective(task: TaskSpec) -> str:
@@ -204,19 +160,92 @@ def _handoff_note_values(result: str, label: str) -> list[str]:
     return values
 
 
-def _worker_success_log(task: TaskSpec, task_id: str, result: str) -> TaskLog:
-    compact = _compact_specialist_result(result)
-    answer = _handoff_answer(result)
+def _handoff_note_value(result: str, label: str) -> str:
+    values = _handoff_note_values(result, label)
+    return values[0] if values else ""
+
+
+def _handoff_sources(result: str, fallback: list[str]) -> list[str]:
+    sources = []
+    for value in _handoff_note_values(result, "Sources"):
+        sources.extend(part.strip() for part in value.split(",") if part.strip())
+    return list(dict.fromkeys([*sources, *fallback]))
+
+
+def _answer_for_synthesis(answer: str) -> str:
+    text = answer.strip()
+    if text.lower().startswith("heads up:") and "\n\n" in text:
+        return text.split("\n\n", 1)[1].strip()
+    return text
+
+
+def _is_useful_specialist_answer(answer: str, uncertainties: list[str]) -> bool:
+    text = _answer_for_synthesis(answer)
+    lowered = text.lower()
+    if not text:
+        return False
+    if any(lowered.startswith(prefix) for prefix in UNUSEFUL_ANSWER_PREFIXES):
+        return False
+    if any(phrase in lowered for phrase in UNUSEFUL_ANSWER_PHRASES):
+        return False
+    if not uncertainties:
+        return True
+    joined_uncertainties = " ".join(uncertainties).lower()
+    if (
+        "no urls were selected or crawled" in joined_uncertainties
+        and len(text.split()) < 12
+    ):
+        return False
+    return True
+
+
+def _specialist_evidence(
+    *,
+    task: TaskSpec,
+    task_id: str,
+    specialist: str,
+    result: str,
+) -> EvidenceItem:
+    answer = _answer_for_synthesis(_handoff_answer(result))
     uncertainties = _handoff_note_values(result, "Uncertainties")
-    findings = [answer] if answer and answer != "No answer returned." else []
+    useful = _is_useful_specialist_answer(answer, uncertainties)
+    return EvidenceItem(
+        task_id=task_id,
+        objective=task.objective,
+        agent=specialist,
+        answer=answer if useful else "",
+        summary=_handoff_note_value(result, "Summary"),
+        useful=useful,
+        sources=_handoff_sources(result, _task_sources(task)),
+        uncertainties=uncertainties,
+    )
+
+
+def _worker_success_log(
+    task: TaskSpec,
+    task_id: str,
+    specialist: str,
+    result: str,
+) -> TaskLog:
+    compact = _compact_specialist_result(result)
+    evidence = _specialist_evidence(
+        task=task,
+        task_id=task_id,
+        specialist=specialist,
+        result=result,
+    )
+    findings = [evidence.answer] if evidence.useful and evidence.answer else []
     return TaskLog(
         task_id=task_id,
         objective=task.objective,
         status="done",
+        agent=specialist,
+        answer=evidence.answer or None,
+        useful=evidence.useful,
         summary=compact,
         key_findings=findings,
-        uncertainties=uncertainties,
-        cited_node_ids=_task_sources(task),
+        uncertainties=evidence.uncertainties,
+        cited_node_ids=evidence.sources,
     )
 
 
@@ -227,7 +256,7 @@ async def _run_worker(task: TaskSpec) -> Dict[str, Any]:
 
     try:
         specialist, result = await _run_specialist_task(task)
-        log = _worker_success_log(task, task_id, result)
+        log = _worker_success_log(task, task_id, specialist, result)
         _rt(f"[worker {task_id[:8]}] ✓ DONE via {specialist}", "green")
     except Exception as exc:
         _rt(f"[worker {task_id[:8]}] ✗ ERROR — {exc}", "red")

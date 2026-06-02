@@ -17,15 +17,12 @@ from .runtime.query_policy import (
     extract_arxiv_ids,
     extract_urls,
     infer_task_kind,
+    likely_requires_current_info,
 )
 
 from .observability import _rt
 from .structured_retry import observable_run_with_manual_validation_retries
-from .runtime.reports import (
-    current_report_dir,
-    load_agent_report_summaries,
-    write_agent_report,
-)
+from .runtime.turn_context import EvidenceItem
 from tools.filesystem.text_ops import read_text_with_policy
 
 MAX_TASKS_PER_PLAN = 5
@@ -123,8 +120,10 @@ Bad task examples:
 class SessionState(BaseModel):
     user_query: str
     completed_tasks: list[str] = Field(default_factory=list)
+    evidence_items: list[EvidenceItem] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
+    skipped_tasks: list[str] = Field(default_factory=list)
     suggested_next_steps: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
 
@@ -145,12 +144,34 @@ def _update_state(
             # Still record it as attempted so final handoff shows coverage.
             state.uncertainties.append(f"Worker failed for: {t.objective}")
             continue
-        state.findings.extend(r.get("key_findings", []))
-        state.uncertainties.extend(r.get("uncertainties", []))
+        findings = r.get("key_findings", [])
+        answer = r.get("answer") or (findings[0] if findings else "")
+        useful = bool(r.get("useful", bool(findings)))
+        uncertainties = r.get("uncertainties", [])
+        sources = r.get("cited_node_ids", [])
+        if not useful or not answer:
+            state.skipped_tasks.append(t.objective)
+            continue
+
+        state.evidence_items.append(
+            EvidenceItem(
+                task_id=str(r.get("task_id") or ""),
+                objective=t.objective,
+                agent=str(r.get("agent") or "worker"),
+                answer=answer,
+                summary=str(r.get("summary") or ""),
+                useful=True,
+                sources=sources,
+                uncertainties=uncertainties,
+            )
+        )
+        state.findings.extend(findings or [answer])
+        state.uncertainties.extend(uncertainties)
         state.suggested_next_steps.extend(r.get("suggested_next_steps", []))
-        state.sources.extend(r.get("cited_node_ids", []))
+        state.sources.extend(sources)
     state.findings = _dedupe(state.findings)
     state.uncertainties = _dedupe(state.uncertainties)
+    state.skipped_tasks = _dedupe(state.skipped_tasks)
     state.suggested_next_steps = _dedupe(state.suggested_next_steps)
     state.sources = _dedupe(state.sources)
 
@@ -207,6 +228,8 @@ def _completion_status(
         return "partial-pending-tasks"
     if failed_tasks:
         return "partial-failed-tasks"
+    if state.skipped_tasks:
+        return "complete-with-skipped-results"
     if state.uncertainties:
         return "complete-with-uncertainties"
     if not planned_tasks:
@@ -238,6 +261,8 @@ def _format_plan_handoff(
         f"Findings available: {len(state.findings)}",
         "Open uncertainties: "
         + (" | ".join(_brief_handoff_items(state.uncertainties, limit=3)) or "none"),
+        "Skipped unhelpful results: "
+        + (" | ".join(_brief_handoff_items(state.skipped_tasks, limit=3)) or "none"),
         "Sources: " + (" | ".join(_brief_handoff_items(state.sources)) or "none"),
         "Use the forwardable answer as the response draft; use this ledger only to catch missing coverage or uncertainty.",
     ]
@@ -504,7 +529,11 @@ class PlanNormalizer:
 
     def _objective_requires_tasks(self) -> bool:
         """Return true for objectives unsafe to answer from planner text alone."""
-        return bool(self.objective_urls) or bool(self.objective_arxiv_ids)
+        return (
+            bool(self.objective_urls)
+            or bool(self.objective_arxiv_ids)
+            or likely_requires_current_info(self.objective)
+        )
 
     @staticmethod
     def _has_kind(tasks: list[TaskSpec], kind: TaskKind) -> bool:
@@ -667,10 +696,12 @@ def _failed_research_report(state: SessionState) -> str:
     uncertainties = (
         "\n".join(f"- {u}" for u in state.uncertainties) or "- no evidence retrieved"
     )
+    skipped = "\n".join(f"- {task}" for task in state.skipped_tasks) or "- none"
     return (
         "I couldn't produce a grounded summary because every retrieval/extraction task failed "
         "or returned no findings.\n\n"
         f"Attempted tasks:\n{attempted}\n\n"
+        f"Skipped unhelpful results:\n{skipped}\n\n"
         f"Errors / uncertainties:\n{uncertainties}"
     )
 
@@ -743,7 +774,7 @@ async def _run_plan_workflow_internal(
             time_sensitive=time_sensitive,
         )
 
-    _rt("[synthesis] generating final report ...", "dim")
+    _rt("[synthesis] generating final answer ...", "dim")
     report = await run_synthesis_worker(
         question=objective,
         as_of=as_of,
@@ -768,25 +799,10 @@ async def run_plan_workflow(
     max_tasks: int = MAX_TASKS_PER_PLAN,
     max_iterations: int = MAX_ITERATIONS,
 ) -> str:
-    """Run the complex-task planning workflow and write plan-report.md."""
-    report_memory = load_agent_report_summaries(current_report_dir())
-    workflow_objective = objective
-    if report_memory:
-        workflow_objective = (
-            "Concise prior session report memory:\n"
-            f"{report_memory}\n\n"
-            f"Objective: {objective}"
-        )
-    report = await _run_plan_workflow_internal(
-        objective=workflow_objective,
+    """Run the complex-task planning workflow."""
+    return await _run_plan_workflow_internal(
+        objective=objective,
         matched_files=[],
         max_tasks=max_tasks,
         max_iterations=max_iterations,
     )
-    write_agent_report(
-        "plan",
-        objective=objective,
-        summary=report,
-        answer=report,
-    )
-    return report

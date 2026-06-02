@@ -244,7 +244,7 @@ def test_normalize_plan_drops_initial_answer_for_url_objective():
     assert normalized.tasks
 
 
-def test_normalize_plan_trusts_initial_answer_without_structural_web_signal():
+def test_normalize_plan_drops_initial_answer_for_current_info_objective():
     normalized = _normalize_plan(
         PlanOutput(initial_answer="Ungrounded direct answer."),
         objective="What is the latest OpenAI API pricing?",
@@ -252,8 +252,9 @@ def test_normalize_plan_trusts_initial_answer_without_structural_web_signal():
         as_of="now",
     )
 
-    assert normalized.initial_answer == "Ungrounded direct answer."
-    assert normalized.tasks == []
+    assert normalized.initial_answer is None
+    assert normalized.tasks[0].kind == TaskKind.WEB_SEARCH
+    assert normalized.tasks[0].requires_current_info is True
 
 
 def test_normalize_plan_keeps_initial_answer_for_non_web_terminal_issue():
@@ -351,6 +352,7 @@ def test_plan_handoff_keeps_compact_task_ledger():
     assert "Tasks planned: 2; completed: 1" in handoff
     assert "Pending tasks: Check current API docs" in handoff
     assert "Findings available: 1" in handoff
+    assert "Skipped unhelpful results: none" in handoff
     assert (
         "Detailed specialist result" not in handoff.split("Orchestrator notes:", 1)[1]
     )
@@ -450,3 +452,54 @@ async def test_research_loop_records_pending_tasks_after_iteration_budget(monkey
         and "Planned task 4" in uncertainty
         for uncertainty in state.uncertainties
     )
+
+
+@pytest.mark.asyncio
+async def test_research_loop_skips_unhelpful_worker_results(monkeypatch):
+    from agents import plan_agent
+
+    async def fake_workers(tasks):
+        return [
+            {
+                "task_id": "useful",
+                "status": "done",
+                "agent": "web_agent",
+                "answer": "The docs now recommend v2.",
+                "useful": True,
+                "key_findings": ["The docs now recommend v2."],
+                "uncertainties": ["Version rollout is ongoing."],
+                "suggested_next_steps": [],
+                "cited_node_ids": ["https://example.com/docs"],
+            },
+            {
+                "task_id": "missing",
+                "status": "done",
+                "agent": "fs_agent",
+                "answer": None,
+                "useful": False,
+                "key_findings": [],
+                "uncertainties": ["Requested path not found: /docs/missing.md."],
+                "suggested_next_steps": [],
+                "cited_node_ids": [],
+            },
+        ]
+
+    monkeypatch.setattr(plan_agent, "_run_workers_limited", fake_workers)
+
+    state = SessionState(user_query="compare useful and missing evidence")
+    await _run_research_loop(
+        objective="compare useful and missing evidence",
+        matched_files=[],
+        as_of="now",
+        state=state,
+        tasks=[
+            TaskSpec(kind=TaskKind.WEB_SEARCH, objective="Read current docs"),
+            TaskSpec(kind=TaskKind.LOCAL_RAG, objective="Read missing local file"),
+        ],
+    )
+
+    assert state.findings == ["The docs now recommend v2."]
+    assert state.sources == ["https://example.com/docs"]
+    assert state.uncertainties == ["Version rollout is ongoing."]
+    assert state.skipped_tasks == ["Read missing local file"]
+    assert state.evidence_items[0].agent == "web_agent"

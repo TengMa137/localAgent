@@ -298,116 +298,6 @@ def test_prompt_for_tool_approval_non_interactive_denies(monkeypatch):
     get_runtime_settings.cache_clear()
 
 
-def test_write_and_load_agent_report(tmp_path):
-    from agents.runtime.reports import (
-        load_agent_reports,
-        set_report_dir,
-        write_agent_report,
-    )
-
-    set_report_dir(tmp_path)
-    write_agent_report(
-        "fs",
-        objective="Read notes",
-        summary="Read the requested note.",
-        answer="The note says the important fact.",
-        findings=["Important fact"],
-        paths=["/docs/notes.md"],
-        uncertainties=["No open issues"],
-    )
-
-    loaded = load_agent_reports(tmp_path)
-    assert "REPORT FILE: fs-report.md" in loaded
-    assert "Answer:" in loaded
-    assert "The note says the important fact." in loaded
-    assert "Objective: Read notes" in loaded
-    assert "- /docs/notes.md" in loaded
-
-    set_report_dir(None)
-
-
-def test_agent_report_appends_runs_in_same_session(tmp_path):
-    from agents.runtime.reports import (
-        load_agent_reports,
-        set_report_dir,
-        write_agent_report,
-    )
-
-    set_report_dir(tmp_path)
-    write_agent_report(
-        "fs",
-        objective="first",
-        summary="first summary",
-        answer="first answer",
-    )
-    write_agent_report(
-        "fs",
-        objective="second",
-        summary="second summary",
-        answer="second answer",
-    )
-
-    loaded = load_agent_reports(tmp_path)
-    assert loaded.count("## Run ") == 2
-    assert "Objective: first" in loaded
-    assert "Objective: second" in loaded
-    assert "first answer" in loaded
-    assert "second answer" in loaded
-
-    set_report_dir(None)
-
-
-def test_agent_report_writes_are_serialized(monkeypatch, tmp_path):
-    import threading
-    import time
-    from concurrent.futures import ThreadPoolExecutor
-    from pathlib import Path
-
-    from agents.runtime import reports
-
-    reports.set_report_dir(tmp_path)
-    first_write_started = threading.Event()
-    delayed_once = False
-    original_write_text = Path.write_text
-
-    def delayed_write_text(path, data, *args, **kwargs):
-        nonlocal delayed_once
-        if (
-            path.name == "fs-report.md"
-            and "Objective: first" in data
-            and not delayed_once
-        ):
-            delayed_once = True
-            first_write_started.set()
-            time.sleep(0.2)
-        return original_write_text(path, data, *args, **kwargs)
-
-    def write_report(objective: str) -> None:
-        reports.set_report_dir(tmp_path)
-        reports.write_agent_report(
-            "fs",
-            objective=objective,
-            summary=f"{objective} summary",
-            answer=f"{objective} answer",
-        )
-
-    monkeypatch.setattr(Path, "write_text", delayed_write_text)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(write_report, "first")
-        assert first_write_started.wait(timeout=1)
-        second = executor.submit(write_report, "second")
-        first.result(timeout=2)
-        second.result(timeout=2)
-
-    content = (tmp_path / "fs-report.md").read_text(encoding="utf-8")
-    assert "Objective: first" in content
-    assert "Objective: second" in content
-    assert content.count("## Run ") == 2
-
-    reports.set_report_dir(None)
-
-
 def test_fs_success_response_keeps_full_findings_out_of_tool_return():
     from agents.fs_agent import FsAgentResult, _format_success_response
 
@@ -415,7 +305,7 @@ def test_fs_success_response_keeps_full_findings_out_of_tool_return():
         answer="Use this answer directly.",
         summary="Short filesystem summary.",
         paths=["/docs/a.md"],
-        findings=["long finding that should stay in the report"],
+        findings=["long finding that should stay out of the compact handoff"],
         changes_made=["updated /docs/a.md"],
     )
 
@@ -424,8 +314,8 @@ def test_fs_success_response_keeps_full_findings_out_of_tool_return():
     assert "Forwardable answer:" in formatted
     assert "Use this answer directly." in formatted
     assert "Summary: Short filesystem summary." in formatted
-    assert "Detailed findings in fs-report.md: 1 item(s)" in formatted
-    assert "long finding that should stay in the report" not in formatted
+    assert "Detailed findings: 1 item(s)" in formatted
+    assert "long finding that should stay out of the compact handoff" not in formatted
     assert "updated /docs/a.md" not in formatted
 
 
@@ -437,7 +327,7 @@ def test_web_response_keeps_full_findings_out_of_tool_return():
         summary="Short web summary.",
         search_queries=["example query"],
         urls=["https://example.com"],
-        findings=["large crawled/RAG finding that belongs in the report"],
+        findings=["large crawled/RAG finding that should stay out of the compact handoff"],
     )
 
     formatted = _format_orchestrator_response(result)
@@ -445,8 +335,8 @@ def test_web_response_keeps_full_findings_out_of_tool_return():
     assert "Forwardable answer:" in formatted
     assert "Current answer for the user." in formatted
     assert "Summary: Short web summary." in formatted
-    assert "Detailed findings in web-report.md: 1 item(s)" in formatted
-    assert "large crawled/RAG finding that belongs in the report" not in formatted
+    assert "Detailed findings: 1 item(s)" in formatted
+    assert "large crawled/RAG finding that should stay out of the compact handoff" not in formatted
 
 
 def test_web_query_guidance_includes_time_sensitive_semantic_guidance():
@@ -520,7 +410,6 @@ async def test_run_turn_sends_bounded_history_without_dropping_saved_history(
         message_history=old_messages.copy(),
         session_title="session",
         history_path=tmp_path / "session.json",
-        report_dir=tmp_path / "reports",
         memory_dir=tmp_path / "memory",
     )
 
@@ -543,6 +432,20 @@ def test_orchestrator_decision_requires_route_payload():
         OrchestratorDecision(route="plan")
 
     assert OrchestratorDecision(route="direct", reply="Hello").reply == "Hello"
+    assert (
+        OrchestratorDecision(
+            route="fs",
+            objective="Read the requested file",
+        ).effort
+        == "minimal"
+    )
+    assert (
+        OrchestratorDecision(
+            route="web",
+            objective="Fetch the provided URL",
+        ).effort
+        == "minimal"
+    )
     assert (
         OrchestratorDecision(
             route="plan",
@@ -793,7 +696,7 @@ async def test_orchestrator_xml_retries_schema_invalid_payload(monkeypatch):
 
     assert len(calls) == 3
     assert "reply is required for direct" in calls[2]
-    assert "route=plan requires a non-empty <objective>" in calls[2]
+    assert "route=fs, route=web, and route=plan require" in calls[2]
     assert result.output.route == "plan"
     assert result.output.objective == (
         "Read all fitness skills and list all important points."
@@ -808,11 +711,11 @@ def test_orchestrator_prompt_declares_validator_mount_access():
     assert "Filesystem access contract:" in prompt
     assert "/docs" in prompt
     assert "/skills" in prompt
-    assert "choose plan" in prompt
+    assert "choose fs or plan" in prompt
     assert "Do not answer that you lack access" in prompt
 
 
-def test_orchestrator_prompt_uses_only_direct_and_plan_routes():
+def test_orchestrator_prompt_declares_fast_specialist_routes():
     from agents.orchestrator_agent import _orchestrator_prompt_body
 
     prompt = _orchestrator_prompt_body()
@@ -820,6 +723,8 @@ def test_orchestrator_prompt_uses_only_direct_and_plan_routes():
 
     assert "Prefer making progress:" in prompt
     assert "Choose direct when" in prompt
+    assert "Choose fs for one narrow filesystem task" in prompt
+    assert "Choose web for one narrow current/web task" in prompt
     assert "Choose plan when" in prompt
     assert "There is no clarify route" in prompt
     assert "Classify by the information source and missing user intent" in prompt
@@ -844,6 +749,70 @@ async def test_orchestrator_direct_decision_returns_reply():
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_fs_decision_forwards_specialist_answer(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+
+    calls: list[str] = []
+
+    async def fake_fs_task(objective: str) -> str:
+        calls.append(objective)
+        return (
+            "Forwardable answer:\n"
+            "The file says hello.\n\n"
+            "Orchestrator notes:\n"
+            "- Summary: Read one file"
+        )
+
+    async def fake_plan_workflow(*_args, **_kwargs):
+        raise AssertionError("fs fast route must not call plan workflow")
+
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
+
+    response, messages = await _response_and_messages(
+        OrchestratorDecision(route="fs", objective="read /docs/a.md"),
+        [],
+    )
+
+    assert response.reply == "The file says hello."
+    assert messages == []
+    assert calls == ["read /docs/a.md"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_web_decision_forwards_specialist_answer(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+
+    calls: list[str] = []
+
+    async def fake_web_task(objective: str) -> str:
+        calls.append(objective)
+        return (
+            "Forwardable answer:\n"
+            "The current docs say to use v2.\n\n"
+            "Orchestrator notes:\n"
+            "- Sources: https://example.com/docs"
+        )
+
+    async def fake_plan_workflow(*_args, **_kwargs):
+        raise AssertionError("web fast route must not call plan workflow")
+
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task", fake_web_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
+
+    response, messages = await _response_and_messages(
+        OrchestratorDecision(route="web", objective="read https://example.com/docs"),
+        [],
+    )
+
+    assert response.reply == "The current docs say to use v2."
+    assert messages == []
+    assert calls == ["read https://example.com/docs"]
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_plan_decision_uses_effort_budget(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import (
@@ -863,7 +832,7 @@ async def test_orchestrator_plan_decision_uses_effort_budget(monkeypatch):
         return (
             "Forwardable answer:\n"
             f"Read result for {objective}.\n\n"
-            "Orchestrator notes:\n- Detailed findings in plan-report.md: 1 item(s)"
+            "Orchestrator notes:\n- Findings available: 1"
         )
 
     async def fake_observable_run(*_args, **_kwargs):
@@ -1088,17 +1057,15 @@ def test_agent_output_validation_retries_are_disabled():
     assert web_agent._max_result_retries == 0
 
 
-def test_save_history_includes_report_dir(tmp_path):
+def test_save_history_includes_memory_dir(tmp_path):
     from run_agents import ChatSession, _save_history
 
     history_path = tmp_path / "chat.json"
-    report_dir = tmp_path / "reports" / "session"
     memory_dir = tmp_path / "memory" / "default"
     session = ChatSession(
         message_history=[ModelRequest.user_text_prompt("hello")],
         session_title="session",
         history_path=history_path,
-        report_dir=report_dir,
         memory_dir=memory_dir,
     )
 
@@ -1106,7 +1073,6 @@ def test_save_history_includes_report_dir(tmp_path):
 
     payload = json.loads(history_path.read_text())
     assert payload["session_title"] == "session"
-    assert payload["report_dir"] == str(report_dir)
     assert payload["memory_dir"] == str(memory_dir)
     assert payload["messages"]
 
@@ -1330,56 +1296,17 @@ def test_memory_apply_findings_skips_empty_list(tmp_path):
     assert not memory.events_path(tmp_path).exists()
 
 
-def test_new_session_sets_report_dir(monkeypatch, tmp_path):
+def test_new_session_sets_history_path(monkeypatch, tmp_path):
     import run_agents
     from run_agents import ChatSession, _init_session_paths_from_user_text
 
     monkeypatch.setattr(run_agents, "CHAT_HISTORY_DIR", tmp_path / "chats")
-    monkeypatch.setattr(run_agents, "REPORT_ROOT", tmp_path / "reports")
 
     session = ChatSession()
     _init_session_paths_from_user_text(session, "read notes")
 
     assert session.session_title == "read-notes"
-    assert session.report_dir == tmp_path / "reports" / "read-notes"
-
-
-@pytest.mark.asyncio
-async def test_run_turn_clears_report_dir_each_turn(monkeypatch, tmp_path):
-    import run_agents
-    from agents.orchestrator_agent import OrchestratorResponse
-    from run_agents import ChatSession, run_turn
-
-    report_dir = tmp_path / "reports" / "session"
-    stale_report = report_dir / "fs-report.md"
-    stale_report.parent.mkdir(parents=True)
-    stale_report.write_text("stale report from previous turn", encoding="utf-8")
-    captured: dict[str, str] = {}
-
-    async def fake_run_orchestrator_turn(prompt, **_kwargs):
-        captured["prompt"] = prompt
-        assert report_dir.exists()
-        assert not stale_report.exists()
-        return SimpleNamespace(
-            output=OrchestratorResponse(reply="ok"),
-            decision=SimpleNamespace(memory_findings=[]),
-            delegated=False,
-            all_messages=lambda: [ModelRequest.user_text_prompt("hello")],
-        )
-
-    monkeypatch.setattr(run_agents, "run_orchestrator_turn", fake_run_orchestrator_turn)
-    monkeypatch.setattr(run_agents, "load_user_memory_context", lambda _memory_dir: "")
-
-    session = ChatSession(
-        session_title="session",
-        history_path=tmp_path / "session.json",
-        report_dir=report_dir,
-        memory_dir=tmp_path / "memory",
-    )
-
-    await run_turn("hello", session)
-
-    assert "stale report from previous turn" not in captured["prompt"]
+    assert session.history_path == tmp_path / "chats" / "read-notes.json"
 
 
 @pytest.mark.asyncio
@@ -1426,7 +1353,6 @@ async def test_run_turn_loads_memory_once_as_orchestrator_context(
     session = ChatSession(
         session_title="session",
         history_path=tmp_path / "session.json",
-        report_dir=tmp_path / "reports",
         memory_dir=memory_dir,
     )
 
@@ -1439,12 +1365,11 @@ async def test_run_turn_loads_memory_once_as_orchestrator_context(
     assert calls[1][1] == ""
 
 
-def test_new_session_report_dir_uses_unique_history_stem(monkeypatch, tmp_path):
+def test_new_session_uses_unique_history_stem(monkeypatch, tmp_path):
     import run_agents
     from run_agents import ChatSession, _init_session_paths_from_user_text
 
     monkeypatch.setattr(run_agents, "CHAT_HISTORY_DIR", tmp_path / "chats")
-    monkeypatch.setattr(run_agents, "REPORT_ROOT", tmp_path / "reports")
     existing_history = tmp_path / "chats" / "read-notes.json"
     existing_history.parent.mkdir(parents=True)
     existing_history.write_text("{}", encoding="utf-8")
@@ -1454,7 +1379,6 @@ def test_new_session_report_dir_uses_unique_history_stem(monkeypatch, tmp_path):
 
     assert session.session_title == "read-notes-2"
     assert session.history_path == tmp_path / "chats" / "read-notes-2.json"
-    assert session.report_dir == tmp_path / "reports" / "read-notes-2"
 
 
 def test_skills_context_includes_current_skill_paths():
@@ -1766,9 +1690,7 @@ def test_fs_usage_limit_error_is_not_reported_as_file_access_problem():
     from pydantic_ai.exceptions import UsageLimitExceeded
 
     from agents.fs_agent import _format_exception_report
-    from agents.runtime.reports import set_report_dir
 
-    set_report_dir(None)
     message = _format_exception_report(
         "read local files",
         UsageLimitExceeded("The next tool call(s) would exceed the tool_calls_limit."),

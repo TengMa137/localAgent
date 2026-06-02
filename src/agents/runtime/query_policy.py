@@ -13,6 +13,13 @@ class TaskKind(str, Enum):
 
 URL_RE = re.compile(r"https?://[^\s<>)\"']+")
 ARXIV_RE = re.compile(r"\b(?:arxiv:)?\d{4}\.\d{4,5}(?:v\d+)?\b", re.IGNORECASE)
+CURRENT_INFO_RE = re.compile(
+    r"\b("
+    r"latest|current|currently|today|recent|recently|live|now|news|"
+    r"price|prices|pricing|rate|rates|weather|score|scores"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def extract_urls(text: str) -> list[str]:
@@ -26,6 +33,10 @@ def extract_arxiv_ids(text: str) -> list[str]:
     return ids
 
 
+def likely_requires_current_info(text: str) -> bool:
+    return bool(CURRENT_INFO_RE.search(text))
+
+
 def infer_task_kind(
     text: str,
     *,
@@ -37,4 +48,6 @@ def infer_task_kind(
         return TaskKind.URL_CRAWL
     if matched_files:
         return TaskKind.LOCAL_RAG
+    if likely_requires_current_info(text):
+        return TaskKind.WEB_SEARCH
     return None

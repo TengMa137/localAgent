@@ -41,7 +41,7 @@ const state = {
   sessions: [],
   messages: [],
   activeSessionId: null,
-  files: { uploads: [], reports: [] },
+  files: { uploads: [] },
   pendingAttachments: [],
   openSessionMenuId: null,
   theme: storageGet("localagent_theme", "dark"),
@@ -577,7 +577,7 @@ function clearAppRuntimeState() {
   state.streamingResponse = false;
   state.autoFollowStream = true;
   state.messages = [];
-  state.files = { uploads: [], reports: [] };
+  state.files = { uploads: [] };
   state.pendingAttachments = [];
   $("messages").textContent = "";
   $("admin-chat-list").textContent = "";
@@ -1331,7 +1331,7 @@ async function refreshFiles({ clearStatus = true } = {}) {
   if (!state.activeSessionId) return;
   try {
     const data = await api(`/api/chat/sessions/${encodeURIComponent(state.activeSessionId)}/files`);
-    state.files = { uploads: data.uploads || [], reports: data.reports || [] };
+    state.files = { uploads: data.uploads || [] };
     renderComposerAttachments();
   } catch (error) {
     $("upload-status").textContent = error.message;
@@ -1763,9 +1763,6 @@ function showDesignPreview() {
         size_bytes: 1840,
       },
     ],
-    reports: [
-      { name: "research-planning.md", size_bytes: 2912, updated_at: now },
-    ],
   };
   state.pendingAttachments = state.files.uploads.map(normalizeAttachment);
   showApp();
@@ -1899,7 +1896,7 @@ $("logout").addEventListener("click", async () => {
   state.user = null;
   state.sessions = [];
   state.activeSessionId = null;
-  state.files = { uploads: [], reports: [] };
+  state.files = { uploads: [] };
   state.pendingAttachments = [];
   showLogin();
 });

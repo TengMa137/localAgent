@@ -8,17 +8,20 @@ llama.cpp, and keeps all data on your machine.
 
 ## Overview
 
-The agent handles three kinds of requests from a single conversation loop:
+The agent handles four routes from a single conversation loop:
 
 - **Direct** — answers immediately from the model's own knowledge (explanations, code, writing, maths).
-- **Clarify** — asks one focused question when a request is too ambiguous to act on safely.
-- **Routed work** — returns a typed route for local file tasks, web/current tasks,
-  or complex multi-step planning; Python then executes the matching route runner.
+- **Filesystem** — runs one focused local file/read/write/search/edit specialist task and forwards its answer.
+- **Web** — runs one focused search, URL crawl, current-docs/facts, or arXiv specialist task and forwards its answer.
+- **Plan** — decomposes complex multi-step work into typed tasks, runs specialists, and synthesizes useful evidence.
 
 The code is intentionally biased toward small local LLMs. Python owns the multi-step workflow,
-route execution, path validation, approval handling, deterministic RAG handoffs, and report
-memory. LLM calls are kept narrow: choose a typed route, plan typed tasks, run focused
-specialists, and synthesize.
+route execution, path validation, approval handling, deterministic RAG handoffs, and per-turn
+typed evidence context. LLM calls are kept narrow: choose a typed route, plan typed tasks
+when needed, run focused specialists, and synthesize only when multiple useful results must
+be merged.
+
+See [AGENT_SYSTEM.md](AGENT_SYSTEM.md) for the prompt chain and agent-system diagram.
 
 Current implementation highlights:
 
@@ -26,13 +29,13 @@ Current implementation highlights:
   shallow/deep listing, directory creation, copy/move/delete, and single-file search/replace.
 - Filesystem writes can use local CLI approval via PydanticAI deferred-tool approval.
 - The orchestrator cannot call specialist agents as tools; it returns one typed
-  semantic route decision, and Python executes the selected runner once.
+  semantic route decision, and Python executes the selected runner.
 - `fs_agent` owns local path discovery/read/write/edit and uses deterministic RAG for large or multi-file reads.
 - `web_agent` owns search/query/URL selection/crawl and then uses deterministic RAG over fetched content.
-- Agents write concise per-session markdown reports in the CLI history directory
-  or the web app state directory.
+- Planned workers produce typed evidence for synthesis; diagnostics stay in trace events
+  and per-turn task logs.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
-- Workers are mostly tool-free: Python retrieves evidence, workers extract findings.
+- Workers are mostly adapters around focused specialists and typed evidence filtering.
 - The planner no longer runs a reflection pass; it executes planned worker batches
   within the configured iteration budget, then synthesizes from collected evidence.
 
@@ -58,7 +61,7 @@ Current implementation highlights:
 │   │   ├── plan_agent.py         # Planning, plan normalization, worker loop
 │   │   ├── worker.py             # Stateless one-shot worker calls and retrieval
 │   │   ├── observability.py      # Real-time event streaming and compact tracing
-│   │   └── runtime/              # Model setup, validators, reports, skill context
+│   │   └── runtime/              # Model setup, validators, typed turn context, skill context
 │   └── tools/
 │       ├── filesystem/      # Validator-backed read/write/list/grep/edit/image tools
 │       ├── retrieval/       # RAG tools and MCP web/arXiv interceptors
@@ -66,8 +69,8 @@ Current implementation highlights:
 ├── web/                     # Same-origin frontend assets
 ├── skills/                  # Skill markdown files loaded at runtime
 ├── user_docs/               # Default local docs mount and web upload root
-├── chat_history/            # CLI JSON logs and reports (auto-created)
-└── localagent_state/        # Web DB, branch history, reports, and app state
+├── chat_history/            # CLI JSON chat logs (auto-created)
+└── localagent_state/        # Web DB, branch history, uploads, and app state
 ```
 
 ---
@@ -218,8 +221,8 @@ Use one of these commands:
 
 The web commands start `agent-app` and `mcp-server`. The CLI command starts an
 interactive `agent-cli` container and also starts `mcp-server` if needed.
-Docker CLI sessions persist chat logs and report memory in `./chat_history/`
-and long-term memory in `./.memory/` on the host.
+Docker CLI sessions persist chat logs in `./chat_history/` and long-term memory
+in `./.memory/` on the host.
 
 ```bash
 # Web app, then open http://127.0.0.1:8088 manually.
@@ -492,12 +495,12 @@ orchestrator and planner, not by regex or keyword heuristics in Python.
 ### Orchestrator
 
 The orchestrator is the long-lived conversational agent. It accumulates `message_history`
-across turns and classifies each turn as either direct or plan.
+across turns and classifies each turn as direct, filesystem, web, or plan.
 
 Before each turn, the shared runtime loads long-term user profile memory and keeps the
 latest user request as the first prompt section. The orchestrator no longer receives the
 deterministic `/skills` catalog by default; filesystem specialists receive it only after
-the orchestrator has selected a filesystem route. If chat/memory/report context is
+the orchestrator has selected a filesystem route. If chat/memory context is
 sufficient, the orchestrator answers directly.
 Otherwise it returns a typed route decision and Python executes the selected route runner
 once. The specialist agents are not exposed as orchestrator tools.
@@ -512,7 +515,7 @@ The orchestrator does not receive raw filesystem, web, RAG, or specialist toolse
 reads files or web pages directly, and it does not run a model-driven tool loop after choosing
 a route.
 
-### Persisted history, traces, and reports
+### Persisted History And Traces
 
 The web runtime keeps model input separate from UI/debug state. Before each agent turn, the
 server rebuilds the orchestrator history from visible branch messages only: prior user
@@ -526,16 +529,18 @@ current user request. Its decision schema is intentionally flat: `route`, `reply
 `objective`, and `effort` only. Session titles are derived by Python, and durable memory
 extraction is not part of the orchestrator decision contract.
 
-For plan routes, Python runs the plan workflow and returns the workflow's `Forwardable answer`
-directly; there is no second orchestrator final-answer LLM pass. Synthesis produces plain
-answer text so the web client can stream only user-visible final-answer deltas while keeping
-hidden route-decision deltas out of the browser.
+For `fs` and `web` routes, Python runs one specialist and forwards the specialist's
+`Forwardable answer` directly. For `plan` routes, Python runs the plan workflow and returns
+the workflow's `Forwardable answer` directly; there is no second orchestrator final-answer
+LLM pass. Synthesis produces plain answer text so the web client can stream only
+user-visible final-answer deltas while keeping hidden route-decision deltas out of the
+browser.
 
 Tool activity shown in the web UI is persisted separately on assistant messages as
 `metadata.trace_events` and `metadata.turn_logs`. These records are returned to the browser so
 the Activity panel survives refreshes, but they are not used when constructing the next LLM
-history. Specialist report files are reset at the start of each user turn and may be used only
-as same-turn coordination context between specialists.
+history. Plan synthesis reads typed worker evidence and skips failed or unhelpful specialist
+outcomes, such as unrelated file-not-found results.
 
 Set `LOCALAGENT_ORCHESTRATOR_USE_XML=true` to make the intake decision use an XML output
 contract such as `<route>plan</route>` instead of the default structured JSON contract. The
@@ -595,8 +600,8 @@ The orchestrator does not call RAG directly; RAG is infrastructure used by fs/we
 `run_plan_workflow` handles complex tasks after the orchestrator chooses the plan route.
 `plan_agent` receives the objective, resolved file paths, and file previews. It returns typed
 tasks directly; it does not call `fs_agent` or `web_agent` during planning. Known reliable
-paths and URLs passed by the orchestrator from chat history or prior reports are included up
-front so they do not need to be rediscovered.
+paths and URLs passed by the orchestrator from chat history are included up front so they do
+not need to be rediscovered.
 
 `plan_agent` decomposes the work into up to `MAX_TASKS_PER_PLAN` independent `TaskSpec`
 objects for the worker pool.
@@ -611,52 +616,29 @@ After the model returns, Python normalizes the plan:
 
 ### Worker steps
 
-Worker steps are stateless and single-shot. The same worker module handles evidence
-extraction, web-query review, synthesis, and summary generation with different system prompts
-and typed output schemas. For extraction, each worker receives one `TaskSpec`,
-but it no longer chooses retrieval tools itself for the normal paths. Python executes retrieval from
-`TaskSpec.kind`:
+Worker steps are stateless and single-shot. For planned extraction, each worker receives one
+`TaskSpec` and delegates to the narrow specialist selected by `TaskSpec.kind`. The worker then
+converts the specialist handoff into typed evidence and marks whether it is useful for final
+synthesis. Synthesis is still a one-round worker step, so workflow observability and usage
+limits stay centralized.
 
 | Kind | Python retrieval path |
 |---|---|
-| `local_rag` | ingest/search the provided local files with RAG |
-| `web_search` | review/repair query, search web, pick top URLs, crawl, then RAG-search crawled pages |
-| `url_crawl` | crawl user-provided URLs, then RAG-search crawled pages |
-| `arxiv` | fetch known arXiv IDs or search arXiv, ingest abstracts, then RAG-search |
+| `local_rag` | `fs_agent` validates/discovers/reads/edits local files and runs deterministic RAG when needed |
+| `web_search` | `web_agent` searches, selects URLs, crawls, then RAG-searches crawled pages |
+| `url_crawl` | `web_agent` crawls user-provided URLs, then RAG-searches crawled pages |
+| `arxiv` | `web_agent` fetches/searches arXiv, ingests paper context, then RAG-searches |
 
 Multiple workers run in parallel via `asyncio.gather`, bounded by `MAX_PARALLEL_TASKS`.
-
-The extraction worker only extracts structured findings from retrieved evidence. Synthesis is a
-one-round worker step, so workflow observability and usage limits stay centralized.
 
 ### Worker → Synthesise loop
 
 The planner executes the normalized task list in worker batches, up to `MAX_ITERATIONS`.
 It does not run a reflection pass or invent follow-up tasks after worker execution. Once the
-planned batches finish or the iteration budget is reached, a synthesis worker step produces
-the final report and includes the `as_of` date when the task is marked time-sensitive. If
-filesystem evidence contains an invalid user path, synthesis answers from the useful
-filesystem result instead of recapping reports: it gives a short path-mismatch heads-up,
-uses a read-only replacement when one was actually inspected, or asks for exact-path
-confirmation before an edit.
-
-### Agent reports
-
-Specialist agents write concise markdown reports in the active session report directory:
-
-```text
-CLI:  chat_history/reports/<session-title>/
-Web:  localagent_state/reports/<user-id>/<session-id>/<branch-id>/
-Files:
-├── fs-report.md
-├── web-report.md
-└── plan-report.md
-```
-
-Reports are overwritten with the latest durable state for that agent: objective, summary,
-paths/sources, findings, and uncertainties. On the next turn, the shared `run_turn`
-runtime loads all `*-report.md` files for the session and injects them before the user
-request.
+planned batches finish or the iteration budget is reached, a synthesis worker step sees only
+useful typed evidence plus meaningful uncertainty and produces the final answer. If no useful
+evidence remains, the plan workflow returns a compact failed-research answer instead of asking
+synthesis to merge missing-file or empty-search noise.
 
 ### Shared RAG knowledge base
 
@@ -838,7 +820,7 @@ web app plus the local MCP web server:
 
 - `agent-app`: FastAPI backend, static frontend, agent runtime, and in-process `rag_lib`
 - `mcp-server`: web search, URL crawling, and arXiv lookup inside the Compose network
-- `agent_state`: persistent volume for the web app SQLite database, branch history, and reports
+- `agent_state`: persistent volume for the web app SQLite database, branch history, uploads, and memory
 
 The app image is built from this repository with `../rag_lib` supplied as a Docker
 BuildKit named context. The MCP server is built from `../mcp_server_local/mcp_web`.
@@ -880,7 +862,7 @@ the MCP server service; the standalone MCP repo's `mcp-client` remains in that
 repo under its `test` profile and is not part of this app stack.
 
 Docker CLI sessions bind-mount `./chat_history/` and `./.memory/` so the
-non-root container user can write chat logs, reports, and memory outside the
+non-root container user can write chat logs and memory outside the
 image filesystem.
 
 In the Compose network, internal service DNS names replace host-only URLs. For example:
@@ -903,35 +885,25 @@ every turn, where `session-title` is a kebab-case slug derived from the first us
 `run_agents.py`.
 
 The file stores the full `List[ModelMessage]` serialised via pydantic-ai's `TypeAdapter`,
-so it is round-trippable back into a live session. It also stores the report directory used
-for agent report memory and the long-term user memory directory.
+so it is round-trippable back into a live session. It also stores the long-term user memory
+directory.
 
 ```json
 {
   "session_title": "compare-llm-pricing",
-  "report_dir": "chat_history/reports/compare-llm-pricing",
   "memory_dir": ".memory/default",
   "saved_at": "2025-03-15T10:23:41+00:00",
   "messages": [ ... ]
 }
 ```
 
-Agent reports are saved next to chat history under:
-
-```text
-chat_history/reports/<session-title>/
-```
-
 The web app stores users, messages, branches, uploaded-file metadata, and audit events in
 SQLite under `LOCALAGENT_STATE_DIR` by default. It also writes branch-specific model-history
-snapshots and reports under:
+snapshots under:
 
 ```text
 localagent_state/history/<user-id>/<session-id>-<branch-id>.json
-localagent_state/reports/<user-id>/<session-id>/<branch-id>/
 ```
-
-Current report filenames are `fs-report.md`, `web-report.md`, and `plan-report.md`.
 
 ---
 

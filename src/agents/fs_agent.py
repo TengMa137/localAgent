@@ -15,12 +15,6 @@ from pydantic_ai.usage import UsageLimits
 from .observability import _rt
 from .runtime.context import fs_toolset, model, validator
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
-from .runtime.reports import (
-    current_report_dir,
-    load_agent_report_summaries,
-    report_path,
-    write_agent_report,
-)
 from .runtime.skills_context import scan_skills_context
 from .structured_retry import observable_run_with_manual_validation_retries
 from tools.filesystem.text_ops import read_text_with_policy
@@ -85,22 +79,15 @@ class FsPromptContext:
     sanitized_objective: str
     files: list[str]
     analysis: PathAnalysis
-    report_memory: str
     skills_context: str
     skill_policy: str
 
     def render(self) -> str:
         """Render the full prompt contract for fs_agent."""
         listed_files = self.files[:MAX_FS_CONTEXT_FILES]
-        report_section = (
-            f"Concise prior session report memory:\n{self.report_memory}\n\n"
-            if self.report_memory
-            else ""
-        )
         return (
             f"{_roots_context()}\n\n"
             f"{self.skills_context}\n\n"
-            f"{report_section}"
             f"{self.skill_policy}\n"
             "Tool-use policy:\n"
             "- Python preflight has already checked exact path hints against the validator.\n"
@@ -457,7 +444,6 @@ def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
         sanitized_objective=sanitized_objective,
         files=files,
         analysis=analysis,
-        report_memory=load_agent_report_summaries(current_report_dir()),
         skills_context=scan_skills_context(),
         skill_policy=_skill_editing_policy_context(analysis),
     )
@@ -499,19 +485,6 @@ async def _add_rag_evidence(
     )
 
 
-def _write_success_report(objective: str, output: FsAgentResult) -> None:
-    """Persist the latest successful filesystem report."""
-    write_agent_report(
-        "fs",
-        objective=objective,
-        summary=output.summary,
-        answer=output.answer,
-        findings=[*output.findings, *output.changes_made],
-        paths=output.paths,
-        uncertainties=output.uncertainties,
-    )
-
-
 def _format_success_response(output: FsAgentResult) -> str:
     """Format a compact fs_agent handoff for the orchestrator history."""
     notes: list[str] = [f"Summary: {output.summary.strip() or 'No summary returned.'}"]
@@ -520,9 +493,7 @@ def _format_success_response(output: FsAgentResult) -> str:
     if output.changes_made:
         notes.append(f"Changes made: {len(output.changes_made)}")
     if output.findings:
-        notes.append(
-            f"Detailed findings in fs-report.md: {len(output.findings)} item(s)"
-        )
+        notes.append(f"Detailed findings: {len(output.findings)} item(s)")
     if output.uncertainties:
         notes.append("Uncertainties: " + "; ".join(_dedupe(output.uncertainties)))
 
@@ -682,41 +653,25 @@ def _apply_path_recovery_guard(
 
 
 def _format_exception_report(objective: str, exc: Exception) -> str:
-    """Write and return a terminal report for unexpected filesystem failures."""
+    """Return a terminal answer for unexpected filesystem failures."""
     if isinstance(exc, UsageLimitExceeded):
-        message = (
+        return (
             "I stopped the filesystem task because the model exceeded its tool-call budget.\n\n"
             f"Error: {exc}\n\n"
             "This usually means the model kept exploring or repeated file reads instead of producing a result. "
             "Try a narrower request or provide exact paths, or adjust the filesystem prompt/tool budget."
         )
-        write_agent_report(
-            "fs",
-            objective=objective,
-            summary=message,
-            answer=message,
-            uncertainties=[str(exc)],
-        )
-        return message
 
-    message = (
+    return (
         "I could not complete the filesystem request because of a file access problem.\n\n"
         f"Error: {exc}\n\n"
         "No further agent retry can fix this automatically. The path needs to be corrected, made readable/writable in the validator, or changed on disk."
     )
-    write_agent_report(
-        "fs",
-        objective=objective,
-        summary=message,
-        answer=message,
-        uncertainties=[str(exc), _roots_context()],
-    )
-    return message
 
 
 async def run_fs_task(objective: str) -> str:
     """
-    Run one local filesystem task and write fs-report.md.
+    Run one local filesystem task.
 
     Use from orchestrator or plan_agent when local path discovery, path
     validation, file reading/summarization, edits, or skill/document context is
@@ -725,10 +680,6 @@ async def run_fs_task(objective: str) -> str:
     """
     _rt(f"[fs_agent] objective: {objective[:120]}", "yellow", 1)
     _rt(f"[fs_agent] {_roots_context().replace(chr(10), ' | ')}", "dim", 1)
-
-    path = report_path("fs")
-    if path is not None:
-        _rt(f"[fs_agent] report: {path}", "dim", 1)
 
     prompt, path_analysis = _fs_task_prompt(objective)
     if path_analysis.invalid_paths:
@@ -750,9 +701,5 @@ async def run_fs_task(objective: str) -> str:
     rag_paths = _rag_paths_for_output(output, path_analysis)
     if rag_paths:
         await _add_rag_evidence(objective, output, paths=rag_paths)
-    _write_success_report(objective, output)
-
-    if path is not None:
-        _rt(f"[fs_agent] wrote report: {path}", "green", 1)
 
     return _format_success_response(output)

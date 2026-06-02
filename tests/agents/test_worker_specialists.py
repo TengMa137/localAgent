@@ -38,6 +38,8 @@ async def test_local_worker_delegates_to_fs_agent(monkeypatch):
 
     assert result["status"] == "done"
     assert result["key_findings"] == ["fs result"]
+    assert result["answer"] == "fs result"
+    assert result["useful"] is True
     assert result["cited_node_ids"] == ["/repo/config.md"]
     assert "Task kind: local_rag" in calls[0]
     assert "/repo/config.md" in calls[0]
@@ -71,6 +73,8 @@ async def test_web_worker_delegates_to_web_agent(monkeypatch):
 
     assert result["status"] == "done"
     assert result["key_findings"] == ["web result"]
+    assert result["answer"] == "web result"
+    assert result["useful"] is True
     assert result["cited_node_ids"] == ["https://example.com/docs"]
     assert "Task kind: url_crawl" in calls[0]
     assert "https://example.com/docs" in calls[0]
@@ -102,6 +106,8 @@ async def test_arxiv_worker_delegates_to_web_agent(monkeypatch):
 
     assert result["status"] == "done"
     assert result["key_findings"] == ["paper result"]
+    assert result["answer"] == "paper result"
+    assert result["useful"] is True
     assert "Task kind: arxiv" in calls[0]
 
 
@@ -130,8 +136,39 @@ async def test_worker_propagates_specialist_uncertainties(monkeypatch):
     )
 
     assert result["status"] == "done"
+    assert result["answer"] is None
+    assert result["useful"] is False
     assert result["key_findings"] == []
     assert result["uncertainties"] == [
         "No URLs were selected or crawled.",
         "Try a narrower query.",
     ]
+
+
+@pytest.mark.asyncio
+async def test_worker_drops_file_not_found_from_synthesis_findings(monkeypatch):
+    from agents import worker
+
+    async def fake_run_fs_task(_objective: str) -> str:
+        return (
+            "Forwardable answer:\n"
+            "I could not find the requested file path (/docs/missing.md) under the readable roots: /docs.\n\n"
+            "Orchestrator notes:\n"
+            "- Summary: File not found.\n"
+            "- Uncertainties: Invalid path hint(s): /docs/missing.md."
+        )
+
+    monkeypatch.setattr(worker, "run_fs_task", fake_run_fs_task)
+
+    result = await _run_worker(
+        TaskSpec(
+            kind=TaskKind.LOCAL_RAG,
+            objective="Read missing file",
+            relevant_files=["/docs/missing.md"],
+        )
+    )
+
+    assert result["status"] == "done"
+    assert result["useful"] is False
+    assert result["answer"] is None
+    assert result["key_findings"] == []

@@ -649,6 +649,9 @@ class TaskLog(BaseModel):
     task_id: str
     objective: str
     status: str
+    agent: Optional[str] = None
+    answer: Optional[str] = None
+    useful: bool = False
     summary: Optional[str] = None
     key_findings: List[str] = Field(default_factory=list)
     uncertainties: List[str] = Field(default_factory=list)
@@ -663,7 +666,7 @@ class TaskLog(BaseModel):
 
 
 def _compact_task_log(log: Dict[str, Any]) -> Dict[str, Any]:
-    for key in ("objective", "summary", "error"):
+    for key in ("objective", "answer", "summary", "error"):
         if key in log:
             log[key] = _trim_text(log[key], MAX_TASK_LOG_FIELD_CHARS)
     for key in ("key_findings", "uncertainties", "suggested_next_steps", "cited_node_ids"):
