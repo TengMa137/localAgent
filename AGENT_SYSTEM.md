@@ -172,3 +172,61 @@ CLI sessions additionally save chat history JSON under `chat_history/chats/`.
 Markdown specialist reports are no longer part of the runtime. The coordination
 path is typed `EvidenceItem` data in memory for the current turn, plus persisted
 trace/task-log metadata for diagnostics.
+
+## Model Size Tradeoff
+
+This system is deliberately decomposed for small local models. Python reduces
+the model's burden by owning routing execution, validation, RAG handoffs,
+budgets, and parallelism.
+
+Already simplified in the current design:
+
+- ordinary file tasks use `fs`, not `plan`
+- ordinary web/current tasks use `web`, not `plan`
+- single-specialist answers bypass workers and synthesis
+- plan synthesis sees typed useful evidence, not failed discovery noise
+
+For a stronger LLM, collapse further into a primary tool-using agent while
+keeping Python safety boundaries:
+
+```text
+user message
+  -> primary agent with visible history
+       tools:
+         - filesystem toolset
+         - web/search/crawl toolset
+         - deterministic RAG/search helpers
+       Python guards:
+         - path validation
+         - write approval
+         - tool budgets
+         - trace/task-log persistence
+  -> final answer
+```
+
+Keep for any model size:
+
+- visible-history-only persistence
+- filesystem validator and write approval
+- deterministic RAG ingestion/search for large local and crawled content
+- trace events and compact task logs
+
+Make optional only for broad/deep research:
+
+- `plan_agent`
+- worker adapter layer
+- separate synthesis call
+- specialist prompts for fs/web, once the primary model reliably follows tool
+  policy and validation feedback
+
+Target stronger-model route table:
+
+```text
+direct        -> primary agent answers
+tool          -> primary agent uses fs/web/RAG tools and answers
+deep_research -> optional planner/parallel workers/synthesis
+```
+
+Migration path: add `primary_tool`, compare it against `fs`/`web`/`plan`, then
+merge fast specialist routes into it if quality and tool discipline hold. Keep
+`plan` as the opt-in deep-research path.
