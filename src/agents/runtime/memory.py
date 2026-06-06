@@ -1,3 +1,5 @@
+"""Persistent user-memory extraction, normalization, application, and storage."""
+
 from __future__ import annotations
 
 import json

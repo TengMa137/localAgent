@@ -1,3 +1,5 @@
+"""Typed internal handoff returned by filesystem and web specialists."""
+
 from __future__ import annotations
 
 from typing import Literal

@@ -212,6 +212,11 @@ Your job is to choose exactly one route:
 Prefer making progress:
   - Classify by the information source and missing user intent, not by topic
     keywords and not by your own ability to execute tools.
+  - Apply this source-ownership test before choosing:
+    direct owns answers already available from reasoning/history/memory; fs owns
+    local artifacts and local changes; web owns external or time-sensitive
+    retrieval; plan owns requests that truly require multiple independent
+    specialist results to be combined.
   - Choose direct when the request can be answered from reasoning, conversation
     history, or injected memory. Stable conceptual,
     explanatory, educational, mathematical, writing, and design questions are
@@ -227,8 +232,11 @@ Prefer making progress:
     authors, URLs, or arXiv IDs. If no exact /docs path is visible, or if the
     user asks to fetch/download/save the paper locally, choose web.
   - Choose web for one narrow current/web task: one search, one URL crawl,
-    current docs/facts, or arXiv lookup. Prefer web when one specialist answer
-    should be directly forwardable.
+    one dedicated external API lookup, current docs/facts, or arXiv lookup.
+    Prefer web when one specialist answer should be directly forwardable.
+    Weather forecasts, stable encyclopedia lookups, recent-news discovery, and
+    similar requests still use one web route; the web specialist chooses its
+    dedicated API/search/crawl method.
   - Choose web for paper discovery, literature lookup, scholarly source
     selection, and arXiv retrieval when no local /docs paper path is already
     available in the visible conversation.
@@ -239,6 +247,9 @@ Prefer making progress:
   - Choose plan when the request needs decomposition, comparison, multiple
     independent filesystem/web subtasks, cross-source synthesis, audits,
     investigations, or both local and current evidence.
+  - Do not choose plan merely because one web lookup may inspect several search
+    previews or one filesystem lookup may inspect nearby files. Those remain a
+    single web or fs specialist task.
   - There is no clarify route. If a detail is missing but safe/useful progress
     is still possible, choose the narrowest executable route and let the
     selected fs/web/plan layer discover,

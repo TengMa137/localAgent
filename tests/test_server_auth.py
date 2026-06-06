@@ -43,6 +43,27 @@ def test_login_me_logout(monkeypatch, tmp_path):
         assert client.get("/api/me").status_code == 401
 
 
+def test_database_schema_has_no_legacy_report_storage(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    with TestClient(server.app):
+        with server.db() as conn:
+            tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            columns = {
+                f"{table}.{row['name']}"
+                for table in tables
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+
+    assert not {name for name in tables if "report" in name.lower()}
+    assert not {name for name in columns if "report" in name.lower()}
+
+
 def test_register_creates_normal_user_after_admin_is_initialized(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
     with TestClient(server.app) as client:
@@ -278,14 +299,14 @@ def test_first_message_preserves_generated_chat_title(monkeypatch, tmp_path):
         response = client.post(
             f"/api/chat/sessions/{chat_id}/messages",
             headers={"X-CSRF-Token": csrf},
-            json={"content": "Explain report writes"},
+            json={"content": "Explain branch writes"},
         )
         assert response.status_code == 200
-        assert response.json()["session"]["title"] == "explain report writes"
+        assert response.json()["session"]["title"] == "explain branch writes"
 
         loaded = client.get(f"/api/chat/sessions/{chat_id}")
         assert loaded.status_code == 200
-        assert loaded.json()["session"]["title"] == "explain report writes"
+        assert loaded.json()["session"]["title"] == "explain branch writes"
 
         next_chat = client.post(
             "/api/chat/sessions",

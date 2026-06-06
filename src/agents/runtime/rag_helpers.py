@@ -1,3 +1,5 @@
+"""Shared deterministic RAG retrieval and compact evidence formatting."""
+
 from __future__ import annotations
 
 from typing import Iterable

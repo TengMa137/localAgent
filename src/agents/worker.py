@@ -1,3 +1,5 @@
+"""Stateless planned-task workers that dispatch fs/web retrieval and evidence."""
+
 from datetime import datetime, timezone
 import asyncio
 import uuid

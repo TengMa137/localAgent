@@ -1,3 +1,5 @@
+"""Structural URL, arXiv, local-RAG, and current-information task signals."""
+
 from __future__ import annotations
 
 import re

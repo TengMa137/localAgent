@@ -1,3 +1,5 @@
+"""Shared model, validator, filesystem toolset, RAG, and MCP runtime wiring."""
+
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 import json

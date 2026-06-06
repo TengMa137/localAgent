@@ -1,12 +1,14 @@
+"""Filesystem specialist facade and execution coordinator.
+
+The `agents.fs` package owns typed contracts, prompt rendering, and path
+preflight. This module wires those pieces to filesystem tools, local RAG,
+observability, recovery guards, and the public `run_fs_task*` entry points.
+"""
+
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
-from dataclasses import dataclass, field
-from difflib import get_close_matches
-from pathlib import PurePosixPath
 
-from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.tools import DeferredToolRequests
@@ -18,197 +20,29 @@ from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
 from .runtime.specialist_result import SpecialistResult
 from .runtime.skills_context import scan_skills_context
 from .structured_retry import observable_run_with_manual_validation_retries
+from .fs.contracts import FsAgentResult, PathAnalysis
+from .fs.path_policy import PathPreflight as ValidatorPathPreflight
+from .fs.prompts import FS_SYSTEM_PROMPT, FsPromptContext
 from tools.filesystem.text_ops import read_text_with_policy
 from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 
-MAX_FS_CONTEXT_FILES = 120
 MAX_SKILL_EDITING_POLICY_CHARS = 5000
 SKILL_EDITING_POLICY_PATH = "/skills/skill_editing.md"
-
-KNOWN_FILE_SUFFIXES = {
-    ".cfg",
-    ".csv",
-    ".gif",
-    ".html",
-    ".ini",
-    ".jpeg",
-    ".jpg",
-    ".json",
-    ".lock",
-    ".log",
-    ".md",
-    ".pdf",
-    ".png",
-    ".py",
-    ".rst",
-    ".toml",
-    ".txt",
-    ".webp",
-    ".xml",
-    ".yaml",
-    ".yml",
-}
-
-PATHLIKE_RE = re.compile(r"(?<!\S)(?:/|[A-Za-z0-9._-]+/)[A-Za-z0-9._~@%+=:,/-]+")
-KNOWN_SUFFIX_RE = re.compile(
-    r"(?<![/\w.-])([A-Za-z0-9._-]+\.(?:cfg|csv|gif|html|ini|jpe?g|json|lock|log|md|pdf|png|py|rst|toml|txt|webp|xml|ya?ml))(?![/\w.-])",
-    re.IGNORECASE,
-)
-
-
-@dataclass
-class PathAnalysis:
-    invalid_paths: list[str] = field(default_factory=list)
-    write_targets: list[str] = field(default_factory=list)
-    resolved_paths: list[str] = field(default_factory=list)
-    candidate_paths: list[str] = field(default_factory=list)
-
-    def all_path_hints(self) -> list[str]:
-        """Return every path hint recorded during preflight."""
-        return [*self.resolved_paths, *self.write_targets, *self.invalid_paths]
-
-    def dedupe(self) -> None:
-        """Remove duplicate path entries while preserving order."""
-        self.invalid_paths = _dedupe(self.invalid_paths)
-        self.write_targets = _dedupe(self.write_targets)
-        self.resolved_paths = _dedupe(self.resolved_paths)
-        self.candidate_paths = _dedupe(self.candidate_paths)
-
-
-@dataclass
-class FsPromptContext:
-    sanitized_objective: str
-    files: list[str]
-    analysis: PathAnalysis
-    skills_context: str
-    skill_policy: str
-
-    def render(self) -> str:
-        """Render the full prompt contract for fs_agent."""
-        listed_files = self.files[:MAX_FS_CONTEXT_FILES]
-        return (
-            f"{_roots_context()}\n\n"
-            f"{self.skills_context}\n\n"
-            f"{self.skill_policy}\n"
-            "Tool-use policy:\n"
-            "- Python preflight has already checked exact path hints against the validator.\n"
-            "- If Resolved exact path hints are listed, perform the requested read, edit, or write directly on those paths before doing any broad discovery.\n"
-            "- Potential new writable path hints are nonexistent paths under writable roots. Use them only when the objective clearly asks to create or write a new file at that exact path. For reading, summarizing, inspecting, or editing an existing file, treat them as missing paths and use wrong-path recovery.\n"
-            "- Use the Readable file index below before calling discovery tools.\n"
-            "- For broad discovery, prefer find_paths, list_files, or grep_files over repeated list_directory calls.\n"
-            "- Do not call list_directory for a directory whose relevant files are already visible in the index.\n"
-            "- Only call file tools with paths from resolved path hints, potential new writable path hints for create/write tasks, the file index, or a tool result.\n"
-            "- Never invent paths. If no matching path exists, report uncertainty instead.\n"
-            "- Never read the same path twice in one run.\n"
-            "- After reading each relevant candidate file once, stop gathering and produce the result.\n\n"
-            "Wrong-path recovery policy:\n"
-            "- Invalid exact path hints mean the exact path check failed before tool use.\n"
-            "- Do not read or stat invalid exact path hints. Do not edit, delete, move, or copy them as existing files.\n"
-            "- Recovery order: first use possible replacement candidates and the readable file index; then call find_paths over path='/' for filename/path lookup; then list_files over path='/' when needed; only then use grep_files for content terms. Do not use grep_files for filename lookup; grep_files searches file content only.\n"
-            "- If exactly one possible replacement path candidate is listed and the objective does not require modifying files, read that candidate first instead of listing directories.\n"
-            "- When invalid path hints are present, search all readable roots, not only the invalid hint's original root.\n"
-            "- For read-only requests, if exactly one plausible replacement is clearly the intended file, read it and answer with a short heads-up that the requested path was not found and the replacement path was used.\n"
-            "- For edit/write/delete/move/copy requests, do not modify a replacement candidate silently. Ask the user to confirm the exact path.\n"
-            "- If multiple plausible replacement paths remain, ask the user to confirm the exact path.\n"
-            "- If find_paths/list_files/grep_files/file-index review finds no plausible path, answer that the file was not found under the readable roots.\n\n"
-            "Readable file index (actual validator paths):\n"
-            f"{self._list(listed_files)}\n"
-            f"File index truncated: {len(self.files) > len(listed_files)}\n\n"
-            "Resolved exact path hints from the objective:\n"
-            f"{self._list(self.analysis.resolved_paths)}\n\n"
-            "Potential new writable path hints from the objective:\n"
-            f"{self._list(self.analysis.write_targets)}\n\n"
-            "Invalid exact path hints from the objective:\n"
-            f"{self._list(self.analysis.invalid_paths)}\n\n"
-            "Possible replacement path candidates from deterministic path validation:\n"
-            f"{self._list(self.analysis.candidate_paths)}\n\n"
-            "Use resolved paths exactly as listed. Use potential new writable "
-            "paths only for create/write tasks. Do not call read/stat on invalid "
-            "path hints; use possible replacements, the file index, and discovery "
-            "tools to find the intended file instead.\n\n"
-            f"Objective: {self.sanitized_objective}"
-        )
-
-    @staticmethod
-    def _list(items: list[str]) -> str:
-        """Render a prompt list section."""
-        return "\n".join(f"- {item}" for item in items) if items else "- none"
-
-
-class FsAgentResult(BaseModel):
-    answer: str | None = Field(
-        default=None,
-        description="A concise answer the orchestrator can forward directly to the user.",
-    )
-    summary: str = Field(
-        description=(
-            "One concise outcome sentence. Do not summarize tool attempts, "
-            "directory listings, or trial-and-error search steps."
-        )
-    )
-    paths: list[str] = Field(default_factory=list)
-    changes_made: list[str] = Field(default_factory=list)
-    findings: list[str] = Field(default_factory=list)
-    uncertainties: list[str] = Field(default_factory=list)
-    needs_rag: bool = False
-
-    @model_validator(mode="before")
-    @classmethod
-    def coerce_none_lists(cls, values):
-        """Normalize nullable list fields returned by small models."""
-        if isinstance(values, dict):
-            for field_name in ("paths", "changes_made", "findings", "uncertainties"):
-                if values.get(field_name) is None:
-                    values[field_name] = []
-        return values
-
 
 fs_agent = Agent(
     model=model,
     output_type=[FsAgentResult, DeferredToolRequests],
     output_retries=0,
     toolsets=[fs_toolset],
-    system_prompt="""
-You are a filesystem specialist agent.
-
-Handle exactly one local filesystem objective. The orchestrator already decided
-this is a filesystem task, so do not second-guess that routing.
-
-Rules:
-  - Use only validator paths under the readable/writable roots in the prompt.
-  - Python preflight has already checked exact path hints. If resolved path hints
-    are present, act on those exact paths first and do not run broad discovery
-    first.
-  - Potential new writable path hints are nonexistent paths under writable
-    roots. Use them only when the objective clearly asks to create or write a new
-    file at that exact path. Do not treat them as existing files.
-  - Use the injected file index first for invalid-path recovery; discover
-    uncertain paths with find_paths, list_files, grep_files, list_directory, and
-    stat only when the index is insufficient.
-  - Prefer find_paths or list_files for filename/path discovery. grep_files
-    searches file contents, not filenames. list_directory is for immediate child
-    inspection, not recursive search.
-  - Never call read_file/read_image/stat on a path unless it came from the file
-    index, resolved path hints, or a prior tool result.
-  - Do not read the same file path twice in one run.
-  - Do not invent paths. Use exact paths from the prompt only when they are
-    listed as resolved paths, or as potential new writable paths for a create or
-    write task.
-  - For directories, many files, or truncated reads, set needs_rag=true and
-    include the relevant paths.
-  - For image files, use read_image to inspect visual content. Use read_file
-    only for text/code files.
-  - For writes under /skills, follow the injected skill editing policy.
-  - If invalid path hints or candidate paths are present, keep the user-facing
-    answer short: either answer from one clear read-only replacement with a
-    heads-up, ask for exact-path confirmation, or state file not found.
-  - Never edit, write, delete, move, or copy a replacement candidate unless it was
-    listed as a resolved exact path, or as a potential new writable path for a
-    create or write task.
-  - Put a practical user-facing answer in answer and durable facts in findings.
-    Keep summary/findings focused on useful results, not tool-attempt history.
-""",
+    system_prompt=FS_SYSTEM_PROMPT,
 )
+
+
+class PathPreflight(ValidatorPathPreflight):
+    """Compatibility wrapper binding deterministic preflight to the active validator."""
+
+    def __init__(self, files: list[str]):
+        super().__init__(files, validator=validator)
 
 
 def _dedupe(items: Iterable[str]) -> list[str]:
@@ -259,134 +93,6 @@ def _readable_file_index() -> list[str]:
             if validator.can_read(vpath):
                 files.add(vpath)
     return sorted(files)
-
-
-class PathPreflight:
-    """Resolve explicit path hints before the LLM uses filesystem tools."""
-
-    def __init__(self, files: list[str]):
-        """Store the readable file index used for matching and suggestions."""
-        self.files = files
-        self.analysis = PathAnalysis()
-
-    def analyze(self, objective: str) -> tuple[str, PathAnalysis]:
-        """Validate explicit path hints and return a safer objective string."""
-        sanitized = objective
-        for candidate in self._extract_hints(objective):
-            replacement = self._handle_hint(candidate)
-            if replacement:
-                if candidate in sanitized:
-                    sanitized = sanitized.replace(candidate, replacement)
-                elif candidate.startswith("/") and candidate[1:] in sanitized:
-                    sanitized = sanitized.replace(candidate[1:], replacement)
-        self.analysis.dedupe()
-        return sanitized, self.analysis
-
-    def _extract_hints(self, text: str) -> list[str]:
-        """Extract slash-like paths and known-suffix filenames."""
-        hints: list[str] = []
-        for raw in PATHLIKE_RE.findall(text):
-            if self._looks_like_url(raw):
-                continue
-            hints.append(self._normalize(raw))
-
-        for raw in KNOWN_SUFFIX_RE.findall(text):
-            if self._looks_like_url(raw):
-                continue
-            hint = self._normalize(raw)
-            matches = self._filename_matches(hint)
-            if matches:
-                hints.extend(matches)
-            elif "/" in hint:
-                hints.append(hint)
-            else:
-                hints.append(f"/{hint}")
-        return _dedupe(hint for hint in hints if "/" in hint)
-
-    def _handle_hint(self, path: str) -> str | None:
-        """Classify one path hint and return replacement text if invalid."""
-        try:
-            _, resolved, _ = validator.get_path_config(path, op="read")
-        except Exception as exc:
-            return self._record_invalid(path, str(exc))
-
-        if resolved.exists():
-            self.analysis.resolved_paths.append(path)
-            return None
-        return self._record_missing(
-            path,
-            "File not found after checking every readable file and considering close filename matches.",
-        )
-
-    def _record_invalid(self, path: str, reason: str) -> str | None:
-        """Record an invalid path hint and return its searchable replacement."""
-        suggestions = self._suggest(path)
-        self.analysis.invalid_paths.append(path)
-        self.analysis.candidate_paths.extend(suggestions)
-        return self._humanize(path)
-
-    def _record_missing(self, path: str, reason: str) -> str | None:
-        """Record a missing readable path, including possible new write targets."""
-        suggestions = self._suggest(path)
-        self.analysis.invalid_paths.append(path)
-        if self._is_write_target(path):
-            self.analysis.write_targets.append(path)
-        self.analysis.candidate_paths.extend(suggestions)
-        if suggestions:
-            return self._humanize(path)
-        if self._is_write_target(path):
-            return None
-        return self._humanize(path)
-
-    def _filename_matches(self, filename: str) -> list[str]:
-        """Resolve a bare filename to readable validator paths by basename."""
-        return [path for path in self.files if PurePosixPath(path).name == filename]
-
-    def _suggest(self, path: str, *, limit: int = 5) -> list[str]:
-        """Find close readable path suggestions for an invalid hint."""
-        basename_matches = self._filename_matches(PurePosixPath(path).name)
-        parents = {str(PurePosixPath(file_path).parent) for file_path in self.files}
-        close_matches = get_close_matches(
-            path, [*self.files, *sorted(parents)], n=limit, cutoff=0.68
-        )
-        return _dedupe([*basename_matches, *close_matches])[:limit]
-
-    @staticmethod
-    def _normalize(path: str) -> str:
-        """Convert a path-like hint into a validator-style path."""
-        cleaned = path.strip().rstrip(".,;:!?)]}\"'").replace("\\", "/")
-        if "/" in cleaned and not cleaned.startswith("/"):
-            return "/" + cleaned
-        return cleaned
-
-    @staticmethod
-    def _looks_like_url(text: str) -> bool:
-        """Return true when a token is clearly a web URL."""
-        return text.lower().startswith(("http://", "https://", "file://"))
-
-    @staticmethod
-    def _has_known_suffix(path: str) -> bool:
-        """Check whether a path uses a recognized file suffix."""
-        return PurePosixPath(path).suffix.lower() in KNOWN_FILE_SUFFIXES
-
-    @classmethod
-    def _is_write_target(cls, path: str) -> bool:
-        """Allow new known-suffix files only when the validator permits writing."""
-        return cls._has_known_suffix(path) and validator.can_write(path)
-
-    @staticmethod
-    def _is_skills_path(path: str) -> bool:
-        """Return true for the skills mount or any path below it."""
-        return path == "/skills" or path.startswith("/skills/")
-
-    @staticmethod
-    def _humanize(path: str) -> str:
-        """Turn an invalid path hint into searchable words for discovery."""
-        parts = [part for part in path.strip("/").split("/") if part]
-        if len(parts) > 1 and f"/{parts[0]}" in validator.readable_roots:
-            parts = parts[1:]
-        text = re.sub(r"[._-]+", " ", " ".join(parts))
-        return " ".join(text.split()) or path
 
 
 def _paths_that_need_rag(paths: list[str]) -> list[str]:
@@ -442,6 +148,7 @@ def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
     files = _readable_file_index()
     sanitized_objective, analysis = PathPreflight(files).analyze(objective)
     context = FsPromptContext(
+        roots_context=_roots_context(),
         sanitized_objective=sanitized_objective,
         files=files,
         analysis=analysis,

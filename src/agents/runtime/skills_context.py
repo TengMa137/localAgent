@@ -1,3 +1,5 @@
+"""Compact skill-index context generation for specialist prompts."""
+
 from __future__ import annotations
 
 from .context import refresh_skills

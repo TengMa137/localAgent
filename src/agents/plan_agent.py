@@ -1,3 +1,5 @@
+"""Multi-step planning, worker scheduling, evidence collection, and synthesis."""
+
 from collections.abc import Iterable
 from dataclasses import dataclass, field as dataclass_field
 from typing import Any

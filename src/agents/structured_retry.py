@@ -1,3 +1,5 @@
+"""Manual structured-output validation retries that keep model history bounded."""
+
 from __future__ import annotations
 
 from typing import Any

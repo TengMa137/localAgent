@@ -418,6 +418,10 @@ def test_orchestrator_prompt_explicitly_routes_current_lookup_to_web():
     assert "assistant message explicitly saved under" in prompt
     assert "/docs path" in prompt
     assert "fetch/download/save the paper locally" in prompt
+    assert "source-ownership test" in prompt
+    assert "one dedicated external API lookup" in prompt
+    assert "web specialist chooses its" in prompt
+    assert "Do not choose plan merely because one web lookup" in prompt
 
 
 def test_orchestrator_guardrail_corrects_recent_research_fs_to_web():
@@ -580,6 +584,10 @@ async def test_run_web_task_preflights_query_before_search(monkeypatch):
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(kind="open_web")
+            )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -591,6 +599,8 @@ async def test_run_web_task_preflights_query_before_search(monkeypatch):
                 )
             )
         if output_name == "WebPreviewDecision":
+            assert "as_of: Saturday, 06 June 2026, 15:00 UTC" in _prompt
+            assert "Thursday, 04 June 2026, 19:00 UTC" not in _prompt
             return SimpleNamespace(
                 output=web_agent.WebPreviewDecision(
                     answer_from_preview=False,
@@ -638,6 +648,11 @@ async def test_run_web_task_preflights_query_before_search(monkeypatch):
         "observable_run_with_manual_validation_retries",
         fake_model_run,
     )
+    monkeypatch.setattr(
+        web_agent,
+        "_now",
+        lambda: "Saturday, 06 June 2026, 15:00 UTC",
+    )
     monkeypatch.setattr(web_agent, "web_search_results", fake_search)
     monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fake_crawl)
     monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
@@ -646,6 +661,7 @@ async def test_run_web_task_preflights_query_before_search(monkeypatch):
 
     assert "Gold is quoted at the tested value." in result
     assert events == [
+        ("model", "WebSourceDecision"),
         ("model", "WebQueryPlan"),
         ("search", "live spot gold price today USD per ounce"),
         ("model", "WebPreviewDecision"),
@@ -663,6 +679,10 @@ async def test_run_web_task_skips_crawl_when_preview_is_enough(monkeypatch):
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(kind="open_web")
+            )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -726,6 +746,7 @@ async def test_run_web_task_skips_crawl_when_preview_is_enough(monkeypatch):
 
     assert "passing showers" in result
     assert events == [
+        ("model", "WebSourceDecision"),
         ("model", "WebQueryPlan"),
         ("search", "weather Lund Sweden tomorrow:3"),
         ("model", "WebPreviewDecision"),
@@ -741,6 +762,10 @@ async def test_run_web_task_uses_source_domain_queries(monkeypatch):
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(kind="open_web")
+            )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -814,12 +839,18 @@ async def test_run_web_task_uses_weather_forecast_mcp_tool(monkeypatch):
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="weather",
+                    target="Lund, Sweden",
+                )
+            )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
                     query="Lund, Sweden - tomorrow's weather forecast (Saturday, 06 June 2026)",
-                    preferred_source="weather",
-                    preferred_tool="weather_forecast",
+                    preferred_source="weather_forecast",
                     date="2026-06-06",
                     search_result_limit=3,
                     crawl_url_limit=0,
@@ -879,6 +910,242 @@ async def test_run_web_task_uses_weather_forecast_mcp_tool(monkeypatch):
     assert ("model", "WebPreviewDecision") not in events
 
 
+def test_preferred_api_tool_accepts_exact_tool_name_or_source_alias():
+    from agents.web_agent import WebQueryPlan, _preferred_api_tool
+
+    assert (
+        _preferred_api_tool(
+            WebQueryPlan(
+                query="Lund weather tomorrow",
+                preferred_source="weather_forecast",
+            )
+        )
+        == "weather_forecast"
+    )
+    assert (
+        _preferred_api_tool(
+            WebQueryPlan(
+                query="Lund weather tomorrow",
+                preferred_source="weather",
+            )
+        )
+        == "weather_forecast"
+    )
+    assert (
+        _preferred_api_tool(
+            WebQueryPlan(
+                query="Lund weather tomorrow",
+                preferred_tool="WEATHER_FORECAST",
+            )
+        )
+        == "weather_forecast"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("preferred_source", "tool_name", "objective", "api_payload", "answer"),
+    [
+        (
+            "wiki_summary",
+            "wiki_summary",
+            "look up an encyclopedia overview of the printing press",
+            {
+                "success": True,
+                "title": "Printing press",
+                "extract": "A printing press applies pressure to an inked surface.",
+                "page_url": "https://en.wikipedia.org/wiki/Printing_press",
+            },
+            "The printing press is a mechanical printing technology.",
+        ),
+        (
+            "news_search",
+            "news_search",
+            "find the latest reporting on the EU AI Act",
+            {
+                "success": True,
+                "articles": [
+                    {
+                        "title": "EU AI Act update",
+                        "url": "https://example.com/eu-ai-act",
+                    }
+                ],
+            },
+            "Recent reporting covers an EU AI Act update.",
+        ),
+    ],
+)
+async def test_run_web_task_uses_selected_structured_api_without_search_or_crawl(
+    monkeypatch,
+    preferred_source,
+    tool_name,
+    objective,
+    api_payload,
+    answer,
+):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind=(
+                        "encyclopedia"
+                        if preferred_source == "wiki_summary"
+                        else "recent_news"
+                    ),
+                    target=(
+                        "Printing press"
+                        if preferred_source == "wiki_summary"
+                        else "EU AI Act"
+                    ),
+                )
+            )
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query=objective,
+                    preferred_source=preferred_source,
+                    preferred_tool=None,
+                    search_result_limit=3,
+                    crawl_url_limit=0,
+                )
+            )
+        if output_name == "McpApiCallPlan":
+            return SimpleNamespace(
+                output=web_agent.McpApiCallPlan(
+                    tool_name=tool_name,
+                    query=f"verbose instruction: {objective}",
+                    timespan="1week" if tool_name == "news_search" else None,
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer=answer,
+                summary=f"Answered with {tool_name}.",
+            )
+        )
+
+    async def fake_wiki(_mcp_url, query, *, language=None):
+        events.append(("wiki", f"{query}:{language}"))
+        return api_payload
+
+    async def fake_news(
+        _mcp_url,
+        query,
+        *,
+        max_results=None,
+        timespan=None,
+    ):
+        events.append(("news", f"{query}:{max_results}:{timespan}"))
+        return api_payload
+
+    async def fail_search(*_args, **_kwargs):
+        raise AssertionError("structured API path should not call web search")
+
+    async def fail_crawl(*_args, **_kwargs):
+        raise AssertionError("structured API path should not crawl")
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "wiki_summary_result", fake_wiki)
+    monkeypatch.setattr(web_agent, "news_search_results", fake_news)
+    monkeypatch.setattr(web_agent, "web_search_results", fail_search)
+    monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fail_crawl)
+
+    result = await web_agent.run_web_task(objective)
+
+    assert answer in result
+    assert ("model", "WebPreviewDecision") not in events
+    expected_api_event = (
+        ("wiki", "Printing press:None")
+        if tool_name == "wiki_summary"
+        else ("news", "EU AI Act:3:1week")
+    )
+    assert expected_api_event in events
+
+
+@pytest.mark.asyncio
+async def test_empty_structured_api_result_falls_back_to_one_web_search(monkeypatch):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="encyclopedia",
+                    target="Example Agency",
+                )
+            )
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="current office holder for example agency",
+                    preferred_source="wiki_summary",
+                    crawl_url_limit=0,
+                )
+            )
+        if output_name == "McpApiCallPlan":
+            return SimpleNamespace(
+                output=web_agent.McpApiCallPlan(
+                    tool_name="wiki_summary",
+                    query="Example Agency",
+                )
+            )
+        if output_name == "WebPreviewDecision":
+            return SimpleNamespace(
+                output=web_agent.WebPreviewDecision(
+                    answer_from_preview=True,
+                    reason="Official-source snippet contains the current office holder.",
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="The current office holder was found from web results.",
+                summary="Dedicated source missed; web fallback succeeded.",
+            )
+        )
+
+    async def fake_wiki(*_args, **_kwargs):
+        events.append(("wiki", "empty"))
+        return {"success": False, "error": "page not found"}
+
+    async def fake_search(_mcp_url, query, *, max_results=None):
+        events.append(("search", f"{query}:{max_results}"))
+        return [
+            {
+                "title": "Example Agency leadership",
+                "url": "https://example.gov/leadership",
+                "snippet": "The current office holder is Example Person.",
+                "position": 1,
+            }
+        ]
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "wiki_summary_result", fake_wiki)
+    monkeypatch.setattr(web_agent, "web_search_results", fake_search)
+
+    result = await web_agent.run_web_task("who currently leads the example agency?")
+
+    assert "web fallback succeeded" in result
+    assert ("wiki", "empty") in events
+    assert ("search", "current office holder for example agency:5") in events
+    assert events.count(("model", "WebPreviewDecision")) == 1
+
+
 @pytest.mark.asyncio
 async def test_run_web_task_retries_weather_with_normalized_location(monkeypatch):
     from agents import web_agent
@@ -887,6 +1154,12 @@ async def test_run_web_task_retries_weather_with_normalized_location(monkeypatch
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="weather",
+                )
+            )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -976,6 +1249,13 @@ async def test_run_web_task_saves_arxiv_paper_to_docs_and_scopes_rag(
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="scholarly",
+                    target="diffusion language model survey",
+                )
+            )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -1126,6 +1406,13 @@ async def test_run_web_task_uses_arxiv_web_search_for_semantic_discovery(
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="scholarly",
+                    target="diffusion language model",
+                )
+            )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -1247,6 +1534,13 @@ async def test_run_web_task_saves_fallback_arxiv_record_when_fetch_misses(
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="scholarly",
+                    target="overview of diffusion language model papers",
+                )
+            )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -1802,7 +2096,9 @@ async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monke
         return SpecialistResult(
             agent="web_agent",
             answer="Recent language model research from web.",
-            summary="Web research completed",
+            summary="INTERNAL_SPECIALIST_SUMMARY",
+            sources=["https://example.com/internal-source"],
+            raw="INTERNAL_SPECIALIST_RAW",
         )
 
     monkeypatch.setattr(
@@ -1821,6 +2117,12 @@ async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monke
     assert result.decision.route == "web"
     assert result.output.reply == "Recent language model research from web."
     assert calls == ["Provide recent language model research overview"]
+    persisted_history = str(result.all_messages())
+    assert "fetch me recent language model research" in persisted_history
+    assert "Recent language model research from web." in persisted_history
+    assert "INTERNAL_SPECIALIST_SUMMARY" not in persisted_history
+    assert "INTERNAL_SPECIALIST_RAW" not in persisted_history
+    assert "https://example.com/internal-source" not in persisted_history
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,5 @@
+"""Typed evidence records exchanged by planned workers and synthesis."""
+
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
