@@ -18,7 +18,7 @@ x-agent-environment: &agent-environment
   LOCALAGENT_SKILLS_DIR: /data/skills
 
 x-agent-volumes: &agent-volumes
-  - ./user_docs:/data/docs:ro
+  - ./user_docs:/data/docs
   - ./skills:/data/skills
   - agent_state:/data/state
 
@@ -58,7 +58,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./user_docs:/data/docs:ro
+      - ./user_docs:/data/docs
       - ./skills:/data/skills
       - agent_state:/data/state
       - ./chat_history:/workspace/localAgent/chat_history

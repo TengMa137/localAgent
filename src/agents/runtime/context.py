@@ -10,8 +10,8 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from localagent_settings import get_runtime_settings
-from rag import rag_service
-from tools.retrieval import make_rag_toolset, make_web_toolset
+from rag import rag_service as rag_service
+from tools.retrieval import make_rag_toolset
 from tools.filesystem import (
     FilesystemValidator,
     FilesystemValidatorConfig,
@@ -70,6 +70,8 @@ FS_READ_DISCOVERY_TOOLS = {
     "find_paths",
     "grep_files",
 }
+FS_EMPTY_DISCOVERY_TOOLS = {"find_paths", "list_files", "grep_files"}
+MAX_EMPTY_DISCOVERY_CALLS = 8
 
 
 def _fs_write_path(tool_name: str, tool_args: dict[str, Any]) -> str | None:
@@ -113,6 +115,7 @@ class DuplicateFilesystemReadGuardToolset(WrapperToolset):
     """Reject identical read/discovery tool calls within the same model run."""
 
     seen_calls: dict[str, set[str]] = field(default_factory=dict)
+    empty_discovery_counts: dict[str, int] = field(default_factory=dict)
 
     async def call_tool(self, name, tool_args, ctx, tool):
         tool_name = getattr(getattr(tool, "tool_def", None), "name", name) or name
@@ -120,6 +123,7 @@ class DuplicateFilesystemReadGuardToolset(WrapperToolset):
 
         if tool_name in FS_WRITE_TOOLS:
             self.seen_calls.pop(run_key, None)
+            self.empty_discovery_counts.pop(run_key, None)
             return await super().call_tool(name, tool_args, ctx, tool)
 
         if tool_name in FS_READ_DISCOVERY_TOOLS:
@@ -135,7 +139,29 @@ class DuplicateFilesystemReadGuardToolset(WrapperToolset):
                 )
             seen.add(call_key)
 
-        return await super().call_tool(name, tool_args, ctx, tool)
+        try:
+            result = await super().call_tool(name, tool_args, ctx, tool)
+        except Exception as exc:
+            if tool_name in FS_READ_DISCOVERY_TOOLS:
+                raise ModelRetry(
+                    f"{tool_name} failed with: {exc}. Use only validator paths "
+                    "from the prompt, file index, or prior tool results. If this "
+                    "means the requested file is unavailable, stop tool use and "
+                    "return a concise uncertainty instead of trying guessed paths."
+                ) from exc
+            raise
+
+        if tool_name in FS_EMPTY_DISCOVERY_TOOLS and self._is_empty_result(result):
+            count = self.empty_discovery_counts.get(run_key, 0) + 1
+            self.empty_discovery_counts[run_key] = count
+            if count >= MAX_EMPTY_DISCOVERY_CALLS:
+                raise ModelRetry(
+                    "Multiple discovery searches returned no matches. Stop using "
+                    "filesystem tools and return the best concise answer with "
+                    "uncertainty, or say the relevant local file was not found."
+                )
+
+        return result
 
     @staticmethod
     def _run_key(ctx: RunContext) -> str:
@@ -147,6 +173,19 @@ class DuplicateFilesystemReadGuardToolset(WrapperToolset):
     def _call_key(tool_name: str, tool_args: dict[str, Any]) -> str:
         args = json.dumps(tool_args, sort_keys=True, default=str)
         return f"{tool_name}:{args}"
+
+    @staticmethod
+    def _is_empty_result(result: Any) -> bool:
+        if hasattr(result, "count"):
+            try:
+                return int(result.count) == 0
+            except Exception:
+                return False
+        if hasattr(result, "files"):
+            return not bool(result.files)
+        if hasattr(result, "matches"):
+            return not bool(result.matches)
+        return False
 
 
 fs_toolset = DuplicateFilesystemReadGuardToolset(
@@ -170,11 +209,6 @@ def refresh_skills() -> str:
 
 
 MCP_URL = settings.mcp_url
-
-web_toolset = make_web_toolset(
-    mcp_url=MCP_URL,
-    rag_service=rag_service,
-)
 
 rag_validator = validator.derive(
     allow_read=["/docs", "/skills"],

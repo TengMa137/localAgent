@@ -58,10 +58,12 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Text
 
 from localagent_settings import get_runtime_settings
 from .observability import _rt, observable_run
-from .fs_agent import run_fs_task as _run_fs_task
+from .fs_agent import run_fs_task_result as _run_fs_task_result
 from .plan_agent import run_plan_workflow as _run_plan_workflow
-from .web_agent import run_web_task as _run_web_task
+from .web_agent import run_web_task_result as _run_web_task_result
 from .runtime.context import model, validator
+from .runtime.query_policy import TaskKind, infer_task_kind
+from .runtime.specialist_result import SpecialistResult
 from .structured_retry import (
     observable_run_with_manual_validation_retries,
     structured_model_settings,
@@ -218,9 +220,22 @@ Prefer making progress:
   - Choose fs for one narrow filesystem task: read, inspect, summarize, search,
     validate, edit, or write local files under the validator roots. Prefer fs
     when one specialist answer should be directly forwardable.
+  - Choose fs for follow-up questions about a paper or source that a previous
+    assistant message explicitly saved under a /docs path. Include that /docs
+    path in the objective so the filesystem specialist can read it directly.
+    Do not choose fs merely because a previous answer mentioned paper titles,
+    authors, URLs, or arXiv IDs. If no exact /docs path is visible, or if the
+    user asks to fetch/download/save the paper locally, choose web.
   - Choose web for one narrow current/web task: one search, one URL crawl,
     current docs/facts, or arXiv lookup. Prefer web when one specialist answer
     should be directly forwardable.
+  - Choose web for paper discovery, literature lookup, scholarly source
+    selection, and arXiv retrieval when no local /docs paper path is already
+    available in the visible conversation.
+  - If the user explicitly asks you to search, browse, look up, check the web,
+    or verify a current external fact, choose web. Live market prices, exchange
+    rates, weather, scores, and similar changing facts are web tasks even when
+    a generic explanatory answer would be possible.
   - Choose plan when the request needs decomposition, comparison, multiple
     independent filesystem/web subtasks, cross-source synthesis, audits,
     investigations, or both local and current evidence.
@@ -275,6 +290,8 @@ Output contract:
 Objective-writing rules:
   - Preserve user constraints, paths, URLs, time requirements, and output format.
   - Do not invent concrete paths, filenames, URLs, dates, or entities.
+  - When choosing fs for a follow-up about a source previously saved under
+    /docs, copy the exact /docs path from visible history into objective.
 """
 
 
@@ -498,9 +515,94 @@ def _extract_forwardable_answer(result: str) -> str | None:
     return answer
 
 
+def _mentions_validator_path(text: str) -> bool:
+    for root in [*validator.readable_roots, *validator.writable_roots]:
+        root = root.rstrip("/")
+        if root and root in text:
+            return True
+    return False
+
+
+def _guardrail_orchestrator_decision(
+    prompt: str,
+    decision: OrchestratorDecision,
+) -> OrchestratorDecision:
+    """Correct single-route decisions that conflict with structural policy signals."""
+    if decision.route in {"web", "plan"}:
+        return decision
+
+    objective = (decision.objective or "").strip()
+    candidate_text = "\n".join(part for part in [prompt, objective] if part)
+    if decision.route == "fs" and _mentions_validator_path(candidate_text):
+        return decision
+
+    inferred_kind = infer_task_kind(candidate_text)
+    if inferred_kind in {TaskKind.WEB_SEARCH, TaskKind.URL_CRAWL, TaskKind.ARXIV}:
+        corrected_objective = objective or prompt.strip()
+        if not corrected_objective:
+            return decision
+        _rt(
+            "[orchestrator] route guardrail corrected "
+            f"{decision.route}→web for inferred {inferred_kind.value}",
+            "yellow",
+        )
+        return OrchestratorDecision(
+            route="web",
+            objective=corrected_objective,
+            effort="minimal",
+        )
+
+    return decision
+
+
+def _should_recover_fs_result_with_web(
+    *,
+    original_prompt: str,
+    objective: str,
+    fs_result: SpecialistResult,
+) -> bool:
+    if fs_result.agent != "fs_agent":
+        return False
+    if fs_result.useful or not fs_result.recoverable_by_web:
+        return False
+
+    candidate_text = "\n".join(
+        part for part in [original_prompt, objective, fs_result.summary] if part
+    )
+    if _mentions_validator_path(candidate_text):
+        return False
+
+    inferred_kind = infer_task_kind(candidate_text)
+    return inferred_kind in {TaskKind.WEB_SEARCH, TaskKind.URL_CRAWL, TaskKind.ARXIV}
+
+
+async def _recover_fs_with_web(
+    *,
+    objective: str,
+    fs_result: SpecialistResult,
+) -> SpecialistResult:
+    recovery_objective = "\n".join(
+        [
+            objective,
+            "",
+            "Local filesystem lookup failed; recover from web if possible.",
+            f"Filesystem status: {fs_result.status}",
+            "Filesystem answer:",
+            fs_result.forwardable_answer(),
+        ]
+    )
+    _rt(
+        f"[orchestrator] recovery route=web after fs {fs_result.status}",
+        "yellow",
+    )
+    return await _run_web_task_result(recovery_objective)
+
+
 async def _response_and_messages(
     decision: OrchestratorDecision,
     message_history: list[ModelMessage],
+    *,
+    original_prompt: str = "",
 ) -> tuple[OrchestratorResponse, list[ModelMessage]]:
     """Execute a route decision and return response plus persisted messages."""
     if decision.route == "direct":
@@ -515,10 +617,19 @@ async def _response_and_messages(
     objective = (decision.objective or "").strip()
     if decision.route == "fs":
         _rt("[orchestrator] specialist route=run_fs_task", "yellow")
-        result = await _run_fs_task(objective)
+        result = await _run_fs_task_result(objective)
+        if _should_recover_fs_result_with_web(
+            original_prompt=original_prompt,
+            objective=objective,
+            fs_result=result,
+        ):
+            result = await _recover_fs_with_web(
+                objective=objective,
+                fs_result=result,
+            )
         return (
             OrchestratorResponse(
-                reply=_extract_forwardable_answer(result) or result.strip(),
+                reply=result.forwardable_answer(),
                 session_title=decision.session_title,
             ),
             message_history,
@@ -526,10 +637,10 @@ async def _response_and_messages(
 
     if decision.route == "web":
         _rt("[orchestrator] specialist route=run_web_task", "yellow")
-        result = await _run_web_task(objective)
+        result = await _run_web_task_result(objective)
         return (
             OrchestratorResponse(
-                reply=_extract_forwardable_answer(result) or result.strip(),
+                reply=result.forwardable_answer(),
                 session_title=decision.session_title,
             ),
             message_history,
@@ -609,13 +720,17 @@ async def run_orchestrator_turn(
             )
     finally:
         _INITIAL_MEMORY_CONTEXT.reset(memory_token)
-    decision: OrchestratorDecision = decision_result.output
+    decision: OrchestratorDecision = _guardrail_orchestrator_decision(
+        prompt,
+        decision_result.output,
+    )
     delegated = decision.route != "direct"
     reason = f" — {decision.routing_reason}" if decision.routing_reason else ""
     _rt(f"[orchestrator] decision route={decision.route}{reason}", "yellow")
     response, _internal_messages = await _response_and_messages(
         decision,
         decision_result.all_messages(),
+        original_prompt=prompt,
     )
     messages = _persistent_turn_messages(message_history, prompt, response)
     return OrchestratorRunResult(

@@ -30,8 +30,22 @@ Current implementation highlights:
 - Filesystem writes can use local CLI approval via PydanticAI deferred-tool approval.
 - The orchestrator cannot call specialist agents as tools; it returns one typed
   semantic route decision, and Python executes the selected runner.
+- Python validates the selected route before dispatch and can correct a structurally
+  incompatible `fs`/`direct` decision to `web` for current, URL, or arXiv requests.
+- Filesystem and web specialists return a shared typed internal result with status,
+  usefulness, sources, uncertainties, and recovery metadata. String handoffs remain
+  available for plan/worker compatibility.
+- A failed local reference lookup can recover to the web exactly once when the
+  original request is externally recoverable. Explicit local paths such as
+  `/docs/missing.md` remain local and do not silently fall back to the internet.
 - `fs_agent` owns local path discovery/read/write/edit and uses deterministic RAG for large or multi-file reads.
-- `web_agent` owns search/query/URL selection/crawl and then uses deterministic RAG over fetched content.
+- `web_agent` validates its query and tool arguments before network access, uses
+  bounded search/crawl budgets, and skips crawling when result previews are enough.
+- Dedicated MCP APIs handle weather through Open-Meteo, definitions through
+  Wikipedia, and recent news through GDELT before generic web search.
+- arXiv discovery uses web search, metadata fetch remains ID-based, and fetched
+  papers are persisted under `user_docs/papers/arxiv/` as Markdown plus the original
+  PDF when download succeeds.
 - Planned workers produce typed evidence for synthesis; diagnostics stay in trace events
   and per-turn task logs.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
@@ -61,7 +75,7 @@ Current implementation highlights:
 │   │   ├── plan_agent.py         # Planning, plan normalization, worker loop
 │   │   ├── worker.py             # Stateless one-shot worker calls and retrieval
 │   │   ├── observability.py      # Real-time event streaming and compact tracing
-│   │   └── runtime/              # Model setup, validators, typed turn context, skill context
+│   │   └── runtime/              # Model setup, validators, typed specialist/turn context
 │   └── tools/
 │       ├── filesystem/      # Validator-backed read/write/list/grep/edit/image tools
 │       ├── retrieval/       # RAG tools and MCP web/arXiv interceptors
@@ -120,7 +134,22 @@ Start an OpenAI-compatible model endpoint, for example llama.cpp:
     --jinja
 ```
 
-Start the MCP server from `~/codespace/mcp_server_local` so it listens on port `8000`.
+Start the MCP server from `~/codespace/mcp_server_local/mcp_web` so it listens
+on port `8000`:
+
+```bash
+cd ../mcp_server_local/mcp_web
+cp -n env.example .env
+docker compose up --build -d mcp-server
+```
+
+The MCP server provides:
+
+- `search_web`, `crawl_url`, and `crawl_urls`
+- `weather_forecast` via Open-Meteo
+- `wiki_summary` via Wikipedia
+- `news_search` via GDELT DOC
+- `fetch_arxiv` for exact arXiv IDs
 
 Host defaults:
 
@@ -205,10 +234,14 @@ The Compose stack has two agent entry points:
 
 - `agent-app`: backend, frontend, agent runtime, and in-process `rag_lib`
 - `agent-cli`: optional terminal agent, enabled only through the `cli` Compose profile
-- `mcp-server`: internal-only web/search/arXiv MCP server
+- `mcp-server`: internal-only web/search/API/arXiv MCP server
 
 By default the app is published at `127.0.0.1:8088` and the MCP server is not
 published to the host. (inspect: lsof -nP -iTCP:8088 -sTCP:LISTEN)
+
+`user_docs/` is mounted writable into the agent containers because fetched arXiv
+Markdown and PDF files are saved beneath `/data/docs/papers/arxiv/`. The MCP
+container remains read-only and isolated from the document mount.
 
 Use one of these commands:
 

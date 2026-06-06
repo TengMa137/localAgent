@@ -15,6 +15,7 @@ from pydantic_ai.usage import UsageLimits
 from .observability import _rt
 from .runtime.context import fs_toolset, model, validator
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
+from .runtime.specialist_result import SpecialistResult
 from .runtime.skills_context import scan_skills_context
 from .structured_retry import observable_run_with_manual_validation_retries
 from tools.filesystem.text_ops import read_text_with_policy
@@ -669,9 +670,54 @@ def _format_exception_report(objective: str, exc: Exception) -> str:
     )
 
 
-async def run_fs_task(objective: str) -> str:
+def _fs_exception_result(objective: str, exc: Exception) -> SpecialistResult:
+    answer = _format_exception_report(objective, exc)
+    status = "tool_error" if isinstance(exc, UsageLimitExceeded) else "blocked"
+    return SpecialistResult(
+        agent="fs_agent",
+        status=status,
+        useful=False,
+        recoverable_by_web=status == "tool_error",
+        answer=answer,
+        summary=str(exc),
+        uncertainties=[str(exc)],
+        raw=answer,
+    )
+
+
+def _fs_output_status(output: FsAgentResult) -> tuple[str, bool]:
+    answer = (output.answer or output.summary or "").strip()
+    lowered = " ".join([answer, *output.uncertainties]).casefold()
+    has_substantive_result = bool(output.findings or output.changes_made)
+    if (
+        "could not find" in lowered
+        or "not found" in lowered
+        or "no plausible replacement" in lowered
+        or "file-not-found" in lowered
+    ) and not has_substantive_result:
+        return "not_found", False
+    return "ok", bool(answer or output.findings or output.changes_made)
+
+
+def _fs_output_to_specialist_result(output: FsAgentResult) -> SpecialistResult:
+    status, useful = _fs_output_status(output)
+    answer = (output.answer or output.summary).strip() or "No answer returned."
+    return SpecialistResult(
+        agent="fs_agent",
+        status=status,
+        useful=useful,
+        recoverable_by_web=status in {"not_found", "tool_error"},
+        answer=answer,
+        summary=output.summary,
+        sources=_dedupe(output.paths),
+        findings=output.findings,
+        uncertainties=output.uncertainties,
+    )
+
+
+async def run_fs_task_result(objective: str) -> SpecialistResult:
     """
-    Run one local filesystem task.
+    Run one local filesystem task and return a typed internal result.
 
     Use from orchestrator or plan_agent when local path discovery, path
     validation, file reading/summarization, edits, or skill/document context is
@@ -695,11 +741,19 @@ async def run_fs_task(objective: str) -> str:
         output = await _run_fs_agent(prompt)
     except Exception as exc:
         _rt(f"[fs_agent] ERROR: {exc}", "red", 1)
-        return _format_exception_report(objective, exc)
+        return _fs_exception_result(objective, exc)
 
     output = _apply_path_recovery_guard(output, path_analysis)
     rag_paths = _rag_paths_for_output(output, path_analysis)
     if rag_paths:
         await _add_rag_evidence(objective, output, paths=rag_paths)
 
-    return _format_success_response(output)
+    result = _fs_output_to_specialist_result(output)
+    result.raw = _format_success_response(output)
+    return result
+
+
+async def run_fs_task(objective: str) -> str:
+    """Compatibility wrapper returning the historical string handoff."""
+    result = await run_fs_task_result(objective)
+    return result.raw or result.to_handoff()

@@ -142,6 +142,60 @@ async def test_filesystem_duplicate_read_guard_clears_after_write():
     )
 
 
+@pytest.mark.asyncio
+async def test_filesystem_guard_converts_read_discovery_error_to_model_retry():
+    from pydantic_ai.exceptions import ModelRetry
+
+    from agents.runtime.context import DuplicateFilesystemReadGuardToolset
+
+    class Wrapped:
+        async def call_tool(self, _name, _tool_args, _ctx, _tool):
+            raise ValueError("outside validator boundaries")
+
+    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    ctx = SimpleNamespace(run_id="run-1", messages=[])
+    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_directory"))
+
+    with pytest.raises(ModelRetry, match="stop tool use"):
+        await guard.call_tool("list_directory", {"path": ".skills"}, ctx, list_tool)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_guard_stops_repeated_empty_discovery():
+    from pydantic_ai.exceptions import ModelRetry
+
+    from agents.runtime.context import (
+        DuplicateFilesystemReadGuardToolset,
+        MAX_EMPTY_DISCOVERY_CALLS,
+    )
+
+    class Wrapped:
+        async def call_tool(self, _name, _tool_args, _ctx, _tool):
+            return SimpleNamespace(count=0)
+
+    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    ctx = SimpleNamespace(run_id="run-1", messages=[])
+    grep_tool = SimpleNamespace(tool_def=SimpleNamespace(name="grep_files"))
+
+    for idx in range(MAX_EMPTY_DISCOVERY_CALLS - 1):
+        assert (
+            await guard.call_tool(
+                "grep_files",
+                {"path": "/docs", "query": f"missing-{idx}"},
+                ctx,
+                grep_tool,
+            )
+        ).count == 0
+
+    with pytest.raises(ModelRetry, match="Multiple discovery searches"):
+        await guard.call_tool(
+            "grep_files",
+            {"path": "/docs", "query": "missing-final"},
+            ctx,
+            grep_tool,
+        )
+
+
 def test_default_skills_mount_is_writable_with_approval():
     from agents.runtime import context
 
@@ -346,10 +400,953 @@ def test_web_query_guidance_includes_time_sensitive_semantic_guidance():
 
     assert "Current date/time:" in guidance
     assert (
-        "Choose the first web_search_tool query semantically from the objective"
+        "Choose the web search query semantically from the objective"
         in guidance
     )
     assert "avoid adding a bare year" in guidance
+
+
+def test_orchestrator_prompt_explicitly_routes_current_lookup_to_web():
+    from agents.orchestrator_agent import _orchestrator_prompt_body
+
+    prompt = _orchestrator_prompt_body()
+
+    assert "If the user explicitly asks you to search" in prompt
+    assert "Live market prices" in prompt
+    assert "changing facts are web tasks" in prompt
+    assert "paper discovery" in prompt
+    assert "assistant message explicitly saved under" in prompt
+    assert "/docs path" in prompt
+    assert "fetch/download/save the paper locally" in prompt
+
+
+def test_orchestrator_guardrail_corrects_recent_research_fs_to_web():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+    )
+
+    decision = OrchestratorDecision(
+        route="fs",
+        objective=(
+            "Provide recent and comprehensive overview of language model research "
+            "including key trends and breakthroughs"
+        ),
+    )
+
+    corrected = _guardrail_orchestrator_decision(
+        "cool, now fetch me recent language model research",
+        decision,
+    )
+
+    assert corrected.route == "web"
+    assert corrected.objective == decision.objective
+
+
+def test_orchestrator_guardrail_keeps_local_docs_paper_followup_on_fs():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+    )
+
+    decision = OrchestratorDecision(
+        route="fs",
+        objective="Summarize /docs/papers/arxiv/2605.06548v1.md experiments",
+    )
+
+    corrected = _guardrail_orchestrator_decision(
+        "break down the paper at /docs/papers/arxiv/2605.06548v1.md",
+        decision,
+    )
+
+    assert corrected.route == "fs"
+    assert corrected.objective == decision.objective
+
+
+def test_web_agent_keeps_arxiv_tools_off_for_general_current_lookup():
+    from agents.web_agent import _objective_allows_arxiv_tools
+
+    assert not _objective_allows_arxiv_tools("check today's gold price")
+
+
+def test_web_agent_enables_arxiv_tools_for_structured_arxiv_task():
+    from agents.web_agent import _objective_allows_arxiv_tools
+
+    objective = "\n".join(
+        [
+            "Plan worker task:",
+            "Original user prompt: Read arXiv 2401.12345",
+            "Task objective: Read arXiv 2401.12345",
+            "Task kind: arxiv",
+            "Query: 2401.12345",
+        ]
+    )
+
+    assert _objective_allows_arxiv_tools(objective)
+
+
+def test_web_agent_enables_arxiv_tools_for_explicit_arxiv_source():
+    from agents.web_agent import _objective_allows_arxiv_tools
+
+    assert _objective_allows_arxiv_tools("Search arXiv for recent RAG papers")
+
+
+def test_web_agent_scopes_this_year_arxiv_candidates(monkeypatch):
+    from datetime import datetime, timezone
+
+    from agents import web_agent
+
+    monkeypatch.setattr(
+        web_agent,
+        "_current_research_date",
+        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
+    )
+
+    assert web_agent._time_scoped_arxiv_ids(
+        "find a diffusion language model paper this year",
+        ["2506.13759", "2605.06548", "2508.10875"],
+    ) == ["2605.06548"]
+    assert web_agent._time_scoped_arxiv_ids(
+        "find a diffusion language model paper this year",
+        ["2506.13759", "2508.10875"],
+    ) == ["2506.13759", "2508.10875"]
+
+
+@pytest.mark.asyncio
+async def test_arxiv_selection_current_year_override_drops_stale_uncertainty(
+    monkeypatch,
+):
+    from datetime import datetime, timezone
+
+    from agents import web_agent
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        assert output_name == "ArxivSelectionDecision"
+        return SimpleNamespace(
+            output=web_agent.ArxivSelectionDecision(
+                arxiv_ids=["2508.10875"],
+                reason="Survey result looked better.",
+                uncertainties=["No exact current-year overview paper was found."],
+            )
+        )
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(
+        web_agent,
+        "_current_research_date",
+        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
+    )
+
+    selected_ids, uncertainties = await web_agent._select_arxiv_ids_from_results(
+        objective="find an overview diffusion language model paper this year",
+        query_plan=web_agent.WebQueryPlan(
+            query="diffusion language model papers 2026 overview",
+            preferred_source="arxiv",
+        ),
+        search_results=[
+            {
+                "title": "[2605.06548] Continuous Latent Diffusion Language Model",
+                "url": "https://arxiv.org/abs/2605.06548",
+                "snippet": "Submitted on 7 May 2026.",
+                "position": 1,
+            },
+            {
+                "title": "[2508.10875] A Survey on Diffusion Language Models",
+                "url": "https://arxiv.org/abs/2508.10875",
+                "snippet": "A 2025 survey.",
+                "position": 2,
+            },
+        ],
+        fallback_ids=["2605.06548", "2508.10875"],
+        max_ids=1,
+    )
+
+    assert selected_ids == ["2605.06548"]
+    assert uncertainties == [
+        "Selector returned no valid current-year ID; using first current-year "
+        "candidate because the user asked for this year."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_preflights_query_before_search(monkeypatch):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="live spot gold price today USD per ounce",
+                    as_of="Thursday, 04 June 2026, 19:00 UTC",
+                    search_result_limit=3,
+                    crawl_url_limit=1,
+                    checks=["Matches current live gold spot price objective."],
+                )
+            )
+        if output_name == "WebPreviewDecision":
+            return SimpleNamespace(
+                output=web_agent.WebPreviewDecision(
+                    answer_from_preview=False,
+                    selected_urls=["https://example.com/gold"],
+                    reason="Need one source page for verification.",
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="Gold is quoted at the tested value.",
+                summary="Found a live gold quote.",
+            )
+        )
+
+    async def fake_search(_mcp_url, query, *, max_results=None):
+        events.append(("search", query))
+        assert events[-2] == ("model", "WebQueryPlan")
+        assert max_results == 3
+        return [
+            {
+                "title": "Gold Price Today",
+                "url": "https://example.com/gold",
+                "snippet": "Live spot gold quote.",
+                "position": 1,
+            }
+        ]
+
+    async def fake_crawl(_mcp_url, _rag_service, urls):
+        events.append(("crawl", ",".join(urls)))
+        return "Ingested 1 document(s): example."
+
+    async def fake_rag_search(**_kwargs):
+        events.append(("rag", "search"))
+        return [
+            {
+                "node_id": "node-1",
+                "source": "https://example.com/gold",
+                "title": "Gold Price Today",
+                "text": "Live spot gold quote.",
+            }
+        ]
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_search_results", fake_search)
+    monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fake_crawl)
+    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
+
+    result = await web_agent.run_web_task("check the gold price on today")
+
+    assert "Gold is quoted at the tested value." in result
+    assert events == [
+        ("model", "WebQueryPlan"),
+        ("search", "live spot gold price today USD per ounce"),
+        ("model", "WebPreviewDecision"),
+        ("crawl", "https://example.com/gold"),
+        ("rag", "search"),
+        ("model", "WebAgentResult"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_skips_crawl_when_preview_is_enough(monkeypatch):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="weather Lund Sweden tomorrow",
+                    as_of="Thursday, 04 June 2026, 21:40 UTC",
+                    search_result_limit=3,
+                    crawl_url_limit=0,
+                    checks=[
+                        "Tomorrow means Friday, 05 June 2026 for Lund, Sweden."
+                    ],
+                )
+            )
+        if output_name == "WebPreviewDecision":
+            return SimpleNamespace(
+                output=web_agent.WebPreviewDecision(
+                    answer_from_preview=True,
+                    reason="Snippet includes the forecast for the requested city/date.",
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer=(
+                    "Lund, Sweden is forecast to have passing showers tomorrow."
+                ),
+                summary="Answered from weather search previews.",
+            )
+        )
+
+    async def fake_search(_mcp_url, query, *, max_results=None):
+        events.append(("search", f"{query}:{max_results}"))
+        assert max_results == 3
+        return [
+            {
+                "title": "Lund weather forecast",
+                "url": "https://weather.example/lund",
+                "snippet": (
+                    "Friday, June 5: passing showers with breaks of sun late."
+                ),
+                "position": 1,
+            }
+        ]
+
+    async def fail_crawl(*_args, **_kwargs):
+        raise AssertionError("crawl should be skipped when preview is enough")
+
+    async def fail_rag(*_args, **_kwargs):
+        raise AssertionError("RAG should be skipped when crawl is skipped")
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_search_results", fake_search)
+    monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fail_crawl)
+    monkeypatch.setattr(web_agent, "rag_search_documents", fail_rag)
+
+    result = await web_agent.run_web_task(
+        "then check the weather in Lund, sweden tomorrow"
+    )
+
+    assert "passing showers" in result
+    assert events == [
+        ("model", "WebQueryPlan"),
+        ("search", "weather Lund Sweden tomorrow:3"),
+        ("model", "WebPreviewDecision"),
+        ("model", "WebAgentResult"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_uses_source_domain_queries(monkeypatch):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="weather Lund Sweden tomorrow",
+                    as_of="Thursday, 04 June 2026, 21:40 UTC",
+                    source_domains=["timeanddate.com/weather", "weather.com"],
+                    search_result_limit=5,
+                    crawl_url_limit=0,
+                )
+            )
+        if output_name == "WebPreviewDecision":
+            return SimpleNamespace(
+                output=web_agent.WebPreviewDecision(
+                    answer_from_preview=True,
+                    reason="Weather previews are enough.",
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="Lund weather answered from source-scoped previews.",
+                summary="Answered weather from source-scoped previews.",
+            )
+        )
+
+    async def fake_search(_mcp_url, query, *, max_results=None):
+        events.append(("search", f"{query}:{max_results}"))
+        assert max_results == 3
+        return [
+            {
+                "title": "Lund weather",
+                "url": f"https://example.com/{len(events)}",
+                "snippet": "Forecast preview.",
+                "position": len(events),
+            }
+        ]
+
+    async def fail_crawl(*_args, **_kwargs):
+        raise AssertionError("crawl should be skipped when preview is enough")
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_search_results", fake_search)
+    monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fail_crawl)
+
+    result = await web_agent.run_web_task("check Lund weather tomorrow")
+
+    assert "Lund weather answered" in result
+    assert (
+        "search",
+        "weather Lund Sweden tomorrow:3",
+    ) in events
+    assert (
+        "search",
+        "site:timeanddate.com/weather weather Lund Sweden tomorrow:3",
+    ) in events
+    assert (
+        "search",
+        "site:weather.com weather Lund Sweden tomorrow:3",
+    ) in events
+    assert "site:timeanddate.com/weather weather Lund Sweden tomorrow" in result
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_uses_weather_forecast_mcp_tool(monkeypatch):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="Lund, Sweden - tomorrow's weather forecast (Saturday, 06 June 2026)",
+                    preferred_source="weather",
+                    preferred_tool="weather_forecast",
+                    date="2026-06-06",
+                    search_result_limit=3,
+                    crawl_url_limit=0,
+                    checks=["Tomorrow resolves to 2026-06-06 in Lund."],
+                )
+            )
+        if output_name == "McpApiCallPlan":
+            return SimpleNamespace(
+                output=web_agent.McpApiCallPlan(
+                    tool_name="weather_forecast",
+                    query="Lund, Sweden weather",
+                    location="Lund, Sweden",
+                    date="2026-06-06",
+                    reason="Location was separated from forecast wording.",
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="Lund forecast: partly cloudy, 18 C high.",
+                summary="Answered from Open-Meteo.",
+            )
+        )
+
+    async def fake_weather(_mcp_url, location, *, date=None):
+        events.append(("weather", f"{location}:{date}"))
+        return {
+            "success": True,
+            "query": location,
+            "date": date,
+            "daily": {
+                "date": date,
+                "weather_description": "Partly cloudy",
+                "temperature_max_c": 18,
+            },
+            "source_url": "https://open-meteo.com/en/docs",
+        }
+
+    async def fail_search(*_args, **_kwargs):
+        raise AssertionError("weather API path should not call web search")
+
+    async def fail_crawl(*_args, **_kwargs):
+        raise AssertionError("weather API path should not call crawl")
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "weather_forecast_result", fake_weather)
+    monkeypatch.setattr(web_agent, "web_search_results", fail_search)
+    monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fail_crawl)
+
+    result = await web_agent.run_web_task("check the weather in Lund tomorrow")
+
+    assert "Lund forecast" in result
+    assert ("weather", "Lund, Sweden:2026-06-06") in events
+    assert ("model", "WebPreviewDecision") not in events
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_retries_weather_with_normalized_location(monkeypatch):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="Lund, Sweden - tomorrow's weather forecast (Saturday, 06 June 2026)",
+                    preferred_tool="weather_forecast",
+                    date="2026-06-06",
+                    search_result_limit=3,
+                    crawl_url_limit=0,
+                )
+            )
+        if output_name == "McpApiCallPlan":
+            first_attempt = events.count(("model", "McpApiCallPlan")) == 1
+            return SimpleNamespace(
+                output=web_agent.McpApiCallPlan(
+                    tool_name="weather_forecast",
+                    query=(
+                        "Lund, Sweden - tomorrow's weather forecast "
+                        "(Saturday, 06 June 2026)"
+                        if first_attempt
+                        else "Lund, Sweden"
+                    ),
+                    location=None if first_attempt else "Lund, Sweden",
+                    date="2026-06-06",
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="Retry succeeded for Lund weather.",
+                summary="Weather API retry succeeded.",
+            )
+        )
+
+    async def fake_weather(_mcp_url, location, *, date=None):
+        events.append(("weather", f"{location}:{date}"))
+        if location != "Lund, Sweden":
+            return {
+                "success": False,
+                "query": location,
+                "date": date,
+                "error": "location not found",
+            }
+        return {
+            "success": True,
+            "query": location,
+            "date": date,
+            "daily": {"weather_description": "Partly cloudy"},
+        }
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "weather_forecast_result", fake_weather)
+
+    result = await web_agent.run_web_task("check the weather in Lund tomorrow")
+
+    assert "Retry succeeded" in result
+    assert (
+        "weather",
+        "Lund, Sweden - tomorrow's weather forecast (Saturday, 06 June 2026):2026-06-06",
+    ) in events
+    assert ("weather", "Lund, Sweden:2026-06-06") in events
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_saves_arxiv_paper_to_docs_and_scopes_rag(
+    monkeypatch,
+    tmp_path,
+):
+    from datetime import datetime, timezone
+
+    from rag import Document
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+    paper = {
+        "arxiv_id": "2508.10875",
+        "title": "Diffusion Language Models Survey",
+        "authors": [{"name": "Li"}],
+        "summary": "Survey abstract.",
+        "pdf_url": "https://arxiv.org/pdf/2508.10875",
+        "abs_url": "https://arxiv.org/abs/2508.10875",
+        "published": "2025-08-15",
+        "categories": ["cs.CL"],
+    }
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="diffusion language model survey",
+                    preferred_source="arxiv",
+                    search_result_limit=4,
+                    crawl_url_limit=1,
+                    checks=["Scholarly paper request should use arXiv."],
+                )
+            )
+        if output_name == "ArxivSelectionDecision":
+            return SimpleNamespace(
+                output=web_agent.ArxivSelectionDecision(
+                    arxiv_ids=["2508.10875"],
+                    reason="Survey paper best matches the overview request.",
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="Saved and summarized the survey.",
+                summary="Saved arXiv survey locally.",
+            )
+        )
+
+    async def fake_web_search(_mcp_url, query, *, max_results=None):
+        events.append(("web_search", query))
+        assert max_results == 3
+        return [
+            {
+                "title": "[2112.10752] High-Resolution Image Synthesis",
+                "url": "https://arxiv.org/abs/2112.10752",
+                "snippet": "Latent diffusion models for image synthesis.",
+                "position": 1,
+            },
+            {
+                "title": "[2508.10875] Diffusion Language Models Survey",
+                "url": "https://arxiv.org/abs/2508.10875",
+                "snippet": "A survey on diffusion language models.",
+                "position": 2,
+            }
+        ]
+
+    async def fake_fetch(_mcp_url, ids):
+        events.append(("arxiv_fetch", ",".join(ids)))
+        return [paper]
+
+    async def fake_crawl_docs(_mcp_url, urls):
+        events.append(("crawl_docs", ",".join(urls)))
+        return [
+            Document(
+                doc_id="pdf-doc",
+                source="https://arxiv.org/pdf/2508.10875",
+                title="PDF",
+                text="Section 1 Introduction\nSection 2 Milestones",
+                mime="text/markdown",
+                meta={},
+            )
+        ]
+
+    async def fake_download_pdfs(papers):
+        events.append(("download_pdf", ",".join(p["arxiv_id"] for p in papers)))
+        papers[0]["local_pdf_path"] = "/docs/papers/arxiv/2508.10875.pdf"
+        return ["/docs/papers/arxiv/2508.10875.pdf"]
+
+    async def fake_ingest(docs):
+        events.append(("ingest", str(len(docs))))
+
+    async def fake_rag_search(**kwargs):
+        docs = kwargs.get("docs") or []
+        events.append(("rag_docs", ",".join(docs)))
+        assert docs == ["/docs/papers/arxiv/2508.10875.md"]
+        return [
+            {
+                "node_id": "node-1",
+                "source": docs[0],
+                "title": "Diffusion Language Models Survey",
+                "text": "Section breakdown evidence.",
+            }
+        ]
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_search_results", fake_web_search)
+    monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
+    monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
+    monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
+    monkeypatch.setattr(
+        web_agent,
+        "_current_research_date",
+        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        web_agent,
+        "rag_service",
+        SimpleNamespace(ingest_documents=fake_ingest),
+    )
+    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
+    monkeypatch.setattr(
+        web_agent,
+        "get_runtime_settings",
+        lambda: SimpleNamespace(docs_dir=tmp_path),
+    )
+
+    result = await web_agent.run_web_task(
+        "find a paper on the latest research in diffusion language model"
+    )
+
+    saved = tmp_path / "papers" / "arxiv" / "2508.10875.md"
+    assert saved.exists()
+    content = saved.read_text(encoding="utf-8")
+    assert "Diffusion Language Models Survey" in content
+    assert "Section 2 Milestones" in content
+    assert "Local PDF Path: /docs/papers/arxiv/2508.10875.pdf" in content
+    assert "/docs/papers/arxiv/2508.10875.md" in result
+    assert "/docs/papers/arxiv/2508.10875.pdf" in result
+    assert "Saved local paper path(s): /docs/papers/arxiv/2508.10875.md" in result
+    assert (
+        "web_search",
+        "site:arxiv.org/abs find a paper on the latest research in diffusion language model June 2026",
+    ) in events
+    assert ("model", "ArxivSelectionDecision") in events
+    assert ("arxiv_fetch", "2508.10875") in events
+    assert ("arxiv_fetch", "2112.10752") not in events
+    assert ("download_pdf", "2508.10875") in events
+    assert ("rag_docs", "/docs/papers/arxiv/2508.10875.md") in events
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_uses_arxiv_web_search_for_semantic_discovery(
+    monkeypatch,
+    tmp_path,
+):
+    from datetime import datetime, timezone
+
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+    paper = {
+        "arxiv_id": "2502.09992",
+        "title": "Large Language Diffusion Models",
+        "authors": [{"name": "Nie"}],
+        "summary": "LLaDA abstract.",
+        "pdf_url": "https://arxiv.org/pdf/2502.09992",
+    }
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="diffusion language model",
+                    preferred_source="arxiv",
+                    search_result_limit=6,
+                    crawl_url_limit=1,
+                )
+            )
+        if output_name == "ArxivSelectionDecision":
+            return SimpleNamespace(
+                output=web_agent.ArxivSelectionDecision(
+                    arxiv_ids=["2502.09992"],
+                    reason="Matches diffusion language models.",
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="Selected Large Language Diffusion Models.",
+                summary="Selected fallback arXiv paper.",
+            )
+        )
+
+    async def fake_web_search(_mcp_url, query, *, max_results=None):
+        events.append(("web_search", query))
+        assert max_results == 3
+        return [
+            {
+                "title": "[2502.09992] Large Language Diffusion Models",
+                "url": "https://arxiv.org/abs/2502.09992",
+                "snippet": "Introduces LLaDA.",
+                "position": 1,
+            }
+        ]
+
+    async def fake_fetch(_mcp_url, ids):
+        events.append(("arxiv_fetch", ",".join(ids)))
+        return [paper]
+
+    async def fake_crawl_docs(_mcp_url, _urls):
+        return []
+
+    async def fake_download_pdfs(papers):
+        events.append(("download_pdf", ",".join(p["arxiv_id"] for p in papers)))
+        papers[0]["local_pdf_path"] = "/docs/papers/arxiv/2502.09992.pdf"
+        return ["/docs/papers/arxiv/2502.09992.pdf"]
+
+    async def fake_ingest(_docs):
+        return None
+
+    async def fake_rag_search(**kwargs):
+        docs = kwargs.get("docs") or []
+        events.append(("rag_docs", ",".join(docs)))
+        assert docs == ["/docs/papers/arxiv/2502.09992.md"]
+        return []
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_search_results", fake_web_search)
+    monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
+    monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
+    monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
+    monkeypatch.setattr(
+        web_agent,
+        "_current_research_date",
+        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        web_agent,
+        "rag_service",
+        SimpleNamespace(ingest_documents=fake_ingest),
+    )
+    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
+    monkeypatch.setattr(
+        web_agent,
+        "get_runtime_settings",
+        lambda: SimpleNamespace(docs_dir=tmp_path),
+    )
+
+    result = await web_agent.run_web_task(
+        "just search diffusion language model on arXiv"
+    )
+
+    assert "Selected Large Language Diffusion Models." in result
+    assert "/docs/papers/arxiv/2502.09992.md" in result
+    assert "/docs/papers/arxiv/2502.09992.pdf" in result
+    assert "Saved local paper path(s): /docs/papers/arxiv/2502.09992.md" in result
+    assert (
+        "web_search",
+        "site:arxiv.org/abs just search diffusion language model on arXiv June 2026",
+    ) in events
+    assert (
+        "web_search",
+        "site:arxiv.org/abs just search diffusion language model on arXiv 2026",
+    ) in events
+    assert (
+        "web_search",
+        "site:arxiv.org/abs just search diffusion language model on arXiv 2024 2025 2026",
+    ) in events
+    assert ("web_search", "site:arxiv.org/abs diffusion language model") in events
+    assert ("model", "ArxivSelectionDecision") in events
+    assert ("arxiv_fetch", "2502.09992") in events
+    assert ("download_pdf", "2502.09992") in events
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_saves_fallback_arxiv_record_when_fetch_misses(
+    monkeypatch,
+    tmp_path,
+):
+    from datetime import datetime, timezone
+
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="overview of diffusion language model papers from 2026",
+                    preferred_source="arxiv",
+                    search_result_limit=4,
+                    crawl_url_limit=1,
+                )
+            )
+        if output_name == "ArxivSelectionDecision":
+            return SimpleNamespace(
+                output=web_agent.ArxivSelectionDecision(
+                    arxiv_ids=["2605.06548"],
+                    reason="Most relevant 2026 DLM paper.",
+                    uncertainties=["No survey paper was visible."],
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="Selected Continuous Latent Diffusion Language Model.",
+                summary="Selected current-year DLM paper.",
+            )
+        )
+
+    async def fake_web_search(_mcp_url, query, *, max_results=None):
+        events.append(("web_search", query))
+        return [
+            {
+                "title": "[2605.06548] Continuous Latent Diffusion Language Model",
+                "url": "https://arxiv.org/abs/2605.06548",
+                "snippet": "Submitted on 7 May 2026. Introduces Cola DLM.",
+                "position": 1,
+            }
+        ]
+
+    async def fake_fetch(_mcp_url, ids):
+        events.append(("arxiv_fetch", ",".join(ids)))
+        return []
+
+    async def fake_crawl_docs(_mcp_url, urls):
+        events.append(("crawl_docs", ",".join(urls)))
+        return []
+
+    async def fake_download_pdfs(papers):
+        events.append(("download_pdf", ",".join(p["arxiv_id"] for p in papers)))
+        papers[0]["local_pdf_path"] = "/docs/papers/arxiv/2605.06548.pdf"
+        return ["/docs/papers/arxiv/2605.06548.pdf"]
+
+    async def fake_ingest(docs):
+        events.append(("ingest", str(len(docs))))
+
+    async def fake_rag_search(**kwargs):
+        docs = kwargs.get("docs") or []
+        events.append(("rag_docs", ",".join(docs)))
+        assert docs == ["/docs/papers/arxiv/2605.06548.md"]
+        return []
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_search_results", fake_web_search)
+    monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
+    monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
+    monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
+    monkeypatch.setattr(
+        web_agent,
+        "_current_research_date",
+        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        web_agent,
+        "rag_service",
+        SimpleNamespace(ingest_documents=fake_ingest),
+    )
+    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
+    monkeypatch.setattr(
+        web_agent,
+        "get_runtime_settings",
+        lambda: SimpleNamespace(docs_dir=tmp_path),
+    )
+
+    result = await web_agent.run_web_task(
+        "search an overview of diffusion language model paper this year and fetch the paper locally"
+    )
+
+    saved = tmp_path / "papers" / "arxiv" / "2605.06548.md"
+    assert saved.exists()
+    content = saved.read_text(encoding="utf-8")
+    assert "Continuous Latent Diffusion Language Model" in content
+    assert "https://arxiv.org/abs/2605.06548" in content
+    assert "Local PDF Path: /docs/papers/arxiv/2605.06548.pdf" in content
+    assert "full paper PDF was saved locally" in content
+    assert "/docs/papers/arxiv/2605.06548.md" in result
+    assert "/docs/papers/arxiv/2605.06548.pdf" in result
+    assert "Saved local paper path(s): /docs/papers/arxiv/2605.06548.md" in result
+    assert ("arxiv_fetch", "2605.06548") in events
+    assert ("download_pdf", "2605.06548") in events
+    assert ("rag_docs", "/docs/papers/arxiv/2605.06548.md") in events
 
 
 def test_current_turn_prompt_prioritizes_user_request():
@@ -752,22 +1749,22 @@ async def test_orchestrator_direct_decision_returns_reply():
 async def test_orchestrator_fs_decision_forwards_specialist_answer(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+    from agents.runtime.specialist_result import SpecialistResult
 
     calls: list[str] = []
 
-    async def fake_fs_task(objective: str) -> str:
+    async def fake_fs_task(objective: str) -> SpecialistResult:
         calls.append(objective)
-        return (
-            "Forwardable answer:\n"
-            "The file says hello.\n\n"
-            "Orchestrator notes:\n"
-            "- Summary: Read one file"
+        return SpecialistResult(
+            agent="fs_agent",
+            answer="The file says hello.",
+            summary="Read one file",
         )
 
     async def fake_plan_workflow(*_args, **_kwargs):
         raise AssertionError("fs fast route must not call plan workflow")
 
-    monkeypatch.setattr(orchestrator_agent, "_run_fs_task", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
     monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
 
     response, messages = await _response_and_messages(
@@ -781,25 +1778,159 @@ async def test_orchestrator_fs_decision_forwards_specialist_answer(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_web_decision_forwards_specialist_answer(monkeypatch):
+async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monkeypatch):
     from agents import orchestrator_agent
-    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+    from agents.orchestrator_agent import OrchestratorDecision, run_orchestrator_turn
+    from agents.runtime.specialist_result import SpecialistResult
 
     calls: list[str] = []
 
-    async def fake_web_task(objective: str) -> str:
+    async def fake_decision(*_args, **_kwargs):
+        return SimpleNamespace(
+            output=OrchestratorDecision(
+                route="fs",
+                objective="Provide recent language model research overview",
+            ),
+            all_messages=lambda: [],
+        )
+
+    async def fail_fs_task(_objective: str):
+        raise AssertionError("guardrail should prevent fs_agent from running")
+
+    async def fake_web_task(objective: str) -> SpecialistResult:
         calls.append(objective)
-        return (
-            "Forwardable answer:\n"
-            "The current docs say to use v2.\n\n"
-            "Orchestrator notes:\n"
-            "- Sources: https://example.com/docs"
+        return SpecialistResult(
+            agent="web_agent",
+            answer="Recent language model research from web.",
+            summary="Web research completed",
+        )
+
+    monkeypatch.setattr(
+        orchestrator_agent,
+        "_run_json_orchestrator_decision",
+        fake_decision,
+    )
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fail_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
+
+    result = await run_orchestrator_turn(
+        "cool, now fetch me recent language model research",
+        use_xml=False,
+    )
+
+    assert result.decision.route == "web"
+    assert result.output.reply == "Recent language model research from web."
+    assert calls == ["Provide recent language model research overview"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_recovers_fs_not_found_with_web_for_recent_research(
+    monkeypatch,
+):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+    from agents.runtime.specialist_result import SpecialistResult
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_fs_task(objective: str) -> SpecialistResult:
+        calls.append(("fs", objective))
+        return SpecialistResult(
+            agent="fs_agent",
+            status="not_found",
+            useful=False,
+            recoverable_by_web=True,
+            answer="I could not find local language model research notes.",
+            summary="Local reference unavailable.",
+            uncertainties=["No matching local docs were found."],
+        )
+
+    async def fake_web_task(objective: str) -> SpecialistResult:
+        calls.append(("web", objective))
+        return SpecialistResult(
+            agent="web_agent",
+            answer="Recent language model research recovered from web.",
+            summary="Recovered externally.",
+            sources=["https://arxiv.org/abs/2605.06548"],
+        )
+
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
+
+    response, messages = await _response_and_messages(
+        OrchestratorDecision(
+            route="fs",
+            objective="Provide recent language model research overview",
+        ),
+        [],
+        original_prompt="fetch me recent language model research",
+    )
+
+    assert response.reply == "Recent language model research recovered from web."
+    assert messages == []
+    assert calls[0] == ("fs", "Provide recent language model research overview")
+    assert calls[1][0] == "web"
+    assert "Local filesystem lookup failed" in calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_does_not_recover_explicit_docs_miss_with_web(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+    from agents.runtime.specialist_result import SpecialistResult
+
+    calls: list[str] = []
+
+    async def fake_fs_task(objective: str) -> SpecialistResult:
+        calls.append(objective)
+        return SpecialistResult(
+            agent="fs_agent",
+            status="not_found",
+            useful=False,
+            recoverable_by_web=True,
+            answer="I could not find /docs/missing.md.",
+            summary="Explicit local path unavailable.",
+            uncertainties=["Invalid path hint(s): /docs/missing.md."],
+        )
+
+    async def fail_web_task(_objective: str) -> SpecialistResult:
+        raise AssertionError("explicit local path miss should not recover to web")
+
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fail_web_task)
+
+    response, messages = await _response_and_messages(
+        OrchestratorDecision(route="fs", objective="Read /docs/missing.md"),
+        [],
+        original_prompt="read /docs/missing.md",
+    )
+
+    assert response.reply == "I could not find /docs/missing.md."
+    assert messages == []
+    assert calls == ["Read /docs/missing.md"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_web_decision_forwards_specialist_answer(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+    from agents.runtime.specialist_result import SpecialistResult
+
+    calls: list[str] = []
+
+    async def fake_web_task(objective: str) -> SpecialistResult:
+        calls.append(objective)
+        return SpecialistResult(
+            agent="web_agent",
+            answer="The current docs say to use v2.",
+            summary="Read current docs.",
+            sources=["https://example.com/docs"],
         )
 
     async def fake_plan_workflow(*_args, **_kwargs):
         raise AssertionError("web fast route must not call plan workflow")
 
-    monkeypatch.setattr(orchestrator_agent, "_run_web_task", fake_web_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
     monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
 
     response, messages = await _response_and_messages(
