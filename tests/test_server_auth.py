@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 def _load_server(monkeypatch, tmp_path):
     monkeypatch.setenv("LOCALAGENT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("LOCALAGENT_DB_PATH", str(tmp_path / "state" / "test.sqlite3"))
+    monkeypatch.setenv("LOCALAGENT_DOCS_DIR", str(tmp_path / "docs"))
     monkeypatch.setenv("LOCALAGENT_ADMIN_USERNAME", "admin")
     monkeypatch.setenv("LOCALAGENT_ADMIN_PASSWORD", "admin-password")
     monkeypatch.setenv("LOCALAGENT_COOKIE_SECURE", "false")
@@ -760,6 +761,43 @@ def test_image_upload_context_tells_agent_to_use_read_image(monkeypatch, tmp_pat
         in captured["prompt"]
     )
     assert "call read_image for supported image paths" in captured["prompt"]
+
+
+def test_delete_chat_session_removes_upload_directory(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "upload cleanup"},
+        )
+        chat_id = create_chat.json()["session"]["id"]
+        upload = client.post(
+            f"/api/chat/sessions/{chat_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files={"file": ("notes.txt", b"temporary", "text/plain")},
+        )
+        assert upload.status_code == 200
+
+        upload_dir = server.WEB_UPLOAD_ROOT / "1" / chat_id
+        assert upload_dir.is_dir()
+
+        response = client.delete(
+            f"/api/chat/sessions/{chat_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert response.status_code == 200
+        assert not upload_dir.exists()
+        assert not upload_dir.parent.exists()
 
 
 def test_web_agent_session_uses_per_user_memory_dir(monkeypatch, tmp_path):

@@ -26,6 +26,7 @@ SourceKind = Literal[
 class WebSourceDecision(BaseModel):
     kind: SourceKind
     target: str = ""
+    include_pdf: bool = False
     reason: str = ""
 
     @property
@@ -42,6 +43,7 @@ class WebSourceDecision(BaseModel):
 class WebQueryPlan(BaseModel):
     query: str
     retrieval_target: str | None = None
+    download_pdf: bool = False
     objective: str | None = None
     as_of: str | None = None
     preferred_source: str = "web"

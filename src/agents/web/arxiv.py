@@ -78,6 +78,7 @@ class ArxivRuntime:
         *,
         max_papers: int | None = None,
         search_results: list[dict] | None = None,
+        download_pdf: bool = False,
     ) -> tuple[str, list[str], list[str], list[dict]]:
         selected_ids = dedupe(arxiv_ids)[
             : max(1, max_papers or self.default_fetch_limit)
@@ -97,7 +98,6 @@ class ArxivRuntime:
         if not papers:
             papers = _fallback_papers(selected_ids, search_results)
 
-        pdf_paths = await self.download_pdfs(papers)
         abstract_docs = self.papers_to_documents(papers)
         html_urls = [
             f"https://arxiv.org/html/{versionless_id(str(paper.get('arxiv_id') or '').strip())}"
@@ -132,6 +132,11 @@ class ArxivRuntime:
                     1,
                 )
 
+        pdf_paths = (
+            await self.download_pdfs(papers)
+            if download_pdf or not full_docs
+            else []
+        )
         docs_to_ingest = [*abstract_docs, *full_docs]
         if docs_to_ingest:
             await self.rag_service.ingest_documents(docs_to_ingest)
@@ -289,7 +294,8 @@ class ArxivRuntime:
                 1,
             )
             receipt, markdown_paths, pdf_paths, papers = await self.fetch_to_local(
-                selected_ids
+                selected_ids,
+                download_pdf=bool(query_plan and query_plan.download_pdf),
             )
             evidence = (
                 await self.rag_search(question=objective, docs=markdown_paths)
@@ -361,6 +367,7 @@ class ArxivRuntime:
                     selected_ids,
                     max_papers=fetch_budget,
                     search_results=fallback_results,
+                    download_pdf=query_plan.download_pdf,
                 )
             )
         evidence = (

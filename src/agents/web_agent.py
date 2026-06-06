@@ -497,6 +497,7 @@ async def _build_web_query_plan(objective: str) -> WebQueryPlan:
         plan.checks.append("Planner returned an empty query; using objective text.")
     plan.as_of = _now()
     plan.preferred_source = source_decision.method
+    plan.download_pdf = source_decision.include_pdf
     plan.preferred_tool = (
         source_decision.method
         if source_decision.method
@@ -746,7 +747,8 @@ async def run_web_task_result(objective: str) -> SpecialistResult:
     if urls:
         output = await _run_url_crawl_task(objective, urls)
     elif _objective_allows_arxiv_tools(objective):
-        output = await _run_arxiv_task(objective)
+        query_plan = await _build_web_query_plan(objective)
+        output = await _run_arxiv_task(objective, query_plan=query_plan)
     else:
         query_plan = await _build_web_query_plan(objective)
         if _preferred_api_tool(query_plan):

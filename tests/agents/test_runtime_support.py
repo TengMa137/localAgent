@@ -1306,9 +1306,9 @@ async def test_run_web_task_saves_arxiv_paper_to_docs_and_scopes_rag(
         events.append(("crawl_docs", ",".join(urls)))
         return [
             Document(
-                doc_id="pdf-doc",
-                source="https://arxiv.org/pdf/2508.10875",
-                title="PDF",
+                doc_id="html-doc",
+                source="https://arxiv.org/html/2508.10875",
+                title="HTML",
                 text="Section 1 Introduction\nSection 2 Milestones",
                 mime="text/markdown",
                 meta={},
@@ -1371,9 +1371,10 @@ async def test_run_web_task_saves_arxiv_paper_to_docs_and_scopes_rag(
     content = saved.read_text(encoding="utf-8")
     assert "Diffusion Language Models Survey" in content
     assert "Section 2 Milestones" in content
-    assert "Local PDF Path: /docs/papers/arxiv/2508.10875.pdf" in content
+    assert "Local PDF Path: not saved" in content
+    assert "Full Text Source: https://arxiv.org/html/2508.10875" in content
     assert "/docs/papers/arxiv/2508.10875.md" in result
-    assert "/docs/papers/arxiv/2508.10875.pdf" in result
+    assert "/docs/papers/arxiv/2508.10875.pdf" not in result
     assert "Saved local paper path(s): /docs/papers/arxiv/2508.10875.md" in result
     assert (
         "web_search",
@@ -1382,8 +1383,102 @@ async def test_run_web_task_saves_arxiv_paper_to_docs_and_scopes_rag(
     assert ("model", "ArxivSelectionDecision") in events
     assert ("arxiv_fetch", "2508.10875") in events
     assert ("arxiv_fetch", "2112.10752") not in events
-    assert ("download_pdf", "2508.10875") in events
+    assert ("download_pdf", "2508.10875") not in events
     assert ("rag_docs", "/docs/papers/arxiv/2508.10875.md") in events
+
+
+@pytest.mark.asyncio
+async def test_arxiv_fetch_downloads_pdf_when_explicitly_requested(
+    monkeypatch,
+    tmp_path,
+):
+    from rag import Document
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+    paper = {
+        "arxiv_id": "2508.10875",
+        "title": "Diffusion Language Models Survey",
+        "summary": "Survey abstract.",
+        "pdf_url": "https://arxiv.org/pdf/2508.10875",
+    }
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="scholarly",
+                    target="diffusion language model survey",
+                    include_pdf=True,
+                )
+            )
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="diffusion language model survey",
+                    preferred_source="arxiv",
+                    crawl_url_limit=1,
+                )
+            )
+        return SimpleNamespace(
+            output=web_agent.WebAgentResult(
+                answer="Saved the paper and original PDF.",
+                summary="Saved both paper artifacts.",
+            )
+        )
+
+    async def fake_fetch(_mcp_url, _ids):
+        return [paper]
+
+    async def fake_crawl_docs(_mcp_url, _urls):
+        return [
+            Document(
+                doc_id="html-doc",
+                source="https://arxiv.org/html/2508.10875",
+                title="HTML",
+                text="Full paper text.",
+                mime="text/markdown",
+                meta={},
+            )
+        ]
+
+    async def fake_download_pdfs(papers):
+        events.append(("download_pdf", papers[0]["arxiv_id"]))
+        papers[0]["local_pdf_path"] = "/docs/papers/arxiv/2508.10875.pdf"
+        return ["/docs/papers/arxiv/2508.10875.pdf"]
+
+    async def fake_ingest(_docs):
+        return None
+
+    async def fake_rag_search(**_kwargs):
+        return []
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
+    monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
+    monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
+    monkeypatch.setattr(
+        web_agent,
+        "rag_service",
+        SimpleNamespace(ingest_documents=fake_ingest),
+    )
+    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
+    monkeypatch.setattr(
+        web_agent,
+        "get_runtime_settings",
+        lambda: SimpleNamespace(docs_dir=tmp_path),
+    )
+
+    result = await web_agent.run_web_task(
+        "fetch arXiv:2508.10875 locally and include the original PDF"
+    )
+
+    assert ("download_pdf", "2508.10875") in events
+    assert "/docs/papers/arxiv/2508.10875.pdf" in result
 
 
 @pytest.mark.asyncio

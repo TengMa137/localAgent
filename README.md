@@ -44,8 +44,9 @@ Current implementation highlights:
 - Dedicated MCP APIs handle weather through Open-Meteo, definitions through
   Wikipedia, and recent news through GDELT before generic web search.
 - arXiv discovery uses web search, metadata fetch remains ID-based, and fetched
-  papers are persisted under `user_docs/papers/arxiv/` as Markdown plus the original
-  PDF when download succeeds.
+  papers are persisted under `user_docs/papers/arxiv/` as full-text Markdown.
+  The original PDF is saved only when HTML extraction fails or the user explicitly
+  requests the PDF.
 - Planned workers produce typed evidence for synthesis; diagnostics stay in trace events
   and per-turn task logs.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
@@ -240,7 +241,8 @@ By default the app is published at `127.0.0.1:8088` and the MCP server is not
 published to the host. (inspect: lsof -nP -iTCP:8088 -sTCP:LISTEN)
 
 `user_docs/` is mounted writable into the agent containers because fetched arXiv
-Markdown and PDF files are saved beneath `/data/docs/papers/arxiv/`. The MCP
+Markdown files and optional PDF fallbacks are saved beneath
+`/data/docs/papers/arxiv/`. The MCP
 container remains read-only and isolated from the document mount.
 
 Use one of these commands:

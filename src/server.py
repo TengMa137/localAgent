@@ -1111,10 +1111,6 @@ def delete_chat_session(
 ) -> dict[str, bool]:
     with db() as conn:
         _load_chat_for_user(conn, session_id, user["id"])
-        upload_rows = conn.execute(
-            "SELECT stored_name FROM chat_files WHERE session_id = ? AND user_id = ?",
-            (session_id, user["id"]),
-        ).fetchall()
         conn.execute(
             "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
             (session_id, user["id"]),
@@ -1122,8 +1118,10 @@ def delete_chat_session(
         _audit(conn, user["id"], "chat_delete", {"session_id": session_id})
 
     upload_dir = WEB_UPLOAD_ROOT / str(user["id"]) / session_id
-    if upload_rows and upload_dir.exists():
-        shutil.rmtree(upload_dir, ignore_errors=True)
+    shutil.rmtree(upload_dir, ignore_errors=True)
+    user_upload_dir = upload_dir.parent
+    if user_upload_dir.exists() and not any(user_upload_dir.iterdir()):
+        user_upload_dir.rmdir()
     return {"ok": True}
 
 

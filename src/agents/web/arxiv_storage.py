@@ -121,6 +121,9 @@ def paper_markdown(paper: dict, full_text_doc: Document | None) -> str:
     abstract = str(paper.get("summary") or "").strip()
     abs_url = str(paper.get("abs_url") or f"https://arxiv.org/abs/{arxiv_id}").strip()
     full_text = (full_text_doc.text if full_text_doc is not None else "").strip()
+    full_text_source = (
+        full_text_doc.source if full_text_doc is not None else "not available"
+    )
     local_pdf_error = str(paper.get("local_pdf_error") or "").strip()
 
     sections = [
@@ -137,6 +140,7 @@ def paper_markdown(paper: dict, full_text_doc: Document | None) -> str:
         f"- Abstract URL: {abs_url}",
         f"- PDF URL: {paper_pdf_url(paper) or 'unknown'}",
         f"- Local PDF Path: {str(paper.get('local_pdf_path') or '').strip() or 'not saved'}",
+        f"- Full Text Source: {full_text_source}",
         "## Abstract",
         abstract or "No abstract returned by arXiv fetch.",
     ]

@@ -4,6 +4,8 @@ WEB_SOURCE_SYSTEM_PROMPT = """
 Classify the evidence type for a request already routed to web. Return:
 - kind: exactly one of open_web, scholarly, weather, encyclopedia, recent_news.
 - target: the smallest useful retrieval subject, without instruction words.
+- include_pdf: false by default. Set true only when the user explicitly
+  requests the original PDF/PDF file.
 - reason: one concise semantic justification.
 
 Preserve user-provided disambiguators that affect lookup accuracy, including
@@ -33,6 +35,8 @@ Boundaries and examples:
 - "Find a diffusion language model paper" -> scholarly.
 
 Never classify only from topic words. Classify the evidence the user requested.
+Do not request a PDF merely because the user says fetch, save, or download a
+paper; full-text Markdown is the default local research artifact.
 """
 
 
