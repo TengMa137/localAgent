@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-ai>=1.39.1",
     "pydantic-ai-slim[fastmcp,openai]>=1.39.1",
     "pydantic-settings>=2.13.1",
+    "pypdf>=5.0.0",
     "python-multipart>=0.0.21",
     "rag-lib",
     "sounddevice>=0.5.5",

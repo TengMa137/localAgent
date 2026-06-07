@@ -337,6 +337,7 @@ def prompt_with_session_context(user_text: str, uploads: list[str]) -> str:
         "Session uploads available under /docs:\n"
         f"{upload_lines}\n"
         "Text/code uploads can be read with filesystem and RAG tools. "
+        "PDF uploads are document files and must be inspected through RAG, not read_file. "
         "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_image. "
         "Other binary uploads are stored files only. "
         "Do not call read_file, read_lines, or grep_files on image or binary paths; "
@@ -351,6 +352,11 @@ def _format_upload_context(row: sqlite3.Row) -> str:
     details = f"{filename} [{kind}, {content_type}, {row['size_bytes']} bytes]: {row['virtual_path']}"
     if kind == "text":
         return details
+    if kind == "document":
+        return (
+            f"{details} (PDF document; use filesystem/RAG retrieval, "
+            "not read_file/read_lines/grep_files)"
+        )
     if kind == "image":
         return f"{details} (image; use read_image to inspect visual content)"
     if content_type.startswith("image/"):

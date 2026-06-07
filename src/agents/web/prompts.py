@@ -35,6 +35,9 @@ Boundaries and examples:
 - "Find a diffusion language model paper" -> scholarly.
 
 Never classify only from topic words. Classify the evidence the user requested.
+Paper requests arrive here only after explicit external intent or an unsuccessful
+local filesystem lookup. Complete the external scholarly retrieval; do not send
+the task back to local discovery.
 Do not request a PDF merely because the user says fetch, save, or download a
 paper; full-text Markdown is the default local research artifact.
 """
@@ -48,10 +51,10 @@ Return a concise query aligned with the user's objective and the injected
 current-time context. Put verification notes in checks so the runtime can log
 why the query is aligned before executing it.
 
-Mirror the selected method in preferred_source. For weather_forecast,
-wiki_summary, and news_search also set preferred_tool to the same exact name,
-leave source_domains empty, and set crawl_url_limit=0. For web and arxiv set
-preferred_tool=null.
+Mirror the selected method in preferred_source. For weather_forecast and
+wiki_summary also set preferred_tool to the same exact name, leave
+source_domains empty, and set crawl_url_limit=0. For web and arxiv set
+preferred_tool=null. Recent news uses web search directly.
 
 Set search_result_limit to the smallest useful number. Use 2-3 for simple
 facts, 4-6 for normal lookups, and up to 10 only for broad comparisons or
@@ -120,28 +123,17 @@ fetch budget.
 """
 
 
-MCP_API_CALL_SYSTEM_PROMPT = """
-You normalize arguments for a dedicated MCP API tool that has already been
-selected. Do not change the objective or choose another tool.
-
-- weather_forecast: location is only the geocodable place name, optionally
-  region/country. Remove weather/date wording. Resolve relative dates to exact
-  YYYY-MM-DD.
-- wiki_summary: query is only the encyclopedia topic. Set language only when
-  requested or necessary.
-- news_search: query is the event/topic whose recent coverage is requested.
-  Use a compact timespan such as 24h, 1day, 1week, or 1month when useful.
-
-Use checks to explain alignment with the objective and as-of time.
-"""
-
-
 WEB_ANSWER_SYSTEM_PROMPT = """
 You synthesize a concise user-facing answer from a completed web retrieval
 package. Do not request more browsing or invent searches. Use only the provided
 query preflight, structured API data, snippets, crawled URLs, and evidence.
 
-Put the practical result in answer. Preserve useful source URLs and search
-queries. Clearly state uncertainty when the available source does not support
-the requested claim.
+Return only the final answer as a text string. Lightweight Markdown is allowed.
+Never output internal reasoning, self-review, instruction checks, or lines
+beginning with "Wait".
+Do not return JSON, XML, field names, or a schema. Python records queries, URLs,
+findings, and uncertainties from the executed retrieval.
+
+Clearly state uncertainty when the available evidence does not support the
+requested claim.
 """

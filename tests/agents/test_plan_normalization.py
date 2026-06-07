@@ -6,12 +6,25 @@ from agents.plan_agent import (
     PlanOutput,
     PlannerInput,
     SessionState,
+    _collection_findings_report,
     _format_plan_handoff,
     _run_research_loop,
     _normalize_plan,
 )
-from agents.runtime.query_policy import TaskKind, extract_urls, infer_task_kind
+from agents.runtime.query_policy import (
+    TaskKind,
+    ambiguously_references_local_artifact,
+    explicitly_requests_local_source,
+    explicitly_requests_web,
+    extract_urls,
+    infer_task_kind,
+    likely_requires_current_info,
+    requests_collection_plan,
+    requests_file_operation,
+    requests_local_discovery,
+)
 from agents.worker import TaskSpec
+from agents.runtime.turn_context import EvidenceItem
 
 
 def test_query_policy_extracts_urls():
@@ -20,6 +33,262 @@ def test_query_policy_extracts_urls():
 
 def test_query_policy_has_no_default_retrieval_kind():
     assert infer_task_kind("Explain recursion") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ok, now explain the architecture", False),
+        ("describe the current implementation", False),
+        ("read the current file", False),
+        ("who is the current president?", True),
+        ("what is the current package version?", True),
+        ("show recent language model research", True),
+        ("check tomorrow's weather", True),
+        ("explain rate limiting", False),
+        ("design a pricing page", False),
+        ("implement live reload", False),
+        ("schedule background jobs", False),
+        ("score model predictions", False),
+        ("check the exchange rate", True),
+        ("gold price", True),
+        ("who currently leads the agency?", True),
+    ],
+)
+def test_query_policy_current_info_signals_are_conservative(text, expected):
+    assert likely_requires_current_info(text) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("search the web for agent patterns", True),
+        ("look up online examples", True),
+        ("verify on the internet", True),
+        ("download the paper", True),
+        ("run a web app locally", False),
+        ("search local files", False),
+        ("check agentsystem.md", False),
+    ],
+)
+def test_query_policy_explicit_web_phrases_name_the_source(text, expected):
+    assert explicitly_requests_web(text) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("check agentsystem.md", True),
+        ("summarize AGENT_SYSTEM.md", True),
+        ("based on config.yaml, explain the setup", True),
+        ("mention agentsystem.md in the answer", False),
+    ],
+)
+def test_query_policy_local_file_actions_require_an_operation(text, expected):
+    assert requests_file_operation(text) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("summarize the paper", True),
+        ("check my recent notes", True),
+        ("inspect the saved document", True),
+        ("find it in the same folder", True),
+        ("find the latest paper", True),
+        ("search the web for the paper", False),
+        ("explain how files work in Python", False),
+    ],
+)
+def test_query_policy_local_discovery_is_narrow_and_local_first(text, expected):
+    assert requests_local_discovery(text) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("now summarize all papers locally in parallel", True),
+        ("I mean all papers under docs/papers/arxiv", True),
+        (
+            "you should first check all papers locally then read and summarize "
+            "them in parallel",
+            True,
+        ),
+        ("summarize one local paper", False),
+        ("list all files under docs", False),
+        ("find papers about world models", False),
+    ],
+)
+def test_query_policy_collection_plan_is_narrow(text, expected):
+    assert requests_collection_plan(text) is expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "check local papers regarding world models",
+        "search local files for agent routing",
+        "review my architecture notes",
+        "inspect the downloaded document",
+    ],
+)
+def test_query_policy_explicit_local_source_overrides_webish_words(text):
+    assert explicitly_requests_local_source(text)
+    assert requests_local_discovery(text)
+    assert infer_task_kind(text) == TaskKind.LOCAL_RAG
+
+
+def test_query_policy_referential_artifact_is_ambiguous_not_explicit_local():
+    text = "summarize the paper and explain its architecture"
+
+    assert ambiguously_references_local_artifact(text)
+    assert not explicitly_requests_local_source(text)
+
+
+def test_query_policy_now_does_not_force_web_but_explicit_web_does():
+    assert infer_task_kind("ok, now explain this design") is None
+    assert infer_task_kind("search the web for this design") == TaskKind.WEB_SEARCH
+
+
+def test_query_policy_resolved_local_files_win_over_external_identifiers():
+    assert (
+        infer_task_kind(
+            "summarize arXiv 2605.00080",
+            matched_files=["/docs/papers/2605.00080.md"],
+        )
+        == TaskKind.LOCAL_RAG
+    )
+
+
+def test_query_policy_local_reference_wins_over_incidental_recent_word():
+    assert infer_task_kind("check my recent notes") == TaskKind.LOCAL_RAG
+    assert infer_task_kind("summarize the paper") == TaskKind.LOCAL_RAG
+    assert infer_task_kind("find the latest paper") == TaskKind.LOCAL_RAG
+
+
+def test_query_policy_explicit_url_wins_over_referential_artifact():
+    assert (
+        infer_task_kind("summarize the paper at https://example.com/paper")
+        == TaskKind.URL_CRAWL
+    )
+
+
+def test_plan_file_resolver_expands_explicit_collection_directory():
+    resolver = PlanFileResolver(
+        [
+            "/docs/papers/arxiv/a.md",
+            "/docs/papers/arxiv/b.pdf",
+            "/docs/papers/arxiv/.DS_Store",
+            "/docs/papers/other.md",
+            "/docs/notes.txt",
+        ]
+    )
+
+    assert resolver.resolve_collection(
+        "summarize all papers under docs/papers/arxiv",
+        matched_files=[],
+    ) == [
+        "/docs/papers/arxiv/a.md",
+        "/docs/papers/arxiv/b.pdf",
+    ]
+
+
+def test_plan_file_resolver_ignores_hidden_non_documents_in_paper_collection():
+    resolver = PlanFileResolver(
+        [
+            "/docs/papers/.DS_Store",
+            "/docs/papers/arxiv/paper.md",
+            "/docs/papers/arxiv/cache.bin",
+        ]
+    )
+
+    assert resolver.resolve_collection(
+        "summarize all papers locally in parallel",
+        matched_files=[],
+    ) == ["/docs/papers/arxiv/paper.md"]
+
+
+def test_normalize_plan_batches_every_collection_file():
+    files = [
+        "/docs/papers/arxiv/a.md",
+        "/docs/papers/arxiv/b.md",
+        "/docs/papers/arxiv/c.pdf",
+        "/docs/papers/arxiv/d.md",
+    ]
+    resolver = PlanFileResolver(files)
+    from agents.plan_agent import PlanNormalizer
+
+    normalized = PlanNormalizer(
+        objective="summarize all papers locally in parallel",
+        matched_files=[],
+        as_of="Sunday, 7 June 2026, 10:00 UTC",
+        resolver=resolver,
+        max_tasks=3,
+    ).normalize(PlanOutput(initial_answer="There is only one paper."))
+
+    assert len(normalized.tasks) == 3
+    assert {
+        path
+        for task in normalized.tasks
+        for path in task.relevant_files
+    } == set(files)
+    assert all(task.kind == TaskKind.LOCAL_RAG for task in normalized.tasks)
+    assert all("Do not omit assigned artifacts" in task.objective for task in normalized.tasks)
+    assert normalized.initial_answer is None
+
+
+def test_normalize_plan_groups_same_stem_markdown_and_pdf_as_one_paper():
+    files = [
+        "/docs/papers/arxiv/a.md",
+        "/docs/papers/arxiv/a.pdf",
+        "/docs/papers/arxiv/b.md",
+    ]
+    resolver = PlanFileResolver(files)
+    from agents.plan_agent import PlanNormalizer
+
+    normalized = PlanNormalizer(
+        objective="summarize all papers under docs/papers/arxiv in parallel",
+        matched_files=[],
+        as_of="Sunday, 7 June 2026, 10:00 UTC",
+        resolver=resolver,
+        max_tasks=3,
+    ).normalize(PlanOutput(tasks=[]))
+
+    assert len(normalized.tasks) == 2
+    assert normalized.tasks[0].relevant_files == files[:2]
+    assert normalized.tasks[1].relevant_files == files[2:]
+
+
+def test_collection_findings_report_forwards_grounded_worker_answers():
+    state = SessionState(
+        user_query="summarize all papers",
+        evidence_items=[
+            EvidenceItem(
+                task_id="1",
+                objective="batch one",
+                agent="fs_agent",
+                answer="Paper A: grounded summary.",
+                useful=True,
+                sources=["/docs/papers/a.md"],
+            ),
+            EvidenceItem(
+                task_id="2",
+                objective="batch two",
+                agent="fs_agent",
+                answer="Paper B: grounded summary.",
+                useful=True,
+                sources=["/docs/papers/b.pdf"],
+            ),
+        ],
+        uncertainties=["Paper B had no abstract metadata."],
+    )
+
+    report = _collection_findings_report(state)
+
+    assert "Paper A: grounded summary." in report
+    assert "Paper B: grounded summary." in report
+    assert "Paper B had no abstract metadata." in report
+    assert "internal reasoning" not in report
 
 
 def test_normalize_plan_forces_web_search_current_info():

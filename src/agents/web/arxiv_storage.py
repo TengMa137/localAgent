@@ -125,6 +125,10 @@ def paper_markdown(paper: dict, full_text_doc: Document | None) -> str:
         full_text_doc.source if full_text_doc is not None else "not available"
     )
     local_pdf_error = str(paper.get("local_pdf_error") or "").strip()
+    local_pdf_ingest_error = str(
+        paper.get("local_pdf_ingest_error") or ""
+    ).strip()
+    local_pdf_ingested = bool(paper.get("local_pdf_ingested"))
 
     sections = [
         f"# {title}",
@@ -140,12 +144,15 @@ def paper_markdown(paper: dict, full_text_doc: Document | None) -> str:
         f"- Abstract URL: {abs_url}",
         f"- PDF URL: {paper_pdf_url(paper) or 'unknown'}",
         f"- Local PDF Path: {str(paper.get('local_pdf_path') or '').strip() or 'not saved'}",
+        f"- Local PDF RAG Indexed: {'yes' if local_pdf_ingested else 'no'}",
         f"- Full Text Source: {full_text_source}",
         "## Abstract",
         abstract or "No abstract returned by arXiv fetch.",
     ]
     if local_pdf_error:
         sections.extend(["## PDF Fetch Status", local_pdf_error])
+    if local_pdf_ingest_error:
+        sections.extend(["## PDF Ingestion Status", local_pdf_ingest_error])
     sections.extend(
         [
             "## Full Text Extract",

@@ -211,6 +211,62 @@ def _collect_path_name_matches(
                 return
 
 
+def _search_terms(
+    *,
+    query: str | None,
+    queries: list[str] | None,
+) -> tuple[list[str], bool]:
+    """Validate one regex query or several literal search terms."""
+    single = (query or "").strip()
+    multiple = list(
+        dict.fromkeys(term.strip() for term in (queries or []) if term.strip())
+    )
+    if single and multiple:
+        raise ValueError("Use either query or queries, not both")
+    if multiple:
+        return multiple, True
+    if single:
+        return [single], False
+    raise ValueError("query or queries must not be empty")
+
+
+def _collect_path_matches_for_term(
+    *,
+    term: str,
+    path: str,
+    include_directories: bool,
+    include_hidden: bool,
+    filesystem_validator: FilesystemValidator,
+) -> set[str]:
+    """Collect path/name matches for one literal term within a scope."""
+    matches: set[str] = set()
+    if path in ("/", ".", ""):
+        roots = filesystem_validator.readable_roots
+    else:
+        roots = [path]
+
+    for root_virtual in roots:
+        mount_point, resolved, _ = filesystem_validator.get_path_config(
+            root_virtual,
+            op="read",
+        )
+        mount_root = filesystem_validator.get_mount_root(mount_point)
+        if not resolved.exists():
+            continue
+        _collect_path_name_matches(
+            resolved,
+            term,
+            mount_point,
+            mount_root,
+            matches,
+            filesystem_validator,
+            include_directories=include_directories,
+            include_hidden=include_hidden,
+            max_results=None,
+        )
+    return matches
+
+
 def _directory_entry(
     path: Path,
     *,
@@ -787,62 +843,43 @@ def make_filesystem_toolset(
         description=(
             "Find readable files by filename or virtual path substring. "
             f"{read_path_hint} "
-            "Use this for path/name lookup such as 'agentsystem.md'. This does "
-            "not search file contents; use grep_files for content search."
+            "Use query for one literal substring, or queries for several "
+            "literal terms with match_mode='any' or 'all'. Use this for "
+            "path/name lookup such as 'agentsystem.md'. This does not search "
+            "file contents; use grep_files for content search."
         )
     )
     async def find_paths(
         ctx: RunContext,
-        query: str,
+        query: str | None = None,
+        queries: list[str] | None = None,
+        match_mode: Literal["any", "all"] = "any",
         path: str = "/",
         include_directories: bool = False,
         include_hidden: bool = True,
         max_results: int | None = 50,
     ) -> ListFilesResult:
-        """Find files or directories by virtual path/name substring."""
-        if not query.strip():
-            raise ValueError("query must not be empty")
+        """Find files or directories by one or more virtual path/name substrings."""
+        terms, _multiple = _search_terms(query=query, queries=queries)
         if max_results is not None and max_results < 1:
             raise ValueError("max_results must be >= 1")
 
-        matching_paths: set[str] = set()
-        if path in ("/", ".", ""):
-            for root_virtual in filesystem_validator.readable_roots:
-                mount_point, resolved, _ = filesystem_validator.get_path_config(
-                    root_virtual, op="read"
-                )
-                mount_root = filesystem_validator.get_mount_root(mount_point)
-                if not resolved.exists():
-                    continue
-                _collect_path_name_matches(
-                    resolved,
-                    query,
-                    mount_point,
-                    mount_root,
-                    matching_paths,
-                    filesystem_validator,
-                    include_directories=include_directories,
-                    include_hidden=include_hidden,
-                    max_results=max_results,
-                )
-                if max_results is not None and len(matching_paths) >= max_results:
-                    break
-        else:
-            mount_point, resolved, _ = filesystem_validator.get_path_config(
-                path, op="read"
-            )
-            mount_root = filesystem_validator.get_mount_root(mount_point)
-            _collect_path_name_matches(
-                resolved,
-                query,
-                mount_point,
-                mount_root,
-                matching_paths,
-                filesystem_validator,
+        term_matches = [
+            _collect_path_matches_for_term(
+                term=term,
+                path=path,
                 include_directories=include_directories,
                 include_hidden=include_hidden,
-                max_results=max_results,
+                filesystem_validator=filesystem_validator,
             )
+            for term in terms
+        ]
+        if match_mode == "all":
+            matching_paths = (
+                set.intersection(*term_matches) if term_matches else set()
+            )
+        else:
+            matching_paths = set().union(*term_matches)
 
         files = sorted(matching_paths)
         if max_results is not None:
@@ -853,27 +890,34 @@ def make_filesystem_toolset(
         description=(
             "Search readable text files for a regular expression. "
             f"{read_path_hint} "
-            "Use file_pattern to limit files, e.g. '**/*.py'. This searches "
-            "file contents only, not filenames; use find_paths or list_files "
-            "for path/name lookup."
+            "Use query for one regex, or queries for several literal terms "
+            "with match_mode='any' or 'all'. For match_mode='all', every term "
+            "must occur somewhere in the same file. Use file_pattern to limit "
+            "files, e.g. '**/*.py'. This searches file contents only, not "
+            "filenames; use find_paths or list_files for path/name lookup."
         )
     )
     async def grep_files(
         ctx: RunContext,
-        query: str,
+        query: str | None = None,
+        queries: list[str] | None = None,
+        match_mode: Literal["any", "all"] = "any",
         path: str = "/",
         file_pattern: str = "**/*",
         case_sensitive: bool = True,
         max_matches: int = 100,
     ) -> GrepResult:
-        """Search text files for a regex pattern within validator boundaries."""
-        if not query:
-            raise ValueError("query must not be empty")
+        """Search text files for one regex or several literal terms."""
+        terms, literal_terms = _search_terms(query=query, queries=queries)
         if max_matches < 1:
             raise ValueError(f"max_matches must be >= 1, got {max_matches}")
 
+        flags = 0 if case_sensitive else re.IGNORECASE
         try:
-            regex = re.compile(query, 0 if case_sensitive else re.IGNORECASE)
+            regexes = [
+                re.compile(re.escape(term) if literal_terms else term, flags)
+                for term in terms
+            ]
         except re.error as e:
             raise ValueError(f"Invalid regular expression: {e}") from e
 
@@ -923,18 +967,32 @@ def make_filesystem_toolset(
                 continue
 
             files_searched += 1
+            file_matches: list[GrepMatch] = []
+            matched_terms = [False] * len(regexes)
             for line_number, line in enumerate(text.splitlines(), start=1):
-                match = regex.search(line)
-                if match is None:
+                line_matches = [regex.search(line) for regex in regexes]
+                present = [
+                    match for match in line_matches if match is not None
+                ]
+                if not present:
                     continue
-                matches.append(
+                for index, match in enumerate(line_matches):
+                    if match is not None:
+                        matched_terms[index] = True
+                first_match = min(present, key=lambda match: match.start())
+                file_matches.append(
                     GrepMatch(
                         path=virtual_path,
                         line=line_number,
-                        column=match.start() + 1,
+                        column=first_match.start() + 1,
                         text=line,
                     )
                 )
+
+            if match_mode == "all" and not all(matched_terms):
+                continue
+            for match in file_matches:
+                matches.append(match)
                 if len(matches) >= max_matches:
                     return GrepResult(
                         matches=matches,

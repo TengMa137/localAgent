@@ -12,7 +12,6 @@ RetrievalMethod = Literal[
     "arxiv",
     "weather_forecast",
     "wiki_summary",
-    "news_search",
 ]
 SourceKind = Literal[
     "open_web",
@@ -36,7 +35,7 @@ class WebSourceDecision(BaseModel):
             "scholarly": "arxiv",
             "weather": "weather_forecast",
             "encyclopedia": "wiki_summary",
-            "recent_news": "news_search",
+            "recent_news": "web",
         }[self.kind]
 
 
@@ -53,7 +52,6 @@ class WebQueryPlan(BaseModel):
     crawl_url_limit: int = 1
     date: str | None = None
     language: str | None = None
-    timespan: str | None = None
     checks: List[str] = Field(default_factory=list)
     ready: bool = True
 
@@ -113,8 +111,6 @@ class McpApiCallPlan(BaseModel):
     location: str | None = None
     date: str | None = None
     language: str | None = None
-    timespan: str | None = None
-    max_results: int | None = None
     reason: str = ""
     checks: List[str] = Field(default_factory=list)
 
@@ -135,14 +131,12 @@ class McpApiCallPlan(BaseModel):
             self.date = self.date.strip() or None
         if self.language is not None:
             self.language = self.language.strip() or None
-        if self.timespan is not None:
-            self.timespan = self.timespan.strip() or None
-        if self.max_results is not None:
-            self.max_results = max(1, min(int(self.max_results), 10))
         return self
 
 
 class WebAgentResult(BaseModel):
+    """Python-assembled result of an executed web retrieval workflow."""
+
     answer: str | None = Field(
         default=None,
         description="A concise answer the orchestrator can forward directly to the user.",

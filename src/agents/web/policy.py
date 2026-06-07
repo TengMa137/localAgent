@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .contracts import McpApiCallPlan, WebQueryPlan, dedupe
 
 
-SPECIALIZED_MCP_TOOLS = frozenset(
-    {"weather_forecast", "wiki_summary", "news_search"}
-)
+SPECIALIZED_MCP_TOOLS = frozenset({"weather_forecast", "wiki_summary"})
 
 # These normalize planner output categories. They are not user-intent matching.
 SOURCE_TOOL_ALIASES = {
@@ -20,8 +19,6 @@ SOURCE_TOOL_ALIASES = {
     "encyclopedia": "wiki_summary",
     "definition": "wiki_summary",
     "reference": "wiki_summary",
-    "news": "news_search",
-    "headlines": "news_search",
 }
 
 
@@ -43,16 +40,45 @@ def api_plan_from_query_plan(
     query_plan: WebQueryPlan,
     tool_name: str,
 ) -> McpApiCallPlan:
+    target = query_plan.retrieval_target or query_plan.query
     return McpApiCallPlan(
         tool_name=tool_name,
-        query=query_plan.retrieval_target or query_plan.query,
+        query=target,
+        location=(
+            weather_location(target)
+            if tool_name == "weather_forecast"
+            else None
+        ),
         date=query_plan.date,
         language=query_plan.language,
-        timespan=query_plan.timespan,
-        max_results=query_plan.search_result_limit,
         reason="Using arguments from the web query preflight.",
         checks=list(query_plan.checks),
     )
+
+
+def weather_location(value: str) -> str:
+    """Remove common forecast/date wording from a model-normalized query."""
+    location = re.sub(r"\([^)]*\)", "", value).strip()
+    location = re.split(r"\s+-\s+", location, maxsplit=1)[0].strip()
+    location = re.sub(
+        r"^(?:check|get|show|find)\s+(?:me\s+)?(?:the\s+)?",
+        "",
+        location,
+        flags=re.IGNORECASE,
+    )
+    location = re.sub(
+        r"^(?:weather|forecast)\s+(?:for|in|at)\s+",
+        "",
+        location,
+        flags=re.IGNORECASE,
+    )
+    location = re.sub(
+        r"\s+(?:weather|forecast|conditions?).*$",
+        "",
+        location,
+        flags=re.IGNORECASE,
+    )
+    return location.strip(" ,.-") or value.strip()
 
 
 def api_result_urls(api_result: dict | None) -> list[str]:
@@ -82,8 +108,6 @@ def api_result_is_usable(tool_name: str, api_result: dict | None) -> bool:
             or api_result.get("summary")
             or api_result.get("description")
         )
-    if tool_name == "news_search":
-        return bool(api_result.get("articles"))
     return False
 
 

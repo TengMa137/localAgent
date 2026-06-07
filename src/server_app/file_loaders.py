@@ -10,6 +10,7 @@ SUPPORTED_READ_IMAGE_MIME_TYPES = {
     "image/png",
     "image/webp",
 }
+PDF_MIME_TYPE = "application/pdf"
 
 TEXT_UPLOAD_MIME_TYPES = {
     "application/csv",
@@ -109,6 +110,8 @@ def normalize_upload_content_type(
 
 def upload_context_kind(filename: str, content_type: str) -> str:
     path = Path(filename or "")
+    if content_type == PDF_MIME_TYPE or path.suffix.lower() == ".pdf":
+        return "document"
     if (
         content_type.startswith("text/")
         or content_type in TEXT_UPLOAD_MIME_TYPES

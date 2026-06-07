@@ -153,23 +153,6 @@ async def wiki_summary_result(
     return _decode_result_payload(_result_to_dict(result))
 
 
-async def news_search_results(
-    mcp_url: str,
-    query: str,
-    *,
-    max_results: int | None = None,
-    timespan: str | None = None,
-) -> dict:
-    async with fastmcp.Client(mcp_url) as client:
-        args: dict[str, Any] = {"query": query}
-        if max_results is not None:
-            args["max_results"] = max_results
-        if timespan:
-            args["timespan"] = timespan
-        result = await client.call_tool("news_search", args)
-    return _decode_result_payload(_result_to_dict(result))
-
-
 def select_urls_from_search_results(
     results: List[dict], *, max_urls: int = 3
 ) -> List[str]:
@@ -308,7 +291,6 @@ def make_web_toolset(
       - web_search_tool()   pass-through, returns result list to LLM
       - weather_forecast_tool() calls the free weather API for forecast questions
       - wiki_summary_tool() calls Wikipedia for definitions/stable overviews
-      - news_search_tool() calls GDELT for recent news discovery
       - web_crawl_tool()    crawls LLM-selected URLs, ingests into rag_service
       - arxiv_fetch_tool()  fetches known arXiv IDs and ingests abstracts when enabled
 
@@ -362,26 +344,6 @@ def make_web_toolset(
         language: str | None = None,
     ) -> dict:
         return await wiki_summary_result(mcp_url, query, language=language)
-
-    @toolset.tool(
-        name="news_search_tool",
-        description=(
-            "Search recent global news articles through GDELT. Use this before "
-            "generic web search for news, politics, and current-event discovery."
-        ),
-    )
-    async def news_search(
-        ctx: RunContext,
-        query: str,
-        max_results: int | None = None,
-        timespan: str | None = None,
-    ) -> dict:
-        return await news_search_results(
-            mcp_url,
-            query,
-            max_results=max_results,
-            timespan=timespan,
-        )
 
     @toolset.tool(
         name="web_crawl_tool",

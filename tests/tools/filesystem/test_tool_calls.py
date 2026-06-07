@@ -236,6 +236,46 @@ async def test_find_paths_matches_filename_across_readable_root(filesystem_tools
 
 
 @pytest.mark.asyncio
+async def test_find_paths_accepts_multiple_literal_terms(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
+    (tmp_path / "agent-system.md").write_text("agent")
+    (tmp_path / "agent-notes.md").write_text("notes")
+    (tmp_path / "system-notes.md").write_text("system")
+
+    any_result = await filesystem_toolset.call_tool(
+        "find_paths",
+        {
+            "path": "/data",
+            "queries": ["agent", "system"],
+            "match_mode": "any",
+        },
+        ctx,
+        tools_in_toolset["find_paths"],
+    )
+    all_result = await filesystem_toolset.call_tool(
+        "find_paths",
+        {
+            "path": "/data",
+            "queries": ["agent", "system"],
+            "match_mode": "all",
+        },
+        ctx,
+        tools_in_toolset["find_paths"],
+    )
+
+    assert any_result.files == [
+        "/data/agent-notes.md",
+        "/data/agent-system.md",
+        "/data/system-notes.md",
+    ]
+    assert all_result.files == ["/data/agent-system.md"]
+
+
+@pytest.mark.asyncio
 async def test_list_directory_returns_immediate_entries(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
     (tmp_path / "sub").mkdir()
     (tmp_path / "a.txt").write_text("a")
@@ -302,6 +342,71 @@ async def test_grep_files_finds_matching_lines(filesystem_toolset, tools_in_tool
         ("/data/a.txt", 1, 1),
         ("/data/b.md", 1, 1),
     ]
+
+
+@pytest.mark.asyncio
+async def test_grep_files_accepts_multiple_literal_terms(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
+    (tmp_path / "both.md").write_text(
+        "The orchestrator selects a route.\nFilesystem validation is separate.\n"
+    )
+    (tmp_path / "one.md").write_text("Only the orchestrator is discussed.\n")
+
+    any_result = await filesystem_toolset.call_tool(
+        "grep",
+        {
+            "path": "/data",
+            "queries": ["orchestrator", "filesystem"],
+            "match_mode": "any",
+            "case_sensitive": False,
+        },
+        ctx,
+        tools_in_toolset["grep_files"],
+    )
+    all_result = await filesystem_toolset.call_tool(
+        "grep",
+        {
+            "path": "/data",
+            "queries": ["orchestrator", "filesystem"],
+            "match_mode": "all",
+            "case_sensitive": False,
+        },
+        ctx,
+        tools_in_toolset["grep_files"],
+    )
+
+    assert [match.path for match in any_result.matches] == [
+        "/data/both.md",
+        "/data/both.md",
+        "/data/one.md",
+    ]
+    assert [match.path for match in all_result.matches] == [
+        "/data/both.md",
+        "/data/both.md",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_grep_files_rejects_query_and_queries_together(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+):
+    with pytest.raises(ValueError, match="either query or queries"):
+        await filesystem_toolset.call_tool(
+            "grep",
+            {
+                "path": "/data",
+                "query": "agent.*system",
+                "queries": ["agent", "system"],
+            },
+            ctx,
+            tools_in_toolset["grep_files"],
+        )
 
 
 @pytest.mark.asyncio

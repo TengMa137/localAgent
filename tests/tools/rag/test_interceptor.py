@@ -21,7 +21,6 @@ from tools.retrieval.interceptor import (
     _ingest,
     _to_dict,
     make_web_toolset,
-    news_search_results,
     weather_forecast_result,
     web_search_results,
     wiki_summary_result,
@@ -371,7 +370,6 @@ class TestWebSearch:
         assert "arxiv_fetch_tool" in tools
         assert "weather_forecast_tool" in tools
         assert "wiki_summary_tool" in tools
-        assert "news_search_tool" in tools
 
     @pytest.mark.asyncio
     async def test_returns_results_list(self, web_toolset, web_tools_in_toolset, ctx):
@@ -497,26 +495,4 @@ class TestWebSearch:
         _mc.call_tool.assert_awaited_once_with(
             "wiki_summary",
             {"query": "diffusion model", "language": "en"},
-        )
-
-    @pytest.mark.asyncio
-    async def test_calls_mcp_news_search(self):
-        payload = {"success": True, "articles": []}
-        with patch("tools.retrieval.interceptor.fastmcp") as _mock_fmcp:
-            _mc = MagicMock()
-            _mc.call_tool = AsyncMock(return_value=_mcp_result(payload))
-            _mock_fmcp.Client.return_value.__aenter__ = AsyncMock(return_value=_mc)
-            _mock_fmcp.Client.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            result = await news_search_results(
-                "http://mcp:8000/sse",
-                "election",
-                max_results=4,
-                timespan="1week",
-            )
-
-        assert result == payload
-        _mc.call_tool.assert_awaited_once_with(
-            "news_search",
-            {"query": "election", "max_results": 4, "timespan": "1week"},
         )

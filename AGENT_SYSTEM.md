@@ -40,32 +40,81 @@ supporting context must not override it.
 The orchestrator receives:
 
 - its system prompt
-- bounded visible chat history
+- visible chat history capped by both message count and character budget
 - first-turn long-term memory, when available
 - the current turn wrapper
 
 Internal specialist prompts, tool traces, and worker transcripts are not
 replayed as orchestrator history.
 
+The orchestrator performs semantic routing only. It does not inspect validator
+roots, list files, or grep file contents. Ambiguous local filenames, paper
+references, and identifiers are delegated to the filesystem specialist. Python
+adds one short routing hint when the current request names a known file suffix;
+explicit web intent still takes precedence.
+
+Deterministic route corrections are deliberately conservative:
+
+1. Keep a model-selected `plan` route.
+2. Force collection-wide requests such as "summarize all papers" or "read
+   these files in parallel" to `plan`, even if a small model returns `direct`.
+3. Treat explicit local-source phrases such as "local papers", "my notes", and
+   "same folder" as filesystem evidence, even when incidental time words appear.
+4. Treat a known-suffix filename plus a local file action as filesystem evidence.
+5. Treat URLs and explicit phrases such as "search the web" as web evidence.
+6. Correct to web only for contextual changing-fact signals such as latest
+   research, today's weather, "check the exchange rate", or "current president".
+
+Standalone `now`, `current`, `check`, and `search` are not sufficient web
+signals. Neither are software uses of words such as "rate", "pricing", "live",
+"score", or "schedule". The phrase lists and precedence live in
+`agents/runtime/query_policy.py`; known file suffixes live in
+`agents/fs/path_policy.py`.
+
+Paper requests are local-first unless the user explicitly names an external
+source. If local discovery returns no usable paper, Python performs one web
+recovery. Exact local paths and known filenames remain local-only on a miss.
+
+Structured output uses at most three total calls: one initial call and two
+retries. A failed completion is omitted from retry history, and the repair
+instruction contains only the original task plus a compact validation summary.
+By default every model request also sends
+`chat_template_kwargs.enable_thinking=false`. This prevents Qwen/llama.cpp from
+spending the output budget in `reasoning_content` and returning empty structured
+`content`. Set `LOCALAGENT_DISABLE_MODEL_THINKING=false` for providers that
+reject that extension.
+
 ### 2. Orchestrator Decision
 
-The orchestrator returns one typed decision:
+The orchestrator model returns one minimal typed choice:
 
 ```text
 route: direct | fs | web | plan
-reply: required only for direct
-objective: required for fs, web, and plan
-effort: none | minimal | standard | deep
+content: direct answer or complete delegated objective
 ```
+
+Python deterministically maps `content` to `reply` or `objective` and assigns
+`none`, `minimal`, or `standard` effort from the selected route.
 
 Routes:
 
 - `direct`: answer from reasoning, visible history, or memory.
-- `fs`: run one focused filesystem specialist task and forward its answer.
+- `fs`: scope one filesystem task, use deterministic local retrieval for
+  explicit directories or large inputs, and forward its text answer.
 - `web`: run one focused web/current/URL/arXiv specialist task and forward its
   answer.
 - `plan`: decompose complex work into typed tasks, run workers, and synthesize
   useful evidence.
+
+Collection-wide local requests are a deterministic `plan` case. Python resolves
+the complete directory or local paper collection before the planner call,
+omits bulk previews to protect small context windows, groups same-stem Markdown
+and PDF companions as one paper, and divides all artifacts across at most three
+parallel workers per batch. For collection summaries, the final answer joins
+the grounded worker summaries directly instead of spending another small-model
+call on cross-worker synthesis. This signal is checked before the orchestrator
+model call, so a small model cannot waste structured-output retries by returning
+`direct` or invalid route JSON for an explicit all/every/parallel collection.
 
 ### 3. Fast Specialist Routes
 
@@ -85,6 +134,25 @@ orchestrator decision
 
 No planner, worker pool, or synthesis call runs for these single-specialist
 routes.
+
+The filesystem route does not expose every mount by default. Ordinary local
+document tasks receive `/docs`; explicit skill tasks receive `/skills`.
+Python selects explicit directories and oversized files for local RAG before
+the model tool loop. Ambiguous references remain in the filesystem tool loop,
+which owns `find_paths`, `list_files`, and `grep_files`. The filesystem model
+returns plain text, while Python derives paths and changes from validated
+preflight state and successful tool calls.
+
+For ambiguous local discovery, the filesystem model is instructed to call
+`find_paths` for names and `grep_files` for content before reporting a miss.
+Both tools accept either one `query` or several literal `queries`; `match_mode`
+is `any` or `all`. For `grep_files`, `all` means every term must occur somewhere
+in the same file.
+
+PDFs are always handed to RAG rather than text tools. `rag_lib` extracts PDF
+pages with `pypdf`; fetched arXiv PDFs are resolved through the validator,
+ingested with `ingest_local`, and included in the paper-scoped RAG query. Web
+uploads classify PDFs as documents and explicitly direct the agent to RAG.
 
 ### 4. Plan Route
 

@@ -17,9 +17,15 @@ The agent handles four routes from a single conversation loop:
 
 The code is intentionally biased toward small local LLMs. Python owns the multi-step workflow,
 route execution, path validation, approval handling, deterministic RAG handoffs, and per-turn
-typed evidence context. LLM calls are kept narrow: choose a typed route, plan typed tasks
+evidence context. LLM calls are kept narrow: choose a typed route, plan typed tasks
 when needed, run focused specialists, and synthesize only when multiple useful results must
 be merged.
+
+For Qwen models served by llama.cpp, model calls disable the chat template's
+thinking stream by default. This keeps structured `content` available within
+small output budgets instead of exhausting tokens in `reasoning_content`.
+Set `LOCALAGENT_DISABLE_MODEL_THINKING=false` for providers that do not accept
+`chat_template_kwargs`.
 
 See [AGENT_SYSTEM.md](AGENT_SYSTEM.md) for the prompt chain and agent-system diagram.
 
@@ -30,23 +36,36 @@ Current implementation highlights:
 - Filesystem writes can use local CLI approval via PydanticAI deferred-tool approval.
 - The orchestrator cannot call specialist agents as tools; it returns one typed
   semantic route decision, and Python executes the selected runner.
-- Python validates the selected route before dispatch and can correct a structurally
-  incompatible `fs`/`direct` decision to `web` for current, URL, or arXiv requests.
+- The orchestrator performs semantic routing only and never scans validator
+  roots. Ambiguous local references are delegated to `fs_agent`, which owns
+  filename/path listing and content grep.
+- Python applies narrow structural checks after the route decision. Current
+  facts and URLs use `web`; an unsuccessful local-first arXiv identifier lookup
+  can recover to web once.
+- Collection-wide requests such as summarizing all papers or processing files
+  in parallel bypass the route model and go directly to `plan`. Python resolves the collection, groups
+  same-stem Markdown/PDF companions, and distributes every artifact across
+  bounded parallel worker batches. Collection summaries forward grounded
+  worker answers directly without a second synthesis call.
 - Filesystem and web specialists return a shared typed internal result with status,
   usefulness, sources, uncertainties, and recovery metadata. String handoffs remain
   available for plan/worker compatibility.
 - A failed local reference lookup can recover to the web exactly once when the
   original request is externally recoverable. Explicit local paths such as
   `/docs/missing.md` remain local and do not silently fall back to the internet.
-- `fs_agent` owns local path discovery/read/write/edit and uses deterministic RAG for large or multi-file reads.
+- `fs_agent` owns scoped local path discovery/read/write/edit. Python sends
+  explicit directories and large files through deterministic RAG before they
+  can fill the model context. Ambiguous paper references stay in the filesystem
+  tool loop for `find_paths`, `list_files`, and `grep_files`.
 - `web_agent` validates its query and tool arguments before network access, uses
   bounded search/crawl budgets, and skips crawling when result previews are enough.
-- Dedicated MCP APIs handle weather through Open-Meteo, definitions through
-  Wikipedia, and recent news through GDELT before generic web search.
+- Dedicated MCP APIs handle weather through Open-Meteo and definitions through
+  Wikipedia. Recent news uses bounded web search directly.
 - arXiv discovery uses web search, metadata fetch remains ID-based, and fetched
   papers are persisted under `user_docs/papers/arxiv/` as full-text Markdown.
   The original PDF is saved only when HTML extraction fails or the user explicitly
-  requests the PDF.
+  requests the PDF. Saved PDFs are parsed by `pypdf`, ingested into `rag_lib`,
+  and added to the paper-scoped RAG query; PDF uploads use the same RAG path.
 - Planned workers produce typed evidence for synthesis; diagnostics stay in trace events
   and per-turn task logs.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
@@ -149,7 +168,6 @@ The MCP server provides:
 - `search_web`, `crawl_url`, and `crawl_urls`
 - `weather_forecast` via Open-Meteo
 - `wiki_summary` via Wikipedia
-- `news_search` via GDELT DOC
 - `fetch_arxiv` for exact arXiv IDs
 
 Host defaults:
@@ -241,8 +259,9 @@ By default the app is published at `127.0.0.1:8088` and the MCP server is not
 published to the host. (inspect: lsof -nP -iTCP:8088 -sTCP:LISTEN)
 
 `user_docs/` is mounted writable into the agent containers because fetched arXiv
-Markdown files and optional PDF fallbacks are saved beneath
-`/data/docs/papers/arxiv/`. The MCP
+Markdown files and PDF fallbacks are saved beneath
+`/data/docs/papers/arxiv/`. PDFs are indexed locally through `rag_lib` after
+download. The MCP
 container remains read-only and isolated from the document mount.
 
 Use one of these commands:
@@ -520,8 +539,9 @@ orchestrator emits a typed route decision only; Python executes the selected
 runner and performs deterministic RAG handoffs when content is large, multi-file,
 or fetched from the web. The current user request is placed before supporting
 context, orchestrator history is bounded, and filesystem read/discovery tools
-reject identical repeat calls in the same run. User intent is routed by the
-orchestrator and planner, not by regex or keyword heuristics in Python.
+reject identical repeat calls in the same run. The orchestrator and planner own
+route selection; Python applies narrow structural checks only for execution
+scope and explicit current/URL requests.
 
 ---
 
@@ -538,12 +558,13 @@ tool traces are not replayed as model history.
 | Route | Runner | Behavior |
 |---|---|---|
 | `direct` | orchestrator reply | Answer from reasoning, visible history, or memory |
-| `fs` | `run_fs_task` | One filesystem specialist task, answer forwarded directly |
+| `fs` | `run_fs_task` | One scoped filesystem task; Python assembles metadata and forwards the text answer |
 | `web` | `run_web_task` | One search/URL/current/arXiv specialist task, answer forwarded directly |
 | `plan` | `run_plan_workflow` | Planner creates typed tasks; workers run specialists; synthesis sees useful evidence only |
 
-The orchestrator never receives filesystem, web, RAG, or specialist toolsets. It returns only
-`route`, `reply`, `objective`, and `effort`; Python executes the selected route.
+The orchestrator never receives filesystem, web, RAG, or specialist toolsets. Its
+model-facing schema contains only `route` and `content`. Python maps `content` to either a
+direct reply or a specialist objective, assigns the route budget, and executes the route.
 
 For `plan`, the flow is:
 
@@ -558,9 +579,9 @@ Model-visible persistence stores only visible user prompts and visible assistant
 The web UI stores trace events and compact turn logs on assistant-message metadata for
 diagnostics, but those records are not used as future model input.
 
-Structured-output retries are handled manually so invalid model completions are not replayed
-into small context windows. Set `LOCALAGENT_ORCHESTRATOR_USE_XML=true` to use the XML route
-contract instead of structured JSON.
+The orchestrator uses one minimal structured contract. Filesystem and final web answer models
+return plain text; Python assembles paths, changes, sources, and other metadata so output
+validation cannot replay expensive retrieval or tool runs.
 
 See [AGENT_SYSTEM.md](AGENT_SYSTEM.md) for the full prompt chain, diagram, and model-size
 tradeoffs.
@@ -575,7 +596,7 @@ Toolsets are attached to specialists, not to the orchestrator.
 |---|---|---|
 | Filesystem | `fs_agent` | Validator-backed reads, image reads, grep, listing, stat, edits, writes, copy/move/delete |
 | Web/MCP | `web_agent` | Search, URL crawl, and arXiv through the MCP web server |
-| Skills | `plan_agent` prompt and `fs_agent` task context | Compact skill catalog for planning; deterministic `scan_skills_context()` before fs tasks |
+| Skills | `plan_agent` prompt and explicit skill tasks in `fs_agent` | Compact skill catalog for planning; filesystem skill context is loaded only when the objective names skills or `/skills` |
 | RAG | fs/web Python helpers; standalone tested tools | Normal routes call deterministic RAG helpers. `rag_toolset` exists for retrieval tooling/tests, not orchestrator use |
 
 All file I/O goes through `FilesystemValidator` and declared mounts. Defaults:
@@ -587,8 +608,9 @@ Writes use PydanticAI deferred-tool approval when the mount requires it. CLI app
 prompt by default, `LOCALAGENT_APPROVE_TOOLS=always`, or `LOCALAGENT_APPROVE_TOOLS=never`.
 
 Skills are markdown files under `./skills/`. The orchestrator does not receive the skill
-catalog. `fs_agent` receives refreshed skill paths before filesystem tasks, and
-`/skills/skill_editing.md` is loaded automatically for skill create/edit/move/delete tasks.
+catalog. Ordinary filesystem tasks are scoped to `/docs`; `fs_agent` receives refreshed
+skill paths only for explicit skill tasks, and `/skills/skill_editing.md` is loaded
+automatically for skill create/edit/move/delete tasks.
 
 Long-term memory is separate from skills and chat transcripts. CLI memory lives under
 `.memory/default/`; web memory lives under `localagent_state/memory/<user-id>/`. Only

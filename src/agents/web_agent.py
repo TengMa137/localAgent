@@ -1,8 +1,30 @@
-"""Web specialist facade and top-level retrieval coordinator.
+"""Web retrieval coordinator with narrow model judgments and Python execution.
 
-The `agents.web` package owns source selection, typed contracts, dedicated API
-execution, arXiv workflows, persistence, and presentation. This module wires
-those capabilities to the shared model/RAG runtime and public entry points.
+The web specialist receives one objective and returns a Python-built
+``WebAgentResult``. Models only select the evidence kind, normalize the query,
+judge preview sufficiency, optionally select arXiv papers, and write the final
+answer as a text string that may contain Markdown. They do not choose arbitrary
+tools or produce the result contract as JSON or XML.
+
+Python owns the retrieval workflow:
+
+* user-provided URLs bypass search and are crawled directly;
+* source selection is converted into a bounded ``WebQueryPlan``;
+* dedicated weather and Wikipedia arguments are built deterministically;
+* recent-news requests use bounded web search directly;
+* API failures and empty results fall back once to ordinary web search;
+* search result limits, crawl limits, selected URLs, arXiv IDs, local writes,
+  timeouts, and RAG ingestion are validated and executed outside the model;
+* final-answer validation failure falls back immediately to readable executed
+  evidence instead of repeating the model call;
+* Python records executed queries, URLs, local paths, findings, and runtime
+  uncertainties in ``WebAgentResult``;
+* that typed result is converted to ``SpecialistResult`` for the orchestrator
+  or plan worker.
+
+Python therefore controls network access, retries, fallback, persistence,
+metadata, and evidence flow. The final model boundary is an unstructured
+string.
 """
 
 from __future__ import annotations
@@ -20,19 +42,23 @@ from tools.retrieval.interceptor import (
     arxiv_fetch_papers,
     arxiv_papers_to_documents,
     select_urls_from_search_results,
-    news_search_results,
     weather_forecast_result,
     web_crawl_documents,
     web_crawl_and_ingest,
     web_search_results,
     wiki_summary_result,
 )
-from .structured_retry import observable_run_with_manual_validation_retries
+from .structured_retry import (
+    answer_model_settings,
+    clean_text_answer,
+    observable_run_with_manual_validation_retries,
+)
 from .observability import _rt
 from .runtime.context import (
     MCP_URL,
     _now,
     model,
+    rag_validator,
     rag_service,
 )
 from .runtime.query_policy import TaskKind, extract_arxiv_ids, extract_urls
@@ -40,7 +66,6 @@ from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
 from .runtime.specialist_result import SpecialistResult
 from .web.contracts import (
     ArxivSelectionDecision,
-    McpApiCallPlan,
     WebAgentResult,
     WebPreviewDecision,
     WebQueryPlan,
@@ -48,6 +73,7 @@ from .web.contracts import (
     dedupe as _dedupe,
 )
 from .web.policy import (
+    api_result_urls as _api_result_urls,
     preferred_api_tool as _preferred_api_tool,
     preferred_source_is_arxiv as _preferred_source_is_arxiv,
     source_scoped_web_queries as _source_scoped_web_queries,
@@ -70,7 +96,6 @@ from .web.presentation import (
 )
 from .web.prompts import (
     ARXIV_SELECTION_SYSTEM_PROMPT,
-    MCP_API_CALL_SYSTEM_PROMPT,
     WEB_ANSWER_SYSTEM_PROMPT,
     WEB_PREVIEW_SYSTEM_PROMPT,
     WEB_QUERY_SYSTEM_PROMPT,
@@ -110,17 +135,9 @@ arxiv_selection_agent = Agent(
 )
 
 
-mcp_api_call_agent = Agent(
+web_answer_agent = Agent(
     model=model,
-    output_type=McpApiCallPlan,
-    output_retries=0,
-    system_prompt=MCP_API_CALL_SYSTEM_PROMPT,
-)
-
-
-web_agent = Agent(
-    model=model,
-    output_type=WebAgentResult,
+    output_type=str,
     output_retries=0,
     system_prompt=WEB_ANSWER_SYSTEM_PROMPT,
 )
@@ -177,7 +194,6 @@ def _query_preflight_text(plan: WebQueryPlan | None) -> str:
             f"crawl_url_limit: {plan.crawl_url_limit}",
             f"date: {plan.date or 'None'}",
             f"language: {plan.language or 'None'}",
-            f"timespan: {plan.timespan or 'None'}",
             f"as_of: {plan.as_of or _now()}",
             f"ready: {plan.ready}",
             "checks:",
@@ -223,6 +239,105 @@ def _log_query_preflight(plan: WebQueryPlan) -> None:
     )
     for check in plan.checks[:3]:
         _rt(f"[web_agent] query check — {check}", "dim", 1)
+
+
+def _web_result_summary(
+    *,
+    api_result: dict | None,
+    search_results: List[dict],
+    papers: List[dict],
+    evidence: List[dict],
+) -> str:
+    """Describe the executed evidence source without asking the model."""
+    if api_result:
+        source = str(api_result.get("source") or "dedicated API").strip()
+        return f"Answered from {source} data."
+    if papers:
+        return "Answered from fetched arXiv paper data."
+    if evidence:
+        return "Answered from crawled web evidence."
+    if search_results:
+        return "Answered from web search result previews."
+    return "Web retrieval completed without usable evidence."
+
+
+def _fallback_web_answer(
+    *,
+    api_result: dict | None,
+    search_results: List[dict],
+    papers: List[dict],
+    evidence: List[dict],
+    urls: List[str],
+) -> str:
+    """Return readable executed evidence when answer synthesis is unavailable."""
+    if api_result:
+        articles = api_result.get("articles") or []
+        if articles:
+            lines = ["Recent articles:"]
+            for article in articles[:5]:
+                title = str(article.get("title") or "Untitled article").strip()
+                url = str(article.get("url") or "").strip()
+                lines.append(f"- {title}" + (f": {url}" if url else ""))
+            return "\n".join(lines)
+
+        extract = str(
+            api_result.get("extract")
+            or api_result.get("summary")
+            or api_result.get("description")
+            or ""
+        ).strip()
+        if extract:
+            source_url = str(
+                api_result.get("page_url") or api_result.get("source_url") or ""
+            ).strip()
+            return extract + (f"\n\nSource: {source_url}" if source_url else "")
+
+        return (
+            "The dedicated service returned the following structured data:\n\n"
+            + _format_api_result(api_result)
+        )
+
+    if papers:
+        lines = ["Retrieved paper information:"]
+        for paper in papers[:5]:
+            title = str(paper.get("title") or "Untitled paper").strip()
+            summary = str(paper.get("summary") or "").strip()
+            url = str(paper.get("abs_url") or paper.get("pdf_url") or "").strip()
+            detail = f"- {title}"
+            if summary:
+                detail += f": {summary[:500]}"
+            if url:
+                detail += f"\n  {url}"
+            lines.append(detail)
+        return "\n".join(lines)
+
+    if evidence:
+        lines = ["Retrieved evidence:"]
+        for item in evidence[:5]:
+            text = str(item.get("text") or "").strip()
+            source = str(item.get("source") or "").strip()
+            if text:
+                lines.append(f"- {text[:700]}" + (f"\n  {source}" if source else ""))
+        if len(lines) > 1:
+            return "\n".join(lines)
+
+    if search_results:
+        lines = ["Web search results:"]
+        for item in search_results[:5]:
+            title = str(item.get("title") or "Untitled result").strip()
+            snippet = str(item.get("snippet") or "").strip()
+            url = str(item.get("url") or "").strip()
+            detail = f"- {title}"
+            if snippet:
+                detail += f": {snippet}"
+            if url:
+                detail += f"\n  {url}"
+            lines.append(detail)
+        return "\n".join(lines)
+
+    if urls:
+        return "Retrieved source URLs:\n" + "\n".join(f"- {url}" for url in urls[:5])
+    return "No usable web evidence was returned."
 
 
 def _dedupe_search_results(results: List[dict]) -> List[dict]:
@@ -288,6 +403,31 @@ async def _download_arxiv_pdfs(papers: list[dict]) -> list[str]:
     )
 
 
+async def _ingest_local_arxiv_pdfs(pdf_paths: list[str]) -> list[str]:
+    resolved_paths: list[str] = []
+    valid_virtual_paths: list[str] = []
+    for virtual_path in _dedupe(pdf_paths):
+        try:
+            _, resolved, _ = rag_validator.get_path_config(
+                virtual_path,
+                op="read",
+            )
+        except Exception:
+            continue
+        resolved_paths.append(str(resolved))
+        valid_virtual_paths.append(virtual_path)
+
+    if not resolved_paths:
+        raise RuntimeError("no downloaded PDF paths passed validator resolution")
+
+    doc_ids = await rag_service.ingest_local(resolved_paths)
+    if len(doc_ids) != len(resolved_paths):
+        raise RuntimeError(
+            "PDF loader returned no extractable document for one or more files"
+        )
+    return valid_virtual_paths
+
+
 def _write_local_arxiv_papers(
     papers: list[dict],
     full_docs: list[Document],
@@ -311,6 +451,7 @@ def _arxiv_runtime() -> ArxivRuntime:
         papers_to_documents=arxiv_papers_to_documents,
         crawl_documents=web_crawl_documents,
         download_pdfs=_download_arxiv_pdfs,
+        ingest_local_pdfs=_ingest_local_arxiv_pdfs,
         write_local_papers=_write_local_arxiv_papers,
         rag_search=rag_search_documents,
         model_run=observable_run_with_manual_validation_retries,
@@ -332,12 +473,8 @@ def _structured_api_runtime() -> StructuredApiRuntime:
         mcp_url=MCP_URL,
         weather_forecast=weather_forecast_result,
         wiki_summary=wiki_summary_result,
-        news_search=news_search_results,
-        model_run=observable_run_with_manual_validation_retries,
-        argument_agent=mcp_api_call_agent,
         synthesize=_synthesize_web_answer,
         fallback_search=_run_web_search_task,
-        query_plan_text=_query_preflight_text,
         log=_rt,
     )
 
@@ -353,25 +490,6 @@ async def _fetch_arxiv_to_local(
         max_papers=max_papers,
         search_results=search_results,
     )
-
-
-async def _build_mcp_api_call_plan(
-    *,
-    objective: str,
-    query_plan: WebQueryPlan,
-    tool_name: str,
-    failed_result: dict | None = None,
-) -> McpApiCallPlan:
-    return await _structured_api_runtime().build_call_plan(
-        objective=objective,
-        query_plan=query_plan,
-        tool_name=tool_name,
-        failed_result=failed_result,
-    )
-
-
-async def _call_specialized_api_tool(api_plan: McpApiCallPlan) -> dict:
-    return await _structured_api_runtime().call(api_plan)
 
 
 async def _select_arxiv_ids_from_results(
@@ -501,7 +619,7 @@ async def _build_web_query_plan(objective: str) -> WebQueryPlan:
     plan.preferred_tool = (
         source_decision.method
         if source_decision.method
-        in {"weather_forecast", "wiki_summary", "news_search"}
+        in {"weather_forecast", "wiki_summary"}
         else None
     )
     if source_decision.target.strip() and source_decision.method != "web":
@@ -598,19 +716,64 @@ async def _synthesize_web_answer(
             ),
         ]
     )
-    result = await observable_run_with_manual_validation_retries(
-        web_agent,
-        prompt,
-        output_type=WebAgentResult,
-        output_name="WebAgentResult",
-        label="web_answer",
-        indent=1,
+    try:
+        result = await observable_run_with_manual_validation_retries(
+            web_answer_agent,
+            prompt,
+            output_type=str,
+            output_name="web answer text",
+            label="web_answer",
+            indent=1,
+            attempts=1,
+            **answer_model_settings(),
+        )
+        answer = clean_text_answer(result.output)
+    except Exception as exc:
+        _rt(
+            f"[web_agent] answer synthesis failed; using evidence fallback: {exc}",
+            "red",
+            1,
+        )
+        answer = _fallback_web_answer(
+            api_result=api_result,
+            search_results=search_results or [],
+            papers=papers or [],
+            evidence=evidence or [],
+            urls=urls or [],
+        )
+
+    runtime_urls = _dedupe(
+        [
+            *(urls or []),
+            *_api_result_urls(api_result),
+            *(
+                str(item.get("url") or "").strip()
+                for item in search_results or []
+            ),
+            *(
+                str(paper.get("abs_url") or paper.get("pdf_url") or "").strip()
+                for paper in papers or []
+            ),
+        ]
     )
-    output: WebAgentResult = result.output
-    if query_plan is not None:
-        output.search_queries = _dedupe([query_plan.query, *output.search_queries])
-    output.urls = _dedupe([*(urls or []), *output.urls])
-    output.uncertainties = _dedupe([*(uncertainties or []), *output.uncertainties])
+    output = WebAgentResult(
+        answer=answer or _fallback_web_answer(
+            api_result=api_result,
+            search_results=search_results or [],
+            papers=papers or [],
+            evidence=evidence or [],
+            urls=runtime_urls,
+        ),
+        summary=_web_result_summary(
+            api_result=api_result,
+            search_results=search_results or [],
+            papers=papers or [],
+            evidence=evidence or [],
+        ),
+        search_queries=[query_plan.query] if query_plan is not None else [],
+        urls=runtime_urls,
+        uncertainties=_dedupe(uncertainties or []),
+    )
     local_paths = _dedupe(_local_doc_paths(output.urls))
     missing_paths = [
         path for path in local_paths if path not in (output.answer or output.summary)
@@ -736,13 +899,7 @@ async def _run_web_search_task(
 
 
 async def run_web_task_result(objective: str) -> SpecialistResult:
-    """
-    Run one deterministic web/current-info task and return a typed internal result.
-
-    Use from orchestrator or plan_agent when URL crawl, current information,
-    current docs, package/API changes, arXiv/DOI lookup, or web source
-    selection is needed. Crawled content is indexed into the shared RAG store.
-    """
+    """Run one Python-controlled retrieval workflow and return its typed result."""
     urls = extract_urls(objective)
     if urls:
         output = await _run_url_crawl_task(objective, urls)
@@ -761,6 +918,6 @@ async def run_web_task_result(objective: str) -> SpecialistResult:
 
 
 async def run_web_task(objective: str) -> str:
-    """Compatibility wrapper returning the historical string handoff."""
+    """Return the compact text handoff consumed by plan workers."""
     result = await run_web_task_result(objective)
     return result.raw or result.to_handoff()

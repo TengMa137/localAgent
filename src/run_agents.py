@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from pydantic import TypeAdapter
-from pydantic_ai.messages import ModelMessage, ModelRequest
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart
 from pydantic_ai.usage import UsageLimits
 
 from localagent_settings import get_runtime_settings
@@ -120,8 +120,10 @@ def _summarize_messages(messages: Any) -> None:
 CHAT_HISTORY_DIR = Path("./chat_history/chats")
 EXIT_COMMANDS = {"exit", "quit", "q", ":q"}
 _MSG_ADAPTER = TypeAdapter(List[ModelMessage])
-MAX_ORCHESTRATOR_HISTORY_MESSAGES = 16
-MAX_CURRENT_USER_PROMPT_CHARS = 12_000
+MAX_ORCHESTRATOR_HISTORY_MESSAGES = 8
+MAX_ORCHESTRATOR_HISTORY_CHARS = 6_000
+MAX_ORCHESTRATOR_HISTORY_MESSAGE_CHARS = 3_000
+MAX_CURRENT_USER_PROMPT_CHARS = 6_000
 
 BANNER = """\
 ╔══════════════════════════════════════════╗
@@ -204,10 +206,63 @@ def _current_turn_prompt(user_text: str) -> str:
 def _recent_orchestrator_history(
     message_history: List[ModelMessage],
 ) -> List[ModelMessage]:
-    """Keep orchestrator context bounded for small local models."""
-    if len(message_history) <= MAX_ORCHESTRATOR_HISTORY_MESSAGES:
-        return message_history
-    return message_history[-MAX_ORCHESTRATOR_HISTORY_MESSAGES:]
+    """Keep recent visible history within a small-model character budget."""
+    compacted: list[ModelMessage] = []
+    used_chars = 0
+    candidates = message_history[-MAX_ORCHESTRATOR_HISTORY_MESSAGES:]
+
+    for message in reversed(candidates):
+        original_text = _visible_history_text(message)
+        if not original_text:
+            continue
+        text = _strip_turn_wrapper(original_text)
+        remaining = MAX_ORCHESTRATOR_HISTORY_CHARS - used_chars
+        if remaining <= 0:
+            break
+        text = _truncate_history_text(
+            text,
+            min(MAX_ORCHESTRATOR_HISTORY_MESSAGE_CHARS, remaining),
+        )
+        if text == original_text:
+            compacted.append(message)
+        elif isinstance(message, ModelRequest):
+            compacted.append(ModelRequest.user_text_prompt(text))
+        elif isinstance(message, ModelResponse):
+            compacted.append(ModelResponse(parts=[TextPart(content=text)]))
+        used_chars += len(text)
+
+    return list(reversed(compacted))
+
+
+def _visible_history_text(message: ModelMessage) -> str:
+    """Extract only user-visible text from persisted orchestrator messages."""
+    parts: list[str] = []
+    for part in message.parts:
+        content = getattr(part, "content", None)
+        if isinstance(content, str) and content.strip():
+            parts.append(content.strip())
+    return "\n".join(parts)
+
+
+def _strip_turn_wrapper(text: str) -> str:
+    """Remove repeated routing boilerplate from prior user turns."""
+    if not text.startswith("## Current User Request"):
+        return text
+    _header, separator, request = text.partition("\n\n")
+    return request.strip() if separator else text
+
+
+def _truncate_history_text(text: str, limit: int) -> str:
+    """Bound one message while retaining both its answer and trailing sources."""
+    if len(text) <= limit:
+        return text
+    marker = "\n...<history truncated>...\n"
+    if limit <= len(marker) + 20:
+        return text[:limit]
+    available = limit - len(marker)
+    head = (available * 2) // 3
+    tail = available - head
+    return f"{text[:head].rstrip()}{marker}{text[-tail:].lstrip()}"
 
 
 async def handle_turn(
@@ -296,7 +351,6 @@ async def run_turn(
             usage_limits=UsageLimits(tool_calls_limit=10),
             metadata={"turn_id": turn_id},
             memory_context=memory_context,
-            use_xml=runtime_settings.orchestrator_use_xml,
         )
     finally:
         stop_trace_collection(trace_token)

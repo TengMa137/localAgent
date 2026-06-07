@@ -30,6 +30,7 @@ class ArxivRuntime:
     papers_to_documents: Callable[[list[dict]], list[Any]]
     crawl_documents: AsyncCallable
     download_pdfs: AsyncCallable
+    ingest_local_pdfs: AsyncCallable
     write_local_papers: Callable[[list[dict], list[Any]], list[str]]
     rag_search: AsyncCallable
     model_run: AsyncCallable
@@ -137,6 +138,26 @@ class ArxivRuntime:
             if download_pdf or not full_docs
             else []
         )
+        ingested_pdf_paths: list[str] = []
+        if pdf_paths:
+            try:
+                ingested_pdf_paths = await self.ingest_local_pdfs(pdf_paths)
+            except Exception as exc:
+                self.log(
+                    f"[web_agent] local PDF ingestion failed: {exc}",
+                    "red",
+                    1,
+                )
+                for paper in papers:
+                    if str(paper.get("local_pdf_path") or "") in pdf_paths:
+                        paper["local_pdf_ingest_error"] = str(exc)
+            else:
+                ingested = set(ingested_pdf_paths)
+                for paper in papers:
+                    local_pdf_path = str(paper.get("local_pdf_path") or "")
+                    if local_pdf_path in ingested:
+                        paper["local_pdf_ingested"] = True
+
         docs_to_ingest = [*abstract_docs, *full_docs]
         if docs_to_ingest:
             await self.rag_service.ingest_documents(docs_to_ingest)
@@ -298,8 +319,11 @@ class ArxivRuntime:
                 download_pdf=bool(query_plan and query_plan.download_pdf),
             )
             evidence = (
-                await self.rag_search(question=objective, docs=markdown_paths)
-                if markdown_paths
+                await self.rag_search(
+                    question=objective,
+                    docs=_local_rag_paths(markdown_paths, papers),
+                )
+                if markdown_paths or _ingested_pdf_paths(papers)
                 else []
             )
             return await self.synthesize(
@@ -371,8 +395,11 @@ class ArxivRuntime:
                 )
             )
         evidence = (
-            await self.rag_search(question=objective, docs=markdown_paths)
-            if markdown_paths
+            await self.rag_search(
+                question=objective,
+                docs=_local_rag_paths(markdown_paths, fetched_papers),
+            )
+            if markdown_paths or _ingested_pdf_paths(fetched_papers)
             else []
         )
         remote_urls = [
@@ -403,6 +430,18 @@ def _ids_from_search_results(results: list[dict]) -> list[str]:
         )
         ids.extend(extract_arxiv_ids(text))
     return dedupe(ids)
+
+
+def _ingested_pdf_paths(papers: list[dict]) -> list[str]:
+    return dedupe(
+        str(paper.get("local_pdf_path") or "").strip()
+        for paper in papers
+        if paper.get("local_pdf_ingested")
+    )
+
+
+def _local_rag_paths(markdown_paths: list[str], papers: list[dict]) -> list[str]:
+    return dedupe([*markdown_paths, *_ingested_pdf_paths(papers)])
 
 
 def _fallback_papers(

@@ -29,6 +29,8 @@ class PathAnalysis:
 
 
 class FsAgentResult(BaseModel):
+    """Python-assembled result of an executed filesystem workflow."""
+
     answer: str | None = Field(
         default=None,
         description="A concise answer the orchestrator can forward directly to the user.",
@@ -43,8 +45,6 @@ class FsAgentResult(BaseModel):
     changes_made: list[str] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
-    needs_rag: bool = False
-
     @model_validator(mode="before")
     @classmethod
     def coerce_none_lists(cls, values):

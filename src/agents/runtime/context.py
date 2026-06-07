@@ -1,7 +1,9 @@
 """Shared model, validator, filesystem toolset, RAG, and MCP runtime wiring."""
 
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 from typing import Any
 
@@ -76,6 +78,64 @@ FS_EMPTY_DISCOVERY_TOOLS = {"find_paths", "list_files", "grep_files"}
 MAX_EMPTY_DISCOVERY_CALLS = 8
 
 
+@dataclass
+class FilesystemRunState:
+    """Task-local filesystem scope and successful tool-call audit."""
+
+    allowed_read_roots: tuple[str, ...]
+    successful_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+
+
+_filesystem_run_state: ContextVar[FilesystemRunState | None] = ContextVar(
+    "localagent_filesystem_run_state",
+    default=None,
+)
+
+
+@contextmanager
+def filesystem_run_scope(
+    allowed_read_roots: list[str] | tuple[str, ...],
+):
+    """Restrict one filesystem model run and collect executed tool metadata."""
+    state = FilesystemRunState(tuple(dict.fromkeys(allowed_read_roots)))
+    token = _filesystem_run_state.set(state)
+    try:
+        yield state
+    finally:
+        _filesystem_run_state.reset(token)
+
+
+def _is_same_or_child_path(path: str, root: str) -> bool:
+    normalized = "/" + path.strip("/")
+    normalized_root = "/" + root.strip("/")
+    return normalized == normalized_root or normalized.startswith(
+        f"{normalized_root}/"
+    )
+
+
+def _filesystem_read_path_allowed(
+    path: str,
+    allowed_roots: tuple[str, ...],
+) -> bool:
+    if not allowed_roots:
+        return False
+    if path in {"", ".", "/"}:
+        return len(allowed_roots) == len(validator.readable_roots)
+    return any(_is_same_or_child_path(path, root) for root in allowed_roots)
+
+
+def _filesystem_write_path_allowed(
+    path: str,
+    allowed_roots: tuple[str, ...],
+) -> bool:
+    writable_roots = tuple(
+        root for root in allowed_roots if validator.can_write(root)
+    )
+    return bool(path) and any(
+        _is_same_or_child_path(path, root) for root in writable_roots
+    )
+
+
 def _fs_write_path(tool_name: str, tool_args: dict[str, Any]) -> str | None:
     if tool_name in {
         "write_file",
@@ -122,11 +182,56 @@ class DuplicateFilesystemReadGuardToolset(WrapperToolset):
     async def call_tool(self, name, tool_args, ctx, tool):
         tool_name = getattr(getattr(tool, "tool_def", None), "name", name) or name
         run_key = self._run_key(ctx)
+        run_state = _filesystem_run_state.get()
+
+        if tool_name in FS_READ_DISCOVERY_TOOLS and run_state is not None:
+            path = str(tool_args.get("path") or "/")
+            if not _filesystem_read_path_allowed(
+                path,
+                run_state.allowed_read_roots,
+            ):
+                allowed = ", ".join(run_state.allowed_read_roots) or "none"
+                raise ModelRetry(
+                    f"{tool_name} path {path!r} is outside this task's read "
+                    f"scope ({allowed}). Use one of those roots directly; do "
+                    "not search unrelated mounts."
+                )
+
+        if tool_name in FS_WRITE_TOOLS and run_state is not None:
+            target = str(_fs_write_path(tool_name, tool_args) or "")
+            if not _filesystem_write_path_allowed(
+                target,
+                run_state.allowed_read_roots,
+            ):
+                allowed = ", ".join(
+                    root
+                    for root in run_state.allowed_read_roots
+                    if validator.can_write(root)
+                ) or "none"
+                raise ModelRetry(
+                    f"{tool_name} target {target!r} is outside this task's "
+                    f"write scope ({allowed})."
+                )
+
+            if tool_name in {"copy_file", "move_file"}:
+                source = str(tool_args.get("source") or "")
+                if not _filesystem_read_path_allowed(
+                    source,
+                    run_state.allowed_read_roots,
+                ):
+                    allowed = ", ".join(run_state.allowed_read_roots) or "none"
+                    raise ModelRetry(
+                        f"{tool_name} source {source!r} is outside this task's "
+                        f"read scope ({allowed})."
+                    )
 
         if tool_name in FS_WRITE_TOOLS:
             self.seen_calls.pop(run_key, None)
             self.empty_discovery_counts.pop(run_key, None)
-            return await super().call_tool(name, tool_args, ctx, tool)
+            result = await super().call_tool(name, tool_args, ctx, tool)
+            if run_state is not None:
+                run_state.successful_calls.append((tool_name, dict(tool_args)))
+            return result
 
         if tool_name in FS_READ_DISCOVERY_TOOLS:
             call_key = self._call_key(tool_name, tool_args)
@@ -163,6 +268,8 @@ class DuplicateFilesystemReadGuardToolset(WrapperToolset):
                     "uncertainty, or say the relevant local file was not found."
                 )
 
+        if run_state is not None:
+            run_state.successful_calls.append((tool_name, dict(tool_args)))
         return result
 
     @staticmethod

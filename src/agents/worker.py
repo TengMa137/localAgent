@@ -16,7 +16,7 @@ from .fs_agent import run_fs_task
 from .web_agent import run_web_task
 
 from .observability import observable_run, _rt, task_log_store, TaskLog
-from .structured_retry import answer_model_settings
+from .structured_retry import answer_model_settings, clean_text_answer
 
 
 MAX_PARALLEL_TASKS = 3
@@ -77,6 +77,8 @@ Requirements:
     exact-path confirmation before an edit
   - If filesystem evidence says no plausible path exists, return that file-not-found
     result without inventing another path
+  - Return the answer only. Never output internal reasoning, self-review,
+    instruction checks, planning notes, or lines beginning with "Wait"
 
 Do not hallucinate citations or sources.
 """
@@ -313,4 +315,4 @@ async def run_synthesis_worker(
         usage_limits=UsageLimits(tool_calls_limit=MAX_TOOL_CALLS),
         **answer_model_settings(),
     )
-    return result.output
+    return clean_text_answer(result.output)

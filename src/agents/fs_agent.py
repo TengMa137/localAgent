@@ -1,40 +1,82 @@
-"""Filesystem specialist facade and execution coordinator.
+"""Filesystem coordinator with scoped tools and Python-built result metadata.
 
-The `agents.fs` package owns typed contracts, prompt rendering, and path
-preflight. This module wires those pieces to filesystem tools, local RAG,
-observability, recovery guards, and the public `run_fs_task*` entry points.
+The filesystem model handles one already-routed local objective and returns
+only user-facing text. Python builds ``FsAgentResult`` from deterministic path
+preflight, successful tool calls, and local RAG evidence.
+
+Python controls the safety and execution boundary before and after that model
+run:
+
+* enumerate readable validator paths and validate exact path hints;
+* distinguish existing paths, invalid paths, and valid new write targets;
+* scope ordinary file tasks to ``/docs`` and enable ``/skills`` only for
+  explicit skill requests;
+* inject replacement candidates, skill-editing policy, and a scoped file index;
+* enforce write approval, duplicate-read guards, and tool-call limits;
+* send explicit directories and large files to RAG before they can expand the
+  model context;
+* prevent unconfirmed replacement paths from being treated as edit targets;
+* derive executed paths and changes from successful Python tool calls;
+* normalize failures and the text answer into one ``SpecialistResult``.
+
+There is no model-produced filesystem JSON contract and no output-validation
+retry that can replay an expensive tool run.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+import re
+from typing import Any
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import UsageLimits
 
-from .observability import _rt
-from .runtime.context import fs_toolset, model, validator
+from .observability import _rt, observable_run
+from .runtime.context import (
+    filesystem_run_scope,
+    fs_toolset,
+    model,
+    validator,
+)
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
+from .runtime.query_policy import (
+    ambiguously_references_local_artifact,
+    requests_local_discovery,
+    requests_paper_lookup,
+)
 from .runtime.specialist_result import SpecialistResult
 from .runtime.skills_context import scan_skills_context
-from .structured_retry import observable_run_with_manual_validation_retries
+from .structured_retry import answer_model_settings, clean_text_answer
 from .fs.contracts import FsAgentResult, PathAnalysis
 from .fs.path_policy import PathPreflight as ValidatorPathPreflight
-from .fs.prompts import FS_SYSTEM_PROMPT, FsPromptContext
+from .fs.prompts import (
+    FS_RAG_ANSWER_SYSTEM_PROMPT,
+    FS_SYSTEM_PROMPT,
+    FsPromptContext,
+)
 from tools.filesystem.text_ops import read_text_with_policy
 from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 
 MAX_SKILL_EDITING_POLICY_CHARS = 5000
 SKILL_EDITING_POLICY_PATH = "/skills/skill_editing.md"
+SKILL_INTENT_RE = re.compile(r"\bskills?\b", re.IGNORECASE)
 
 fs_agent = Agent(
     model=model,
-    output_type=[FsAgentResult, DeferredToolRequests],
+    output_type=[str, DeferredToolRequests],
     output_retries=0,
     toolsets=[fs_toolset],
     system_prompt=FS_SYSTEM_PROMPT,
+)
+
+fs_rag_answer_agent = Agent(
+    model=model,
+    output_type=str,
+    output_retries=0,
+    system_prompt=FS_RAG_ANSWER_SYSTEM_PROMPT,
 )
 
 
@@ -57,15 +99,18 @@ def _format_virtual_path(mount_point: str, rel: str) -> str:
     return f"{mount_point}/{rel.lstrip('/')}"
 
 
-def _roots_context() -> str:
-    """Describe validator read/write roots for the agent prompt."""
-    readable = ", ".join(validator.readable_roots) or "none"
-    writable = ", ".join(validator.writable_roots) or "none"
+def _roots_context(task_roots: list[str] | None = None) -> str:
+    """Describe validator roots and the narrower task read scope."""
+    scoped_roots = task_roots or validator.readable_roots
+    readable = ", ".join(scoped_roots) or "none"
+    writable = ", ".join(
+        root for root in scoped_roots if validator.can_write(root)
+    ) or "none"
     return (
-        f"Readable roots: {readable}\n"
+        f"Readable roots for this task: {readable}\n"
         f"Writable roots: {writable}\n"
-        "Use only these roots. The readable file index lists known files; use "
-        "list_directory('/') only when you need root metadata."
+        "Use only the task readable roots. The readable file index lists known "
+        "files inside that scope."
     )
 
 
@@ -75,7 +120,8 @@ def _readable_file_index() -> list[str]:
     for root_virtual in validator.readable_roots:
         try:
             mount_point, resolved, _ = validator.get_path_config(
-                root_virtual, op="read"
+                root_virtual,
+                op="read",
             )
             mount_root = validator.get_mount_root(mount_point)
         except Exception:
@@ -89,10 +135,95 @@ def _readable_file_index() -> list[str]:
                 rel = file_path.relative_to(mount_root)
             except ValueError:
                 continue
-            vpath = _format_virtual_path(mount_point, rel.as_posix())
-            if validator.can_read(vpath):
-                files.add(vpath)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            virtual_path = _format_virtual_path(mount_point, rel.as_posix())
+            if validator.can_read(virtual_path):
+                files.add(virtual_path)
     return sorted(files)
+
+
+def _path_root(path: str) -> str | None:
+    normalized = "/" + path.strip("/")
+    for root in validator.readable_roots:
+        if _is_same_or_child_path(normalized, root):
+            return root
+    return None
+
+
+def _objective_uses_skills(objective: str, analysis: PathAnalysis) -> bool:
+    """Enable skill context only for explicit skill language or paths."""
+    if SKILL_INTENT_RE.search(objective):
+        return True
+    return any(
+        PathPreflight._is_skills_path(path)
+        for path in analysis.all_path_hints()
+    )
+
+
+def _task_read_roots(objective: str, analysis: PathAnalysis) -> list[str]:
+    """Choose the mounts the filesystem model may inspect for this objective."""
+    roots: list[str] = []
+    uses_skills = _objective_uses_skills(objective, analysis)
+    default_root = "/skills" if uses_skills else "/docs"
+    if default_root in validator.readable_roots:
+        roots.append(default_root)
+
+    if analysis.all_path_hints():
+        for path in [
+            *analysis.all_path_hints(),
+            *analysis.candidate_paths,
+        ]:
+            root = _path_root(path)
+            if root:
+                roots.append(root)
+
+    if not roots:
+        roots.extend(validator.readable_roots)
+    return _dedupe(roots)
+
+
+def _files_in_roots(files: list[str], roots: list[str]) -> list[str]:
+    return [
+        path
+        for path in files
+        if any(_is_same_or_child_path(path, root) for root in roots)
+    ]
+
+
+def _preemptive_rag_paths(
+    objective: str,
+    analysis: PathAnalysis,
+    task_roots: list[str],
+) -> list[str]:
+    """Select known large local inputs before the model can read them."""
+    assigned_paths = _plan_worker_relevant_files(objective)
+    if assigned_paths:
+        resolved = set(analysis.resolved_paths)
+        return _dedupe(path for path in assigned_paths if path in resolved)
+
+    selected = _paths_that_need_rag(analysis.resolved_paths)
+    if len(analysis.resolved_paths) > 3:
+        selected = _dedupe([*selected, *analysis.resolved_paths])
+    return _dedupe(selected)
+
+
+def _plan_worker_relevant_files(objective: str) -> list[str]:
+    """Read the explicit file assignment from a normalized plan handoff."""
+    if not objective.startswith("Plan worker task:"):
+        return []
+    marker = "Relevant local files:\n"
+    if marker not in objective:
+        return []
+    block = objective.split(marker, 1)[1]
+    paths: list[str] = []
+    for line in block.splitlines():
+        if not line.startswith("- "):
+            break
+        path = line[2:].strip()
+        if path:
+            paths.append(path)
+    return _dedupe(paths)
 
 
 def _paths_that_need_rag(paths: list[str]) -> list[str]:
@@ -104,6 +235,8 @@ def _paths_that_need_rag(paths: list[str]) -> list[str]:
         except Exception:
             continue
         if resolved.is_dir():
+            selected.append(path)
+        elif resolved.is_file() and resolved.suffix.casefold() == ".pdf":
             selected.append(path)
         elif resolved.is_file() and resolved.stat().st_size > DEFAULT_MAX_READ_CHARS:
             selected.append(path)
@@ -147,49 +280,169 @@ def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
     """Build the fs_agent prompt and path preflight analysis."""
     files = _readable_file_index()
     sanitized_objective, analysis = PathPreflight(files).analyze(objective)
+    task_roots = _task_read_roots(objective, analysis)
+    scoped_files = _files_in_roots(files, task_roots)
+    skills_context = (
+        scan_skills_context()
+        if _objective_uses_skills(objective, analysis)
+        else ""
+    )
     context = FsPromptContext(
-        roots_context=_roots_context(),
+        roots_context=_roots_context(task_roots),
         sanitized_objective=sanitized_objective,
-        files=files,
+        files=scoped_files,
         analysis=analysis,
-        skills_context=scan_skills_context(),
+        skills_context=skills_context,
         skill_policy=_skill_editing_policy_context(analysis),
+        task_roots=task_roots,
+        local_discovery_required=requests_local_discovery(objective),
+        web_fallback_allowed=(
+            ambiguously_references_local_artifact(objective)
+            or requests_paper_lookup(objective)
+        ),
     )
     return context.render(), analysis
 
 
-async def _run_fs_agent(prompt: str) -> FsAgentResult:
-    """Run the model-backed filesystem specialist once."""
-    result = await observable_run_with_manual_validation_retries(
-        fs_agent,
-        prompt,
-        output_type=FsAgentResult,
-        output_name="FsAgentResult",
-        label="fs_agent",
-        indent=1,
-        usage_limits=UsageLimits(tool_calls_limit=20),
-    )
-    return result.output
-
-
-async def _add_rag_evidence(
-    objective: str,
-    output: FsAgentResult,
+async def _run_fs_agent(
+    prompt: str,
     *,
-    paths: list[str] | None = None,
-) -> None:
-    """Append deterministic local RAG evidence when the agent requests it."""
-    candidate_paths = output.paths if paths is None else paths
-    rag_paths = _paths_that_need_rag(candidate_paths)
-    if output.needs_rag:
-        rag_paths = _dedupe([*rag_paths, *candidate_paths])
-    if not rag_paths:
-        return
+    task_roots: list[str],
+) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
+    """Run one scoped filesystem tool loop with an unstructured text result."""
+    with filesystem_run_scope(task_roots) as run_state:
+        result = await observable_run(
+            fs_agent,
+            prompt,
+            label="fs_agent",
+            indent=1,
+            usage_limits=UsageLimits(tool_calls_limit=12),
+            **answer_model_settings(),
+        )
+    return clean_text_answer(result.output), run_state.successful_calls
 
+
+async def _retrieve_rag_evidence(
+    objective: str,
+    paths: list[str],
+) -> list[dict]:
+    """Retrieve bounded local evidence for validated paths."""
+    rag_paths = _dedupe(paths)
     _rt(f"[fs_agent] deterministic RAG paths: {rag_paths}", "cyan", 1)
-    evidence = await rag_search_documents(question=objective, docs=rag_paths)
-    output.findings.append(
-        "RAG evidence over local paths:\n" + format_rag_evidence(evidence)
+    return await rag_search_documents(question=objective, docs=rag_paths)
+
+
+async def _synthesize_rag_answer(
+    *,
+    objective: str,
+    paths: list[str],
+    evidence: list[dict],
+    draft_answer: str = "",
+) -> str:
+    """Write a text answer from deterministic local evidence without tools."""
+    prompt = "\n\n".join(
+        [
+            f"Objective:\n{objective}",
+            "Scoped local paths:\n" + "\n".join(f"- {path}" for path in paths),
+            "Existing draft answer:\n" + (draft_answer or "None"),
+            "Retrieved evidence:\n" + format_rag_evidence(evidence),
+        ]
+    )
+    try:
+        result = await observable_run(
+            fs_rag_answer_agent,
+            prompt,
+            label="fs_answer",
+            indent=1,
+            **answer_model_settings(),
+        )
+        answer = clean_text_answer(result.output)
+    except Exception as exc:
+        _rt(
+            f"[fs_agent] RAG answer synthesis failed; returning evidence: {exc}",
+            "red",
+            1,
+        )
+        answer = ""
+    return answer or (
+        "Retrieved local evidence:\n\n" + format_rag_evidence(evidence)
+    )
+
+
+def _executed_paths(
+    calls: list[tuple[str, dict[str, Any]]],
+) -> list[str]:
+    """Derive source paths from successful filesystem calls."""
+    paths: list[str] = []
+    for tool_name, args in calls:
+        if tool_name in {
+            "find_paths",
+            "grep_files",
+            "list_directory",
+            "list_files",
+        }:
+            continue
+        keys = ("source", "destination") if tool_name in {"move_file", "copy_file"} else (
+            "path",
+        )
+        for key in keys:
+            value = str(args.get(key) or "").strip()
+            if value and value not in {"/", "."}:
+                paths.append(value)
+    return _dedupe(paths)
+
+
+def _executed_changes(
+    calls: list[tuple[str, dict[str, Any]]],
+) -> list[str]:
+    """Describe successful mutating calls without asking the model."""
+    changes: list[str] = []
+    write_tools = {
+        "write_file",
+        "edit_file",
+        "search_and_replace",
+        "make_directory",
+        "delete_file",
+        "move_file",
+        "copy_file",
+    }
+    for tool_name, args in calls:
+        if tool_name not in write_tools:
+            continue
+        target = (
+            args.get("destination")
+            if tool_name in {"move_file", "copy_file"}
+            else args.get("path")
+        )
+        changes.append(f"{tool_name}: {target or 'unknown path'}")
+    return _dedupe(changes)
+
+
+def _build_fs_output(
+    *,
+    answer: str,
+    paths: list[str],
+    calls: list[tuple[str, dict[str, Any]]] | None = None,
+    evidence: list[dict] | None = None,
+) -> FsAgentResult:
+    """Assemble the internal result from executed Python state."""
+    calls = calls or []
+    evidence = evidence or []
+    findings = (
+        ["RAG evidence over local paths:\n" + format_rag_evidence(evidence)]
+        if evidence
+        else []
+    )
+    return FsAgentResult(
+        answer=answer,
+        summary=(
+            "Answered from deterministic local RAG."
+            if evidence
+            else "Filesystem task completed."
+        ),
+        paths=_dedupe([*paths, *_executed_paths(calls)]),
+        changes_made=_executed_changes(calls),
+        findings=findings,
     )
 
 
@@ -370,10 +623,27 @@ def _format_exception_report(objective: str, exc: Exception) -> str:
             "Try a narrower request or provide exact paths, or adjust the filesystem prompt/tool budget."
         )
 
+    error = str(exc)
+    lowered = error.casefold()
+    if (
+        "context size" in lowered
+        or "exceed_context_size" in lowered
+        or "context window" in lowered
+    ):
+        return (
+            "I could not complete the filesystem request because the model "
+            "exceeded its context limit.\n\n"
+            f"Error: {error}\n\n"
+            "This is not a file path or permission problem. Large files and "
+            "collections should be handled by deterministic local retrieval "
+            "instead of replaying them through the filesystem model."
+        )
+
     return (
-        "I could not complete the filesystem request because of a file access problem.\n\n"
-        f"Error: {exc}\n\n"
-        "No further agent retry can fix this automatically. The path needs to be corrected, made readable/writable in the validator, or changed on disk."
+        "I could not complete the filesystem request because of a runtime error.\n\n"
+        f"Error: {error}\n\n"
+        "The error was preserved without assuming that the file path or "
+        "validator permissions were the cause."
     )
 
 
@@ -423,18 +693,15 @@ def _fs_output_to_specialist_result(output: FsAgentResult) -> SpecialistResult:
 
 
 async def run_fs_task_result(objective: str) -> SpecialistResult:
-    """
-    Run one local filesystem task and return a typed internal result.
-
-    Use from orchestrator or plan_agent when local path discovery, path
-    validation, file reading/summarization, edits, or skill/document context is
-    needed. The task owns filesystem tools and deterministic local RAG over
-    discovered paths.
-    """
+    """Run one validator-controlled filesystem workflow and return its typed result."""
     _rt(f"[fs_agent] objective: {objective[:120]}", "yellow", 1)
-    _rt(f"[fs_agent] {_roots_context().replace(chr(10), ' | ')}", "dim", 1)
-
     prompt, path_analysis = _fs_task_prompt(objective)
+    task_roots = _task_read_roots(objective, path_analysis)
+    _rt(
+        f"[fs_agent] {_roots_context(task_roots).replace(chr(10), ' | ')}",
+        "dim",
+        1,
+    )
     if path_analysis.invalid_paths:
         _rt(
             f"[fs_agent] invalid path hints ignored: {path_analysis.invalid_paths}",
@@ -445,15 +712,65 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
         _rt(f"[fs_agent] write target hints: {path_analysis.write_targets}", "dim", 1)
 
     try:
-        output = await _run_fs_agent(prompt)
+        preemptive_rag_paths = _preemptive_rag_paths(
+            objective,
+            path_analysis,
+            task_roots,
+        )
+        evidence: list[dict] = []
+        if preemptive_rag_paths:
+            evidence = await _retrieve_rag_evidence(
+                objective,
+                preemptive_rag_paths,
+            )
+
+        if evidence:
+            answer = await _synthesize_rag_answer(
+                objective=objective,
+                paths=preemptive_rag_paths,
+                evidence=evidence,
+            )
+            output = _build_fs_output(
+                answer=answer,
+                paths=preemptive_rag_paths,
+                evidence=evidence,
+            )
+        else:
+            answer, calls = await _run_fs_agent(
+                prompt,
+                task_roots=task_roots,
+            )
+            output = _build_fs_output(
+                answer=answer,
+                paths=path_analysis.resolved_paths,
+                calls=calls,
+            )
     except Exception as exc:
         _rt(f"[fs_agent] ERROR: {exc}", "red", 1)
         return _fs_exception_result(objective, exc)
 
     output = _apply_path_recovery_guard(output, path_analysis)
     rag_paths = _rag_paths_for_output(output, path_analysis)
-    if rag_paths:
-        await _add_rag_evidence(objective, output, paths=rag_paths)
+    post_rag_paths = [
+        path
+        for path in _paths_that_need_rag(rag_paths)
+        if path not in preemptive_rag_paths
+    ]
+    if post_rag_paths:
+        evidence = await _retrieve_rag_evidence(objective, post_rag_paths)
+        if evidence:
+            output.answer = await _synthesize_rag_answer(
+                objective=objective,
+                paths=post_rag_paths,
+                evidence=evidence,
+                draft_answer=output.answer or "",
+            )
+            output.paths = _dedupe([*output.paths, *post_rag_paths])
+            output.findings.append(
+                "RAG evidence over local paths:\n"
+                + format_rag_evidence(evidence)
+            )
+            output.summary = "Answered from deterministic local RAG."
 
     result = _fs_output_to_specialist_result(output)
     result.raw = _format_success_response(output)
@@ -461,6 +778,6 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
 
 
 async def run_fs_task(objective: str) -> str:
-    """Compatibility wrapper returning the historical string handoff."""
+    """Return the compact text handoff consumed by plan workers."""
     result = await run_fs_task_result(objective)
     return result.raw or result.to_handoff()

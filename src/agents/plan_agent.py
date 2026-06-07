@@ -20,6 +20,8 @@ from .runtime.query_policy import (
     extract_urls,
     infer_task_kind,
     likely_requires_current_info,
+    references_papers,
+    requests_collection_plan,
 )
 
 from .observability import _rt
@@ -32,6 +34,15 @@ MAX_ITERATIONS = 3
 MAX_PLAN_PREVIEW_CHARS = 4000
 MAX_HANDOFF_ITEMS = 5
 MAX_HANDOFF_ITEM_CHARS = 180
+PAPER_COLLECTION_SUFFIXES = {
+    ".docx",
+    ".htm",
+    ".html",
+    ".markdown",
+    ".md",
+    ".pdf",
+    ".txt",
+}
 
 
 class PlanOutput(BaseModel):
@@ -82,6 +93,9 @@ Rule 2 — File objectives: preview first, then decide honestly.
     b) No web lookup is needed to validate or supplement it
     c) The answer would not improve with deeper retrieval
   If uncertain → generate tasks. Err on the side of spawning workers.
+  For collection-wide objectives, Python may omit previews and deterministically
+  split all resolved files into bounded batches. Do not collapse an "all files"
+  request into a single-file task.
 
 Rule 3 — Tasks must never be empty without initial_answer.
   If you cannot set initial_answer, you MUST return at least one task.
@@ -293,6 +307,30 @@ class PlanFileResolver:
         candidates = _dedupe([*matched_files, *self.all_files])
         return self._resolve_fragments(text, candidates)
 
+    def resolve_collection(
+        self,
+        text: str,
+        *,
+        matched_files: list[str],
+    ) -> list[str]:
+        """Resolve every file in an explicit or implied local collection."""
+        explicit = self.resolve(text, matched_files=matched_files)
+        candidates = explicit or _dedupe([*matched_files, *self.all_files])
+        if references_papers(text):
+            return [
+                path
+                for path in candidates
+                if (
+                    (explicit or "/papers/" in path.casefold())
+                    and not path.rsplit("/", 1)[-1].startswith(".")
+                    and any(
+                        path.casefold().endswith(suffix)
+                        for suffix in PAPER_COLLECTION_SUFFIXES
+                    )
+                )
+            ]
+        return candidates
+
     def preview(self, paths: list[str]) -> str:
         """Read short previews for planner context."""
         unique_paths = _dedupe(paths)
@@ -310,24 +348,29 @@ class PlanFileResolver:
         return "\n\n---\n\n".join(sections)
 
     def _resolve_fragments(self, text: str, candidates: list[str]) -> list[str]:
-        """Resolve explicit slash path fragments."""
+        """Resolve explicit file or directory path fragments."""
         resolved: list[str] = []
         for fragment in self._path_fragments(text):
+            fragment = fragment.rstrip("/")
             for candidate in candidates:
                 candidate_rel = candidate.lstrip("/")
-                if candidate_rel.endswith(fragment) or candidate_rel.endswith(
-                    f"/{fragment}"
+                candidate_with_root = f"/{candidate_rel}"
+                if (
+                    candidate_rel == fragment
+                    or candidate_rel.endswith(f"/{fragment}")
+                    or candidate_rel.startswith(f"{fragment}/")
+                    or f"/{fragment}/" in candidate_with_root
                 ):
                     resolved.append(candidate)
         return _dedupe(resolved)
 
     @staticmethod
     def _path_fragments(text: str) -> list[str]:
-        """Extract explicit slash fragments that look like file paths."""
+        """Extract explicit slash fragments that look like files or directories."""
         fragments = []
         for token in text.replace("`", " ").replace("'", " ").replace('"', " ").split():
             cleaned = token.strip(".,;:!?()[]{}")
-            if "/" in cleaned and "." in cleaned:
+            if "/" in cleaned and not cleaned.casefold().startswith(("http://", "https://")):
                 fragments.append(cleaned.lstrip("/"))
         return fragments
 
@@ -395,10 +438,16 @@ class PlanNormalizer:
         self.max_tasks = max(1, min(self.max_tasks, MAX_TASKS_PER_PLAN))
         self.objective_urls = extract_urls(self.objective)
         self.objective_arxiv_ids = extract_arxiv_ids(self.objective)
-        self.objective_files = self.resolver.resolve(
-            self.objective,
-            matched_files=self.matched_files,
-        )
+        if requests_collection_plan(self.objective):
+            self.objective_files = self.resolver.resolve_collection(
+                self.objective,
+                matched_files=self.matched_files,
+            )
+        else:
+            self.objective_files = self.resolver.resolve(
+                self.objective,
+                matched_files=self.matched_files,
+            )
 
     def normalize(self, plan_output: PlanOutput) -> PlanOutput:
         """Return a normalized plan without relying on model consistency."""
@@ -464,6 +513,9 @@ class PlanNormalizer:
         """Build structural local, URL, or arXiv tasks omitted by the planner."""
         required: list[TaskSpec] = []
         local_files = _dedupe([*self.matched_files, *self.objective_files])
+        if requests_collection_plan(self.objective) and local_files:
+            return self._collection_tasks(local_files)
+
         if local_files and not self._has_kind(tasks, TaskKind.LOCAL_RAG):
             required.append(
                 TaskSpec(
@@ -512,6 +564,54 @@ class PlanNormalizer:
             )
         return required
 
+    def _collection_tasks(self, files: list[str]) -> list[TaskSpec]:
+        """Split a complete local collection into balanced worker batches."""
+        units = self._collection_units(files)
+        task_count = min(len(units), self.max_tasks)
+        base_size, extra = divmod(len(units), task_count)
+        batches: list[list[list[str]]] = []
+        offset = 0
+        for index in range(task_count):
+            batch_size = base_size + (1 if index < extra else 0)
+            batches.append(units[offset : offset + batch_size])
+            offset += batch_size
+
+        return [
+            TaskSpec(
+                kind=TaskKind.LOCAL_RAG,
+                objective=(
+                    f"Process collection batch {index + 1} of {len(batches)}. "
+                    "Read every assigned file and return a "
+                    "separate grounded summary for each paper or artifact; "
+                    "same-stem Markdown and PDF files are one paper. Do not omit "
+                    "assigned artifacts."
+                ),
+                query="Summarize every assigned local paper or artifact.",
+                relevant_files=[
+                    path for artifact_paths in batch for path in artifact_paths
+                ],
+                requires_current_info=False,
+                as_of=self.as_of,
+                user_prompt="Summarize all assigned local papers or artifacts.",
+            )
+            for index, batch in enumerate(batches)
+        ]
+
+    @staticmethod
+    def _collection_units(files: list[str]) -> list[list[str]]:
+        """Group same-stem Markdown/PDF companions as one scholarly artifact."""
+        units: list[list[str]] = []
+        indexes: dict[str, int] = {}
+        for path in files:
+            lowered = path.casefold()
+            suffix = lowered.rsplit(".", 1)[-1] if "." in lowered else ""
+            key = lowered.rsplit(".", 1)[0] if suffix in {"md", "pdf"} else lowered
+            if key not in indexes:
+                indexes[key] = len(units)
+                units.append([])
+            units[indexes[key]].append(path)
+        return units
+
     def _fallback_task(self) -> TaskSpec | None:
         """Create one deterministic task when structural evidence requires it."""
         local_files = _dedupe([*self.matched_files, *self.objective_files])
@@ -535,6 +635,7 @@ class PlanNormalizer:
             bool(self.objective_urls)
             or bool(self.objective_arxiv_ids)
             or likely_requires_current_info(self.objective)
+            or requests_collection_plan(self.objective)
         )
 
     @staticmethod
@@ -584,13 +685,28 @@ class PlannerInput:
     ) -> "PlannerInput":
         """Resolve known local context before planner tool calls."""
         resolver = PlanFileResolver.from_validator()
-        objective_files = resolver.resolve(objective, matched_files=matched_files)
+        if requests_collection_plan(objective):
+            objective_files = resolver.resolve_collection(
+                objective,
+                matched_files=matched_files,
+            )
+        else:
+            objective_files = resolver.resolve(
+                objective,
+                matched_files=matched_files,
+            )
         file_paths = _dedupe([*matched_files, *objective_files])
+        file_context = (
+            "Collection request: file previews omitted to preserve the planner "
+            "context window; Python will batch every resolved path."
+            if requests_collection_plan(objective) and file_paths
+            else resolver.preview(file_paths)
+        )
         return cls(
             objective=objective,
             matched_files=matched_files,
             file_paths=file_paths,
-            file_context=resolver.preview(file_paths),
+            file_context=file_context,
             resolver=resolver,
             max_tasks=max_tasks,
             max_iterations=max_iterations,
@@ -598,11 +714,16 @@ class PlannerInput:
 
     def render_prompt(self) -> str:
         """Render the model prompt for plan_agent."""
+        shown_paths = self.file_paths[:50]
+        remaining = len(self.file_paths) - len(shown_paths)
+        path_summary = str(shown_paths or "none")
+        if remaining > 0:
+            path_summary += f" (+{remaining} more resolved paths)"
         return (
             f"Objective: {self.objective}\n"
             f"Execution budget: at most {self.max_tasks} task(s), "
             f"{self.max_iterations} research iteration(s). Keep the plan as small as the objective allows.\n"
-            f"Resolved file paths: {self.file_paths or 'none'}\n"
+            f"Resolved file paths: {path_summary}\n"
             f"File previews:\n{self.file_context}"
         )
 
@@ -708,6 +829,26 @@ def _failed_research_report(state: SessionState) -> str:
     )
 
 
+def _collection_findings_report(state: SessionState) -> str:
+    """Forward grounded batch summaries without another small-model pass."""
+    sections = ["## Local Collection Summary"]
+    for index, item in enumerate(state.evidence_items, start=1):
+        sections.extend(
+            [
+                f"### Batch {index}",
+                item.answer.strip(),
+            ]
+        )
+    if state.uncertainties:
+        sections.extend(
+            [
+                "## Uncertainties",
+                "\n".join(f"- {item}" for item in state.uncertainties),
+            ]
+        )
+    return "\n\n".join(section for section in sections if section)
+
+
 async def _run_plan_workflow_internal(
     objective: str,
     matched_files: list[str],
@@ -770,6 +911,19 @@ async def _run_plan_workflow_internal(
         _rt("[synthesis] skipped — no findings collected", "yellow")
         return _format_plan_handoff(
             answer=_failed_research_report(state),
+            state=state,
+            planned_tasks=plan_output.tasks,
+            as_of=as_of,
+            time_sensitive=time_sensitive,
+        )
+
+    if requests_collection_plan(objective):
+        _rt(
+            "[synthesis] collection summaries forwarded from worker evidence",
+            "green",
+        )
+        return _format_plan_handoff(
+            answer=_collection_findings_report(state),
             state=state,
             planned_tasks=plan_output.tasks,
             as_of=as_of,

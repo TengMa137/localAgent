@@ -45,6 +45,14 @@ def _dedupe(items: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))
 
 
+def known_file_references(text: str) -> list[str]:
+    """Return bare, known-suffix filenames named in user text."""
+    return _dedupe(
+        match.group(1).strip().rstrip(".,;:!?)]}\"'")
+        for match in KNOWN_SUFFIX_RE.finditer(text)
+    )
+
+
 class PathPreflight:
     """Resolve explicit path hints before the LLM uses filesystem tools."""
 
@@ -71,7 +79,7 @@ class PathPreflight:
             if not self._looks_like_url(raw):
                 hints.append(self._normalize(raw))
 
-        for raw in KNOWN_SUFFIX_RE.findall(text):
+        for raw in known_file_references(text):
             if self._looks_like_url(raw):
                 continue
             hint = self._normalize(raw)
@@ -111,7 +119,26 @@ class PathPreflight:
         return None
 
     def _filename_matches(self, filename: str) -> list[str]:
-        return [path for path in self.files if PurePosixPath(path).name == filename]
+        normalized = filename.casefold()
+        exact = [
+            path
+            for path in self.files
+            if PurePosixPath(path).name.casefold() == normalized
+        ]
+        if exact:
+            return exact
+
+        compact = re.sub(r"[^a-z0-9]+", "", normalized)
+        return [
+            path
+            for path in self.files
+            if re.sub(
+                r"[^a-z0-9]+",
+                "",
+                PurePosixPath(path).name.casefold(),
+            )
+            == compact
+        ]
 
     def _suggest(self, path: str, *, limit: int = 5) -> list[str]:
         basename_matches = self._filename_matches(PurePosixPath(path).name)

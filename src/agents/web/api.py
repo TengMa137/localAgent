@@ -1,4 +1,4 @@
-"""Injected runtime for structured weather, Wikipedia, and news capabilities."""
+"""Injected runtime for structured weather and Wikipedia capabilities."""
 
 from __future__ import annotations
 
@@ -7,13 +7,11 @@ from typing import Any, Awaitable, Callable
 
 from .contracts import McpApiCallPlan, WebAgentResult, WebQueryPlan, dedupe
 from .policy import (
-    SPECIALIZED_MCP_TOOLS,
     api_plan_from_query_plan,
     api_result_is_usable,
     api_result_urls,
     preferred_api_tool,
 )
-from .presentation import format_api_result
 
 
 AsyncCallable = Callable[..., Awaitable[Any]]
@@ -24,84 +22,30 @@ class StructuredApiRuntime:
     mcp_url: str
     weather_forecast: AsyncCallable
     wiki_summary: AsyncCallable
-    news_search: AsyncCallable
-    model_run: AsyncCallable
-    argument_agent: Any
     synthesize: AsyncCallable
     fallback_search: AsyncCallable
-    query_plan_text: Callable[[WebQueryPlan | None], str]
     log: Callable[..., None]
 
-    async def build_call_plan(
+    def build_call_plan(
         self,
         *,
-        objective: str,
         query_plan: WebQueryPlan,
         tool_name: str,
-        failed_result: dict | None = None,
     ) -> McpApiCallPlan:
-        prompt_parts = [
-            f"Objective:\n{objective}",
-            "Query preflight:\n" + self.query_plan_text(query_plan),
-            f"Selected MCP tool: {tool_name}",
-        ]
-        if failed_result:
-            prompt_parts.append(
-                "Previous API failure:\n" + format_api_result(failed_result)
-            )
-            prompt_parts.append(
-                "Return corrected arguments and keep the same objective."
-            )
-        try:
-            result = await self.model_run(
-                self.argument_agent,
-                "\n\n".join(prompt_parts),
-                output_type=McpApiCallPlan,
-                output_name="McpApiCallPlan",
-                label="mcp_api_args",
-                indent=1,
-            )
-        except Exception as exc:
-            self.log(
-                f"[web_agent] mcp api arg preflight failed: {exc}",
-                "red",
-                1,
-            )
-            return api_plan_from_query_plan(query_plan, tool_name)
-
-        api_plan: McpApiCallPlan = result.output
-        if api_plan.tool_name not in SPECIALIZED_MCP_TOOLS:
-            api_plan.tool_name = tool_name
-        if api_plan.tool_name != tool_name:
-            api_plan.tool_name = tool_name
-            api_plan.checks.append(
-                "Tool name corrected to the already selected MCP tool."
-            )
+        api_plan = api_plan_from_query_plan(query_plan, tool_name)
         target = query_plan.retrieval_target
         if tool_name == "weather_forecast":
-            if target and failed_result is None:
+            if target:
                 api_plan.query = target
-                api_plan.location = target
+                api_plan.location = api_plan.location or target
             api_plan.date = api_plan.date or query_plan.date
             api_plan.language = None
-            api_plan.timespan = None
-            api_plan.max_results = None
         elif tool_name == "wiki_summary":
             if target:
                 api_plan.query = target
             api_plan.location = None
             api_plan.date = None
-            api_plan.timespan = None
-            api_plan.max_results = None
-        elif tool_name == "news_search":
-            if target:
-                api_plan.query = target
-            api_plan.location = None
-            api_plan.date = None
-            api_plan.language = None
-            api_plan.max_results = (
-                api_plan.max_results or query_plan.search_result_limit
-            )
+        api_plan.tool_name = tool_name
         if target:
             api_plan.checks.append(
                 "Dedicated API target locked to the verified source-selection target."
@@ -121,13 +65,6 @@ class StructuredApiRuntime:
                 api_plan.query,
                 language=api_plan.language,
             )
-        if api_plan.tool_name == "news_search":
-            return await self.news_search(
-                self.mcp_url,
-                api_plan.query,
-                max_results=api_plan.max_results,
-                timespan=api_plan.timespan,
-            )
         raise ValueError(f"Unsupported specialized MCP tool: {api_plan.tool_name}")
 
     async def run(
@@ -144,8 +81,7 @@ class StructuredApiRuntime:
             "yellow",
             1,
         )
-        api_plan = await self.build_call_plan(
-            objective=objective,
+        api_plan = self.build_call_plan(
             query_plan=query_plan,
             tool_name=tool_name,
         )
@@ -167,31 +103,18 @@ class StructuredApiRuntime:
                 1,
             )
 
-        api_result = await self.call(api_plan)
-        if (
-            tool_name == "weather_forecast"
-            and api_result.get("success") is False
-            and "location not found"
-            in str(api_result.get("error") or "").casefold()
-        ):
+        try:
+            api_result = await self.call(api_plan)
+        except Exception as exc:
+            api_result = {
+                "success": False,
+                "error": f"{tool_name} call failed: {exc.__class__.__name__}: {exc}",
+            }
             self.log(
-                "[web_agent] weather location failed; retrying normalized args",
+                f"[web_agent] {tool_name} call failed; using web fallback",
                 "red",
                 1,
             )
-            api_plan = await self.build_call_plan(
-                objective=objective,
-                query_plan=query_plan,
-                tool_name=tool_name,
-                failed_result=api_result,
-            )
-            self.log(
-                "[web_agent] deterministic mcp api retry location="
-                f"{api_plan.location or api_plan.query!r}",
-                "yellow",
-                1,
-            )
-            api_result = await self.call(api_plan)
 
         if not api_result_is_usable(tool_name, api_result):
             error = str(

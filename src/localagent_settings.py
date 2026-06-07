@@ -27,22 +27,15 @@ class AgentRuntimeSettings(LocalAgentSettings):
     mcp_url: str = "http://localhost:8000/sse"
     memory_dir: Path = Path(".memory")
     memory_enabled: bool = True
-    orchestrator_use_xml: bool = False
     structured_output_attempts: int = 3
     structured_output_max_tokens: int = 2048
     answer_output_max_tokens: int = 4096
+    disable_model_thinking: bool = True
     model_request_timeout_seconds: float = 180
     approve_tools: str = ""
     max_approval_rounds: int = 3
     log_level: str = ""
     trace: str = ""
-
-    @field_validator("orchestrator_use_xml", mode="before")
-    @classmethod
-    def parse_orchestrator_use_xml(cls, value: Any) -> Any:
-        if isinstance(value, str) and value.strip().lower() == "xml":
-            return True
-        return value
 
     @field_validator("skills_mode", mode="before")
     @classmethod

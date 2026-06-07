@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic_ai import Agent
@@ -10,8 +11,17 @@ from pydantic_ai.exceptions import UnexpectedModelBehavior
 from localagent_settings import get_runtime_settings
 from .observability import _rt, observable_run
 
+# Total calls, not retries: one initial call plus at most two fresh retries.
 MAX_MANUAL_OUTPUT_ATTEMPTS = 3
-MAX_RETRY_ERROR_CHARS = 1200
+MAX_RETRY_ERROR_CHARS = 240
+SELF_REVIEW_BOUNDARY_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"wait(?:[,.:]|\s+-)|"
+    r"final check:|"
+    r"i need to (?:ensure|check|verify)\b|"
+    r"(?:okay|ok),?\s+(?:i will|let me)\b"
+    r")"
+)
 
 
 def _attempt_limit(attempts: int | None = None) -> int:
@@ -36,6 +46,16 @@ def _merge_model_settings(
         merged["max_tokens"] = max_tokens
     if settings.model_request_timeout_seconds and "timeout" not in merged:
         merged["timeout"] = settings.model_request_timeout_seconds
+    if settings.disable_model_thinking:
+        extra_body = merged.get("extra_body")
+        if extra_body is None or isinstance(extra_body, dict):
+            normalized_extra = dict(extra_body or {})
+            chat_template_kwargs = dict(
+                normalized_extra.get("chat_template_kwargs") or {}
+            )
+            chat_template_kwargs.setdefault("enable_thinking", False)
+            normalized_extra["chat_template_kwargs"] = chat_template_kwargs
+            merged["extra_body"] = normalized_extra
     if merged:
         run_kwargs["model_settings"] = merged
     return run_kwargs
@@ -59,6 +79,16 @@ def answer_model_settings(kwargs: dict[str, Any] | None = None) -> dict[str, Any
     )
 
 
+def clean_text_answer(text: str) -> str:
+    """Trim small-model self-review that continues after a usable answer."""
+    answer = text.strip()
+    for match in SELF_REVIEW_BOUNDARY_RE.finditer(answer):
+        prefix = answer[: match.start()].rstrip()
+        if len(prefix) >= 80:
+            return prefix
+    return answer
+
+
 def _compact_error(exc: BaseException) -> str:
     text = str(exc).strip()
     if len(text) <= MAX_RETRY_ERROR_CHARS:
@@ -73,15 +103,11 @@ def _validation_retry_prompt(
     error: BaseException,
 ) -> str:
     return (
-        "The previous model response failed runtime output validation. The "
-        "invalid response is intentionally omitted from this retry.\n\n"
-        f"Expected output: {output_name}\n\n"
-        "Validation error summary:\n"
-        f"{_compact_error(error)}\n\n"
-        "Original task:\n"
-        f"{original_prompt}\n\n"
-        "Retry from the original task. Return only the required final output "
-        "for the expected schema; do not explain the validation failure."
+        "The invalid response is intentionally omitted.\n"
+        f"Return only a valid {output_name}; follow the system schema exactly "
+        "and do not explain.\n\n"
+        f"Task:\n{original_prompt}\n\n"
+        f"Validation summary: {_compact_error(error)}"
     )
 
 

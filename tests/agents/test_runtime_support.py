@@ -196,6 +196,78 @@ async def test_filesystem_guard_stops_repeated_empty_discovery():
         )
 
 
+@pytest.mark.asyncio
+async def test_filesystem_task_scope_rejects_unrelated_mount_reads():
+    from pydantic_ai.exceptions import ModelRetry
+
+    from agents.runtime.context import (
+        DuplicateFilesystemReadGuardToolset,
+        filesystem_run_scope,
+    )
+
+    class Wrapped:
+        async def call_tool(self, _name, _tool_args, _ctx, _tool):
+            raise AssertionError("out-of-scope call must not reach filesystem")
+
+    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    ctx = SimpleNamespace(run_id="run-scoped-read", messages=[])
+    read_tool = SimpleNamespace(tool_def=SimpleNamespace(name="read_file"))
+
+    with filesystem_run_scope(["/docs"]):
+        with pytest.raises(ModelRetry, match="outside this task's read scope"):
+            await guard.call_tool(
+                "read_file",
+                {"path": "/skills/research/strategy.md"},
+                ctx,
+                read_tool,
+            )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_task_scope_rejects_copy_from_unrelated_mount(
+    monkeypatch,
+    tmp_path,
+):
+    from pydantic_ai.exceptions import ModelRetry
+
+    from agents.runtime import context
+
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[
+                Mount(
+                    host_path=skills,
+                    mount_point="/skills",
+                    mode="rw",
+                )
+            ]
+        )
+    )
+    monkeypatch.setattr(context, "validator", validator)
+
+    class Wrapped:
+        async def call_tool(self, _name, _tool_args, _ctx, _tool):
+            raise AssertionError("out-of-scope copy must not reach filesystem")
+
+    guard = context.DuplicateFilesystemReadGuardToolset(Wrapped())
+    ctx = SimpleNamespace(run_id="run-scoped-copy", messages=[])
+    copy_tool = SimpleNamespace(tool_def=SimpleNamespace(name="copy_file"))
+
+    with context.filesystem_run_scope(["/skills"]):
+        with pytest.raises(ModelRetry, match="outside this task's read scope"):
+            await guard.call_tool(
+                "copy_file",
+                {
+                    "source": "/docs/secret.md",
+                    "destination": "/skills/secret.md",
+                },
+                ctx,
+                copy_tool,
+            )
+
+
 def test_default_skills_mount_is_writable_with_approval():
     from agents.runtime import context
 
@@ -241,6 +313,30 @@ def test_fs_preflight_keeps_unmatched_known_suffix_filename():
     assert "missing config yaml" in sanitized
 
 
+def test_fs_preflight_matches_bare_filename_case_and_separator_insensitively(
+    tmp_path,
+):
+    from agents.fs.path_policy import PathPreflight
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "AGENT_SYSTEM.md").write_text("Agent system notes.", encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+
+    sanitized, analysis = PathPreflight(
+        ["/docs/AGENT_SYSTEM.md"],
+        validator=validator,
+    ).analyze("check agentsystem.md")
+
+    assert sanitized == "check agentsystem.md"
+    assert analysis.resolved_paths == ["/docs/AGENT_SYSTEM.md"]
+    assert analysis.invalid_paths == []
+
+
 def test_fs_task_prompt_includes_file_index_and_write_targets(monkeypatch):
     from agents import fs_agent
 
@@ -275,6 +371,122 @@ def test_fs_task_prompt_includes_file_index_and_write_targets(monkeypatch):
     assert "- /skills/fitness/movement_recovery.md" in prompt
     assert "Skill editing policy hook" in prompt
     assert "Source: /skills/skill_editing.md" in prompt
+
+
+def test_fs_task_prompt_excludes_skills_for_ordinary_docs(monkeypatch):
+    from agents import fs_agent
+
+    monkeypatch.setattr(
+        fs_agent,
+        "_readable_file_index",
+        lambda: [
+            "/docs/papers/arxiv/world-model.md",
+            "/skills/research/strategy.md",
+        ],
+    )
+    monkeypatch.setattr(
+        fs_agent,
+        "scan_skills_context",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("ordinary docs task must not scan skills")
+        ),
+    )
+
+    prompt, analysis = fs_agent._fs_task_prompt(
+        "check the local papers related to world models"
+    )
+
+    assert analysis.all_path_hints() == []
+    assert "Readable roots for this task: /docs" in prompt
+    assert "/docs/papers/arxiv/world-model.md" in prompt
+    assert "/skills" not in prompt
+    assert "strategy.md" not in prompt
+    task_roots = fs_agent._task_read_roots(
+        "check the local papers related to world models",
+        analysis,
+    )
+    assert fs_agent._preemptive_rag_paths(
+        "check the local papers related to world models",
+        analysis,
+        task_roots,
+    ) == []
+    assert "use find_paths/list_files in the task scope" in prompt
+    assert "then grep_files with relevant title or identifier terms" in prompt
+
+
+def test_fs_task_prompt_requires_model_tool_discovery_for_ambiguous_artifact(
+    monkeypatch,
+):
+    from agents import fs_agent
+
+    monkeypatch.setattr(
+        fs_agent,
+        "_readable_file_index",
+        lambda: ["/docs/papers/agent-architecture.md"],
+    )
+
+    prompt, analysis = fs_agent._fs_task_prompt(
+        "summarize the paper and explain its architecture"
+    )
+
+    assert analysis.all_path_hints() == []
+    assert "Local-first discovery requirement" in prompt
+    assert "call grep_files for relevant content terms" in prompt
+    assert "queries=[...]" in prompt
+    assert "orchestrator can recover with web search" in prompt
+
+
+def test_fs_task_prompt_allows_web_recovery_for_local_paper_lookup(monkeypatch):
+    from agents import fs_agent
+
+    monkeypatch.setattr(
+        fs_agent,
+        "_readable_file_index",
+        lambda: ["/docs/papers/world-model.md"],
+    )
+
+    prompt, _analysis = fs_agent._fs_task_prompt(
+        "check local papers regarding recent world model research"
+    )
+
+    assert "Local-first discovery requirement" in prompt
+    assert "Try local discovery before using any fallback" in prompt
+    assert "orchestrator can recover with web search" in prompt
+
+
+def test_fs_non_paper_prompt_keeps_all_docs_in_scope(monkeypatch, tmp_path):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    papers = docs / "papers"
+    papers.mkdir(parents=True)
+    (docs / "agentsystem.md").write_text("Agent system notes.", encoding="utf-8")
+    (docs / "auth.md").write_text("Authentication notes.", encoding="utf-8")
+    (papers / "world-model.md").write_text("World model paper.", encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    prompt, analysis = fs_agent._fs_task_prompt(
+        "find the local authentication documentation and summarize it"
+    )
+    task_roots = fs_agent._task_read_roots(
+        "find the local authentication documentation and summarize it",
+        analysis,
+    )
+
+    assert task_roots == ["/docs"]
+    assert "/docs/agentsystem.md" in prompt
+    assert "/docs/auth.md" in prompt
+    assert "/docs/papers/world-model.md" in prompt
+    assert fs_agent._preemptive_rag_paths(
+        "find the local authentication documentation and summarize it",
+        analysis,
+        task_roots,
+    ) == []
 
 
 def test_fs_task_prompt_includes_skill_policy_for_loose_skill_write():
@@ -467,6 +679,232 @@ def test_orchestrator_guardrail_keeps_local_docs_paper_followup_on_fs():
     assert corrected.objective == decision.objective
 
 
+def test_orchestrator_guardrail_keeps_relative_docs_path_on_fs():
+    from agents.orchestrator_agent import (
+        OrchestratorChoice,
+        _decision_from_choice,
+        _guardrail_orchestrator_decision,
+        _mentioned_validator_roots,
+    )
+
+    prompt = "summarize agentsystem.md under docs/"
+    decision = _decision_from_choice(
+        prompt,
+        OrchestratorChoice(
+            route="fs",
+            content="Summarize the current agent system documentation.",
+        ),
+    )
+    corrected = _guardrail_orchestrator_decision(prompt, decision)
+
+    assert _mentioned_validator_roots(prompt) == {"/docs"}
+    assert decision.objective == prompt
+    assert corrected.route == "fs"
+    assert corrected.objective == prompt
+
+
+def test_orchestrator_guardrail_prefers_explicit_filename_over_discourse_now():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+        _orchestrator_model_prompt,
+    )
+
+    prompt = (
+        "ok, now check agentsystem.md and tell me how to build a robust "
+        "agent system"
+    )
+    corrected = _guardrail_orchestrator_decision(
+        prompt,
+        OrchestratorDecision(
+            route="web",
+            objective="Search for current agent system guidance",
+        ),
+    )
+
+    assert corrected.route == "fs"
+    assert corrected.objective == prompt
+    model_prompt = _orchestrator_model_prompt(prompt)
+    assert "explicit local filename(s): agentsystem.md" in model_prompt
+    assert len(model_prompt) < len(prompt) + 150
+
+
+def test_orchestrator_guardrail_does_not_turn_discourse_now_into_web():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+    )
+
+    decision = OrchestratorDecision(
+        route="direct",
+        reply="A robust agent system uses narrow contracts and deterministic guards.",
+    )
+
+    assert (
+        _guardrail_orchestrator_decision(
+            "ok, now explain how to build a robust agent system",
+            decision,
+        )
+        == decision
+    )
+
+
+def test_orchestrator_guardrail_routes_ambiguous_artifact_local_first():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+        _orchestrator_model_prompt,
+    )
+
+    prompt = "summarize the paper and explain its architecture"
+    corrected = _guardrail_orchestrator_decision(
+        prompt,
+        OrchestratorDecision(
+            route="web",
+            objective="Search online for the paper",
+        ),
+    )
+
+    assert corrected.route == "fs"
+    assert corrected.objective == prompt
+    assert "Try fs discovery first" in _orchestrator_model_prompt(prompt)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "now summarize all papers locally in parallel",
+        "I mean all papers under docs/papers/arxiv",
+        (
+            "you should first check all papers locally then read and summarize "
+            "them in parallel"
+        ),
+    ],
+)
+def test_orchestrator_guardrail_routes_collection_work_to_plan(prompt):
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+        _orchestrator_model_prompt,
+    )
+
+    corrected = _guardrail_orchestrator_decision(
+        prompt,
+        OrchestratorDecision(route="direct", reply="One paper summary."),
+    )
+
+    assert corrected.route == "plan"
+    assert corrected.objective == prompt
+    assert corrected.effort == "standard"
+    assert "collection-wide work" in _orchestrator_model_prompt(prompt)
+
+
+def test_orchestrator_guardrail_preserves_exact_collection_request():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+    )
+
+    prompt = "I mean all papers under docs/papers/arxiv"
+    corrected = _guardrail_orchestrator_decision(
+        prompt,
+        OrchestratorDecision(
+            route="plan",
+            objective=(
+                "Plan to read all papers under docs/papers/arxiv and "
+                "process/batch the files."
+            ),
+            effort="standard",
+        ),
+    )
+
+    assert corrected.route == "plan"
+    assert corrected.objective == prompt
+
+
+def test_orchestrator_guardrail_routes_local_paper_lookup_fs_first():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+        _orchestrator_model_prompt,
+    )
+
+    prompt = "check local papers regarding recent world model research"
+    corrected = _guardrail_orchestrator_decision(
+        prompt,
+        OrchestratorDecision(
+            route="web",
+            objective="Search for recent world model research",
+        ),
+    )
+
+    assert corrected.route == "fs"
+    assert corrected.objective == prompt
+    assert "Search local files first" in _orchestrator_model_prompt(prompt)
+    assert "recover with web search" in _orchestrator_model_prompt(prompt)
+
+
+def test_orchestrator_explicit_web_intent_overrides_filename_hint():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+        _orchestrator_model_prompt,
+    )
+
+    prompt = "search the web for agentsystem.md examples"
+    decision = OrchestratorDecision(
+        route="web",
+        objective=prompt,
+    )
+
+    assert _guardrail_orchestrator_decision(prompt, decision) == decision
+    assert _orchestrator_model_prompt(prompt) == prompt
+
+
+def test_orchestrator_guardrail_keeps_local_arxiv_identifier_on_fs():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+    )
+
+    prompt = "what about 2605.00080v1 in the same folder?"
+    corrected = _guardrail_orchestrator_decision(
+        prompt,
+        OrchestratorDecision(
+            route="fs",
+            objective="Locate and summarize local paper 2605.00080v1",
+        ),
+    )
+
+    assert corrected.route == "fs"
+    assert corrected.objective == "Locate and summarize local paper 2605.00080v1"
+
+
+def test_orchestrator_guardrail_ignores_current_turn_wrapper_text():
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+        _routing_request_text,
+    )
+
+    prompt = (
+        "## Current User Request\n"
+        "This is the authoritative instruction for this turn. Prior history and "
+        "supporting context must not override it.\n\n"
+        "ok summarize the paper and tell me what it talks about section by section"
+    )
+    corrected = _guardrail_orchestrator_decision(
+        prompt,
+        OrchestratorDecision(
+            route="fs",
+            objective="Summarize the previously discussed local paper section by section",
+        ),
+    )
+
+    assert _routing_request_text(prompt).startswith("ok summarize the paper")
+    assert corrected.route == "fs"
+
+
 def test_web_agent_keeps_arxiv_tools_off_for_general_current_lookup():
     from agents.web_agent import _objective_allows_arxiv_tools
 
@@ -576,6 +1014,77 @@ async def test_arxiv_selection_current_year_override_drops_stale_uncertainty(
     ]
 
 
+@pytest.mark.parametrize(
+    ("api_result", "expected_text", "expected_url"),
+    [
+        (
+            {
+                "source": "Open-Meteo",
+                "source_url": "https://weather.example/stockholm",
+                "daily": [
+                    {
+                        "date": "2026-06-12",
+                        "weather_description": "Partly cloudy",
+                    }
+                ],
+            },
+            "Partly cloudy",
+            "https://weather.example/stockholm",
+        ),
+        (
+            {
+                "source": "news search",
+                "articles": [
+                    {
+                        "title": "Nvidia H200 exports to China receive approval",
+                        "url": "https://news.example/nvidia-h200-china",
+                    }
+                ],
+            },
+            "Nvidia H200 exports to China receive approval",
+            "https://news.example/nvidia-h200-china",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_web_answer_validation_failure_uses_executed_api_evidence(
+    monkeypatch,
+    api_result,
+    expected_text,
+    expected_url,
+):
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    from agents import web_agent
+
+    calls: list[dict] = []
+
+    async def fail_synthesis(_agent, _prompt, **kwargs):
+        calls.append(kwargs)
+        raise UnexpectedModelBehavior(
+            "Exceeded maximum retries (0) for output validation"
+        )
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fail_synthesis,
+    )
+
+    result = await web_agent._synthesize_web_answer(
+        objective="Get current information",
+        query_plan=web_agent.WebQueryPlan(query="current information"),
+        api_result=api_result,
+    )
+
+    assert expected_text in result.answer
+    assert result.search_queries == ["current information"]
+    assert expected_url in result.urls
+    assert len(calls) == 1
+    assert calls[0]["attempts"] == 1
+    assert calls[0]["output_type"] is str
+
+
 @pytest.mark.asyncio
 async def test_run_web_task_preflights_query_before_search(monkeypatch):
     from agents import web_agent
@@ -608,12 +1117,7 @@ async def test_run_web_task_preflights_query_before_search(monkeypatch):
                     reason="Need one source page for verification.",
                 )
             )
-        return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="Gold is quoted at the tested value.",
-                summary="Found a live gold quote.",
-            )
-        )
+        return SimpleNamespace(output="Gold is quoted at the tested value.")
 
     async def fake_search(_mcp_url, query, *, max_results=None):
         events.append(("search", query))
@@ -667,7 +1171,7 @@ async def test_run_web_task_preflights_query_before_search(monkeypatch):
         ("model", "WebPreviewDecision"),
         ("crawl", "https://example.com/gold"),
         ("rag", "search"),
-        ("model", "WebAgentResult"),
+        ("model", "web answer text"),
     ]
 
 
@@ -703,12 +1207,7 @@ async def test_run_web_task_skips_crawl_when_preview_is_enough(monkeypatch):
                 )
             )
         return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer=(
-                    "Lund, Sweden is forecast to have passing showers tomorrow."
-                ),
-                summary="Answered from weather search previews.",
-            )
+            output="Lund, Sweden is forecast to have passing showers tomorrow."
         )
 
     async def fake_search(_mcp_url, query, *, max_results=None):
@@ -750,7 +1249,7 @@ async def test_run_web_task_skips_crawl_when_preview_is_enough(monkeypatch):
         ("model", "WebQueryPlan"),
         ("search", "weather Lund Sweden tomorrow:3"),
         ("model", "WebPreviewDecision"),
-        ("model", "WebAgentResult"),
+        ("model", "web answer text"),
     ]
 
 
@@ -784,10 +1283,7 @@ async def test_run_web_task_uses_source_domain_queries(monkeypatch):
                 )
             )
         return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="Lund weather answered from source-scoped previews.",
-                summary="Answered weather from source-scoped previews.",
-            )
+            output="Lund weather answered from source-scoped previews."
         )
 
     async def fake_search(_mcp_url, query, *, max_results=None):
@@ -857,22 +1353,7 @@ async def test_run_web_task_uses_weather_forecast_mcp_tool(monkeypatch):
                     checks=["Tomorrow resolves to 2026-06-06 in Lund."],
                 )
             )
-        if output_name == "McpApiCallPlan":
-            return SimpleNamespace(
-                output=web_agent.McpApiCallPlan(
-                    tool_name="weather_forecast",
-                    query="Lund, Sweden weather",
-                    location="Lund, Sweden",
-                    date="2026-06-06",
-                    reason="Location was separated from forecast wording.",
-                )
-            )
-        return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="Lund forecast: partly cloudy, 18 C high.",
-                summary="Answered from Open-Meteo.",
-            )
-        )
+        return SimpleNamespace(output="Lund forecast: partly cloudy, 18 C high.")
 
     async def fake_weather(_mcp_url, location, *, date=None):
         events.append(("weather", f"{location}:{date}"))
@@ -911,7 +1392,11 @@ async def test_run_web_task_uses_weather_forecast_mcp_tool(monkeypatch):
 
 
 def test_preferred_api_tool_accepts_exact_tool_name_or_source_alias():
-    from agents.web_agent import WebQueryPlan, _preferred_api_tool
+    from agents.web_agent import (
+        WebQueryPlan,
+        WebSourceDecision,
+        _preferred_api_tool,
+    )
 
     assert (
         _preferred_api_tool(
@@ -940,107 +1425,46 @@ def test_preferred_api_tool_accepts_exact_tool_name_or_source_alias():
         )
         == "weather_forecast"
     )
+    assert WebSourceDecision(kind="recent_news").method == "web"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("preferred_source", "tool_name", "objective", "api_payload", "answer"),
-    [
-        (
-            "wiki_summary",
-            "wiki_summary",
-            "look up an encyclopedia overview of the printing press",
-            {
-                "success": True,
-                "title": "Printing press",
-                "extract": "A printing press applies pressure to an inked surface.",
-                "page_url": "https://en.wikipedia.org/wiki/Printing_press",
-            },
-            "The printing press is a mechanical printing technology.",
-        ),
-        (
-            "news_search",
-            "news_search",
-            "find the latest reporting on the EU AI Act",
-            {
-                "success": True,
-                "articles": [
-                    {
-                        "title": "EU AI Act update",
-                        "url": "https://example.com/eu-ai-act",
-                    }
-                ],
-            },
-            "Recent reporting covers an EU AI Act update.",
-        ),
-    ],
-)
-async def test_run_web_task_uses_selected_structured_api_without_search_or_crawl(
-    monkeypatch,
-    preferred_source,
-    tool_name,
-    objective,
-    api_payload,
-    answer,
-):
+async def test_run_web_task_uses_wiki_api_without_search_or_crawl(monkeypatch):
     from agents import web_agent
 
     events: list[tuple[str, str]] = []
+    objective = "look up an encyclopedia overview of the printing press"
+    answer = "The printing press is a mechanical printing technology."
+    api_payload = {
+        "success": True,
+        "title": "Printing press",
+        "extract": "A printing press applies pressure to an inked surface.",
+        "page_url": "https://en.wikipedia.org/wiki/Printing_press",
+    }
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
         if output_name == "WebSourceDecision":
             return SimpleNamespace(
                 output=web_agent.WebSourceDecision(
-                    kind=(
-                        "encyclopedia"
-                        if preferred_source == "wiki_summary"
-                        else "recent_news"
-                    ),
-                    target=(
-                        "Printing press"
-                        if preferred_source == "wiki_summary"
-                        else "EU AI Act"
-                    ),
+                    kind="encyclopedia",
+                    target="Printing press",
                 )
             )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
                     query=objective,
-                    preferred_source=preferred_source,
+                    preferred_source="wiki_summary",
                     preferred_tool=None,
                     search_result_limit=3,
                     crawl_url_limit=0,
                 )
             )
-        if output_name == "McpApiCallPlan":
-            return SimpleNamespace(
-                output=web_agent.McpApiCallPlan(
-                    tool_name=tool_name,
-                    query=f"verbose instruction: {objective}",
-                    timespan="1week" if tool_name == "news_search" else None,
-                )
-            )
-        return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer=answer,
-                summary=f"Answered with {tool_name}.",
-            )
-        )
+        return SimpleNamespace(output=answer)
 
     async def fake_wiki(_mcp_url, query, *, language=None):
         events.append(("wiki", f"{query}:{language}"))
-        return api_payload
-
-    async def fake_news(
-        _mcp_url,
-        query,
-        *,
-        max_results=None,
-        timespan=None,
-    ):
-        events.append(("news", f"{query}:{max_results}:{timespan}"))
         return api_payload
 
     async def fail_search(*_args, **_kwargs):
@@ -1055,7 +1479,6 @@ async def test_run_web_task_uses_selected_structured_api_without_search_or_crawl
         fake_model_run,
     )
     monkeypatch.setattr(web_agent, "wiki_summary_result", fake_wiki)
-    monkeypatch.setattr(web_agent, "news_search_results", fake_news)
     monkeypatch.setattr(web_agent, "web_search_results", fail_search)
     monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fail_crawl)
 
@@ -1063,12 +1486,7 @@ async def test_run_web_task_uses_selected_structured_api_without_search_or_crawl
 
     assert answer in result
     assert ("model", "WebPreviewDecision") not in events
-    expected_api_event = (
-        ("wiki", "Printing press:None")
-        if tool_name == "wiki_summary"
-        else ("news", "EU AI Act:3:1week")
-    )
-    assert expected_api_event in events
+    assert ("wiki", "Printing press:None") in events
 
 
 @pytest.mark.asyncio
@@ -1094,13 +1512,6 @@ async def test_empty_structured_api_result_falls_back_to_one_web_search(monkeypa
                     crawl_url_limit=0,
                 )
             )
-        if output_name == "McpApiCallPlan":
-            return SimpleNamespace(
-                output=web_agent.McpApiCallPlan(
-                    tool_name="wiki_summary",
-                    query="Example Agency",
-                )
-            )
         if output_name == "WebPreviewDecision":
             return SimpleNamespace(
                 output=web_agent.WebPreviewDecision(
@@ -1109,10 +1520,7 @@ async def test_empty_structured_api_result_falls_back_to_one_web_search(monkeypa
                 )
             )
         return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="The current office holder was found from web results.",
-                summary="Dedicated source missed; web fallback succeeded.",
-            )
+            output="The current office holder was found from web results."
         )
 
     async def fake_wiki(*_args, **_kwargs):
@@ -1140,14 +1548,70 @@ async def test_empty_structured_api_result_falls_back_to_one_web_search(monkeypa
 
     result = await web_agent.run_web_task("who currently leads the example agency?")
 
-    assert "web fallback succeeded" in result
+    assert "current office holder was found from web results" in result
     assert ("wiki", "empty") in events
     assert ("search", "current office holder for example agency:5") in events
     assert events.count(("model", "WebPreviewDecision")) == 1
 
 
 @pytest.mark.asyncio
-async def test_run_web_task_retries_weather_with_normalized_location(monkeypatch):
+async def test_recent_news_uses_web_search_directly(monkeypatch):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="recent_news",
+                    target="EU AI Act",
+                )
+            )
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query="latest EU AI Act reporting",
+                    search_result_limit=3,
+                    crawl_url_limit=0,
+                )
+            )
+        if output_name == "WebPreviewDecision":
+            return SimpleNamespace(
+                output=web_agent.WebPreviewDecision(answer_from_preview=True)
+            )
+        return SimpleNamespace(
+            output="Fallback search found current EU AI Act reporting."
+        )
+
+    async def fake_search(_mcp_url, query, *, max_results=None):
+        events.append(("search", f"{query}:{max_results}"))
+        return [
+            {
+                "title": "EU AI Act update",
+                "url": "https://example.com/eu-ai-act",
+                "snippet": "A current update.",
+                "position": 1,
+            }
+        ]
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_search_results", fake_search)
+
+    result = await web_agent.run_web_task("find the latest EU AI Act reporting")
+
+    assert "Fallback search found" in result
+    assert ("search", "latest EU AI Act reporting:3") in events
+    assert all(event[0] != "news" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_run_web_task_normalizes_weather_location_without_model_retry(monkeypatch):
     from agents import web_agent
 
     events: list[tuple[str, str]] = []
@@ -1170,27 +1634,7 @@ async def test_run_web_task_retries_weather_with_normalized_location(monkeypatch
                     crawl_url_limit=0,
                 )
             )
-        if output_name == "McpApiCallPlan":
-            first_attempt = events.count(("model", "McpApiCallPlan")) == 1
-            return SimpleNamespace(
-                output=web_agent.McpApiCallPlan(
-                    tool_name="weather_forecast",
-                    query=(
-                        "Lund, Sweden - tomorrow's weather forecast "
-                        "(Saturday, 06 June 2026)"
-                        if first_attempt
-                        else "Lund, Sweden"
-                    ),
-                    location=None if first_attempt else "Lund, Sweden",
-                    date="2026-06-06",
-                )
-            )
-        return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="Retry succeeded for Lund weather.",
-                summary="Weather API retry succeeded.",
-            )
-        )
+        return SimpleNamespace(output="Lund weather lookup succeeded.")
 
     async def fake_weather(_mcp_url, location, *, date=None):
         events.append(("weather", f"{location}:{date}"))
@@ -1217,11 +1661,7 @@ async def test_run_web_task_retries_weather_with_normalized_location(monkeypatch
 
     result = await web_agent.run_web_task("check the weather in Lund tomorrow")
 
-    assert "Retry succeeded" in result
-    assert (
-        "weather",
-        "Lund, Sweden - tomorrow's weather forecast (Saturday, 06 June 2026):2026-06-06",
-    ) in events
+    assert "lookup succeeded" in result
     assert ("weather", "Lund, Sweden:2026-06-06") in events
 
 
@@ -1273,12 +1713,7 @@ async def test_run_web_task_saves_arxiv_paper_to_docs_and_scopes_rag(
                     reason="Survey paper best matches the overview request.",
                 )
             )
-        return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="Saved and summarized the survey.",
-                summary="Saved arXiv survey locally.",
-            )
-        )
+        return SimpleNamespace(output="Saved and summarized the survey.")
 
     async def fake_web_search(_mcp_url, query, *, max_results=None):
         events.append(("web_search", query))
@@ -1420,12 +1855,7 @@ async def test_arxiv_fetch_downloads_pdf_when_explicitly_requested(
                     crawl_url_limit=1,
                 )
             )
-        return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="Saved the paper and original PDF.",
-                summary="Saved both paper artifacts.",
-            )
-        )
+        return SimpleNamespace(output="Saved the paper and original PDF.")
 
     async def fake_fetch(_mcp_url, _ids):
         return [paper]
@@ -1524,12 +1954,7 @@ async def test_run_web_task_uses_arxiv_web_search_for_semantic_discovery(
                     reason="Matches diffusion language models.",
                 )
             )
-        return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="Selected Large Language Diffusion Models.",
-                summary="Selected fallback arXiv paper.",
-            )
-        )
+        return SimpleNamespace(output="Selected Large Language Diffusion Models.")
 
     async def fake_web_search(_mcp_url, query, *, max_results=None):
         events.append(("web_search", query))
@@ -1654,10 +2079,7 @@ async def test_run_web_task_saves_fallback_arxiv_record_when_fetch_misses(
                 )
             )
         return SimpleNamespace(
-            output=web_agent.WebAgentResult(
-                answer="Selected Continuous Latent Diffusion Language Model.",
-                summary="Selected current-year DLM paper.",
-            )
+            output="Selected Continuous Latent Diffusion Language Model."
         )
 
     async def fake_web_search(_mcp_url, query, *, max_results=None):
@@ -1687,10 +2109,17 @@ async def test_run_web_task_saves_fallback_arxiv_record_when_fetch_misses(
     async def fake_ingest(docs):
         events.append(("ingest", str(len(docs))))
 
+    async def fake_ingest_local_pdfs(paths):
+        events.append(("ingest_pdf", ",".join(paths)))
+        return paths
+
     async def fake_rag_search(**kwargs):
         docs = kwargs.get("docs") or []
         events.append(("rag_docs", ",".join(docs)))
-        assert docs == ["/docs/papers/arxiv/2605.06548.md"]
+        assert docs == [
+            "/docs/papers/arxiv/2605.06548.md",
+            "/docs/papers/arxiv/2605.06548.pdf",
+        ]
         return []
 
     monkeypatch.setattr(
@@ -1702,6 +2131,11 @@ async def test_run_web_task_saves_fallback_arxiv_record_when_fetch_misses(
     monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
     monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
     monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
+    monkeypatch.setattr(
+        web_agent,
+        "_ingest_local_arxiv_pdfs",
+        fake_ingest_local_pdfs,
+    )
     monkeypatch.setattr(
         web_agent,
         "_current_research_date",
@@ -1729,13 +2163,56 @@ async def test_run_web_task_saves_fallback_arxiv_record_when_fetch_misses(
     assert "Continuous Latent Diffusion Language Model" in content
     assert "https://arxiv.org/abs/2605.06548" in content
     assert "Local PDF Path: /docs/papers/arxiv/2605.06548.pdf" in content
+    assert "Local PDF RAG Indexed: yes" in content
     assert "full paper PDF was saved locally" in content
     assert "/docs/papers/arxiv/2605.06548.md" in result
     assert "/docs/papers/arxiv/2605.06548.pdf" in result
     assert "Saved local paper path(s): /docs/papers/arxiv/2605.06548.md" in result
     assert ("arxiv_fetch", "2605.06548") in events
     assert ("download_pdf", "2605.06548") in events
-    assert ("rag_docs", "/docs/papers/arxiv/2605.06548.md") in events
+    assert (
+        "ingest_pdf",
+        "/docs/papers/arxiv/2605.06548.pdf",
+    ) in events
+    assert (
+        "rag_docs",
+        "/docs/papers/arxiv/2605.06548.md,/docs/papers/arxiv/2605.06548.pdf",
+    ) in events
+
+
+@pytest.mark.asyncio
+async def test_ingest_local_arxiv_pdfs_resolves_validator_paths(
+    monkeypatch,
+    tmp_path,
+):
+    from agents import web_agent
+
+    docs = tmp_path / "docs"
+    paper_dir = docs / "papers" / "arxiv"
+    paper_dir.mkdir(parents=True)
+    pdf_path = paper_dir / "2605.06548.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\nfixture")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    captured: list[list[str]] = []
+
+    class FakeRagService:
+        async def ingest_local(self, paths):
+            captured.append(paths)
+            return ["pdf-doc"]
+
+    monkeypatch.setattr(web_agent, "rag_validator", validator)
+    monkeypatch.setattr(web_agent, "rag_service", FakeRagService())
+
+    result = await web_agent._ingest_local_arxiv_pdfs(
+        ["/docs/papers/arxiv/2605.06548.pdf"]
+    )
+
+    assert result == ["/docs/papers/arxiv/2605.06548.pdf"]
+    assert captured == [[str(pdf_path)]]
 
 
 def test_current_turn_prompt_prioritizes_user_request():
@@ -1760,6 +2237,125 @@ def test_recent_orchestrator_history_is_bounded():
     assert _recent_orchestrator_history(messages) == messages[
         -MAX_ORCHESTRATOR_HISTORY_MESSAGES:
     ]
+
+
+def test_clean_text_answer_trims_small_model_self_review():
+    from agents.structured_retry import clean_text_answer
+
+    answer = (
+        "The local collection contains five papers. Each paper was summarized "
+        "from its assigned files.\n\n"
+        "Wait, I need to ensure I followed every instruction.\n"
+        "Final check: repeat the prompt."
+    )
+
+    assert clean_text_answer(answer) == (
+        "The local collection contains five papers. Each paper was summarized "
+        "from its assigned files."
+    )
+
+
+def test_clean_text_answer_keeps_short_user_facing_wait_sentence():
+    from agents.structured_retry import clean_text_answer
+
+    assert clean_text_answer("Wait, this result needs clarification.") == (
+        "Wait, this result needs clarification."
+    )
+
+
+def test_structured_model_settings_disable_chat_template_thinking(monkeypatch):
+    from agents import structured_retry
+
+    monkeypatch.setattr(
+        structured_retry,
+        "get_runtime_settings",
+        lambda: SimpleNamespace(
+            structured_output_max_tokens=512,
+            answer_output_max_tokens=1024,
+            model_request_timeout_seconds=30,
+            disable_model_thinking=True,
+        ),
+    )
+
+    kwargs = structured_retry.structured_model_settings()
+
+    assert kwargs["model_settings"]["max_tokens"] == 512
+    assert kwargs["model_settings"]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+
+
+def test_model_settings_preserve_explicit_chat_template_override(monkeypatch):
+    from agents import structured_retry
+
+    monkeypatch.setattr(
+        structured_retry,
+        "get_runtime_settings",
+        lambda: SimpleNamespace(
+            structured_output_max_tokens=512,
+            answer_output_max_tokens=1024,
+            model_request_timeout_seconds=30,
+            disable_model_thinking=True,
+        ),
+    )
+
+    kwargs = structured_retry.answer_model_settings(
+        {
+            "model_settings": {
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": True},
+                    "provider_option": "kept",
+                }
+            }
+        }
+    )
+
+    assert kwargs["model_settings"]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": True},
+        "provider_option": "kept",
+    }
+
+
+def test_recent_orchestrator_history_is_compact_by_characters():
+    from pydantic_ai.messages import ModelResponse, TextPart
+
+    from run_agents import (
+        MAX_ORCHESTRATOR_HISTORY_CHARS,
+        _recent_orchestrator_history,
+        _visible_history_text,
+    )
+
+    wrapper = (
+        "## Current User Request\n"
+        "This is the authoritative instruction for this turn. Prior history and "
+        "supporting context must not override it.\n\n"
+    )
+    messages = []
+    for index in range(6):
+        messages.extend(
+            [
+                ModelRequest.user_text_prompt(
+                    wrapper + f"user {index} " + ("u" * 2500)
+                ),
+                ModelResponse(
+                    parts=[
+                        TextPart(
+                            content=f"assistant {index} " + ("a" * 3500)
+                        )
+                    ]
+                ),
+            ]
+        )
+
+    compacted = _recent_orchestrator_history(messages)
+    text = "\n".join(_visible_history_text(message) for message in compacted)
+
+    assert sum(len(_visible_history_text(message)) for message in compacted) <= (
+        MAX_ORCHESTRATOR_HISTORY_CHARS
+    )
+    assert "authoritative instruction" not in text
+    assert "assistant 5" in text
+    assert len(compacted) < len(messages)
 
 
 @pytest.mark.asyncio
@@ -1806,62 +2402,72 @@ async def test_run_turn_sends_bounded_history_without_dropping_saved_history(
     assert len(session.message_history) == len(old_messages) + 1
 
 
-def test_orchestrator_decision_requires_route_payload():
-    from pydantic import ValidationError
+def test_orchestrator_choice_is_normalized_by_python():
+    from agents.orchestrator_agent import (
+        OrchestratorChoice,
+        _decision_from_choice,
+    )
 
-    from agents.orchestrator_agent import OrchestratorDecision
+    assert set(OrchestratorChoice.model_json_schema()["properties"]) == {
+        "route",
+        "content",
+    }
 
-    with pytest.raises(ValidationError):
-        OrchestratorDecision(route="direct")
+    direct = _decision_from_choice(
+        "hello",
+        OrchestratorChoice(route="direct", content="Hello."),
+    )
+    assert direct.reply == "Hello."
+    assert direct.objective is None
+    assert direct.effort == "none"
 
-    with pytest.raises(ValidationError):
-        OrchestratorDecision(route="plan")
+    delegated = _decision_from_choice(
+        "fallback objective",
+        OrchestratorChoice(route="web", content="Fetch the current docs."),
+    )
+    assert delegated.reply is None
+    assert delegated.objective == "Fetch the current docs."
+    assert delegated.effort == "minimal"
 
-    assert OrchestratorDecision(route="direct", reply="Hello").reply == "Hello"
-    assert (
-        OrchestratorDecision(
+    planned = _decision_from_choice(
+        "Compare local notes with current sources.",
+        OrchestratorChoice(route="plan"),
+    )
+    assert planned.objective == "Compare local notes with current sources."
+    assert planned.effort == "standard"
+
+
+def test_orchestrator_drops_invented_fs_mount_path():
+    from agents.orchestrator_agent import (
+        OrchestratorChoice,
+        _decision_from_choice,
+    )
+
+    prompt = "check the papers locally related to world models and summarize them"
+    decision = _decision_from_choice(
+        prompt,
+        OrchestratorChoice(
             route="fs",
-            objective="Read the requested file",
-        ).effort
-        == "minimal"
-    )
-    assert (
-        OrchestratorDecision(
-            route="web",
-            objective="Fetch the provided URL",
-        ).effort
-        == "minimal"
-    )
-    assert (
-        OrchestratorDecision(
-            route="plan",
-            objective="Read the requested file",
-            effort="minimal",
-        ).objective
-        == "Read the requested file"
+            content=(
+                "I will read local papers under /skills and summarize them."
+            ),
+        ),
     )
 
-
-def test_orchestrator_deep_effort_caps_iterations_at_three():
-    from agents.orchestrator_agent import _plan_budget
-
-    assert _plan_budget("deep")[1] == 3
+    assert decision.objective == prompt
 
 
 def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
-    from localagent_settings import AgentRuntimeSettings, get_runtime_settings
+    from localagent_settings import get_runtime_settings
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LOCALAGENT_MEMORY_ENABLED", raising=False)
-    monkeypatch.delenv("LOCALAGENT_ORCHESTRATOR_USE_XML", raising=False)
     monkeypatch.delenv("LOCALAGENT_SKILLS_MODE", raising=False)
-    assert AgentRuntimeSettings().orchestrator_use_xml is False
 
     (tmp_path / ".env").write_text(
         "\n".join(
             [
                 "LOCALAGENT_MEMORY_ENABLED=false",
-                "LOCALAGENT_ORCHESTRATOR_USE_XML=xml",
                 "LOCALAGENT_SKILLS_MODE=RO",
             ]
         ),
@@ -1872,7 +2478,6 @@ def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
     settings = get_runtime_settings()
 
     assert settings.memory_enabled is False
-    assert settings.orchestrator_use_xml is True
     assert settings.skills_mode == "ro"
     get_runtime_settings.cache_clear()
 
@@ -1922,173 +2527,6 @@ def test_env_example_contains_only_supported_settings():
     assert speech_keys <= env_keys
 
 
-def test_parse_xml_orchestrator_decision_with_simple_fields():
-    from agents.orchestrator_agent import _parse_xml_orchestrator_decision
-
-    decision = _parse_xml_orchestrator_decision(
-        """
-<decision>
-  <route>plan</route>
-  <reply></reply>
-  <objective>Read /docs/notes.md and summarize it.</objective>
-  <effort>minimal</effort>
-</decision>
-"""
-    )
-
-    assert decision.route == "plan"
-    assert decision.objective == "Read /docs/notes.md and summarize it."
-    assert decision.reply is None
-    assert decision.effort == "minimal"
-    assert decision.session_title is None
-    assert decision.memory_findings == []
-
-
-def test_parse_xml_orchestrator_decision_accepts_fenced_document():
-    from agents.orchestrator_agent import _parse_xml_orchestrator_decision
-
-    decision = _parse_xml_orchestrator_decision(
-        """
-```xml
-<decision>
-  <route>direct</route>
-  <reply><![CDATA[Use general reasoning for stable concepts.]]></reply>
-  <objective></objective>
-  <effort>none</effort>
-</decision>
-```
-"""
-    )
-
-    assert decision.route == "direct"
-    assert decision.reply == "Use general reasoning for stable concepts."
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_turn_uses_xml_output_contract(monkeypatch):
-    from agents import orchestrator_agent
-    from agents.orchestrator_agent import run_orchestrator_turn
-    from localagent_settings import get_runtime_settings
-
-    seen: dict[str, object] = {}
-
-    async def fake_observable_run(agent, prompt, **_kwargs):
-        seen["agent"] = agent
-        seen["prompt"] = prompt
-        return SimpleNamespace(
-            output="""
-<decision>
-  <route>direct</route>
-  <reply>Hello.</reply>
-  <objective></objective>
-  <effort>none</effort>
-</decision>
-""",
-            all_messages=lambda: [ModelRequest.user_text_prompt(prompt)],
-        )
-
-    monkeypatch.setenv("LOCALAGENT_ORCHESTRATOR_USE_XML", "true")
-    get_runtime_settings.cache_clear()
-    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
-
-    result = await run_orchestrator_turn("hello")
-
-    assert seen["agent"] is orchestrator_agent.orchestrator_xml
-    assert "XML output format:" in orchestrator_agent._orchestrator_xml_prompt()
-    assert result.output.reply == "Hello."
-    assert result.decision.route == "direct"
-    assert result.decision.session_title is None
-    get_runtime_settings.cache_clear()
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_xml_output_repair_retry(monkeypatch):
-    from agents import orchestrator_agent
-    from agents.orchestrator_agent import run_orchestrator_turn
-
-    calls: list[str] = []
-
-    async def fake_observable_run(_agent, prompt, **_kwargs):
-        calls.append(prompt)
-        if len(calls) == 1:
-            output = "not xml"
-        else:
-            output = """
-<decision>
-  <route>direct</route>
-  <reply>Repaired.</reply>
-  <objective></objective>
-  <effort>none</effort>
-</decision>
-"""
-        return SimpleNamespace(
-            output=output,
-            all_messages=lambda: [ModelRequest.user_text_prompt(prompt)],
-        )
-
-    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
-
-    result = await run_orchestrator_turn("hello", use_xml=True)
-
-    assert len(calls) == 2
-    assert "failed XML parsing or schema validation" in calls[1]
-    assert "Original user prompt to route:\nhello" in calls[1]
-    assert result.output.reply == "Repaired."
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_xml_retries_schema_invalid_payload(monkeypatch):
-    from agents import orchestrator_agent
-    from agents.orchestrator_agent import _run_xml_orchestrator_decision
-
-    calls: list[str] = []
-
-    async def fake_observable_run(_agent, prompt, **_kwargs):
-        calls.append(prompt)
-        if len(calls) == 1:
-            output = "not xml"
-        elif len(calls) == 2:
-            output = """
-<decision>
-  <route>direct</route>
-  <reply></reply>
-  <objective><![CDATA[Read all available fitness skills.]]></objective>
-  <effort>minimal</effort>
-</decision>
-"""
-        else:
-            output = """
-<decision>
-  <route>plan</route>
-  <reply></reply>
-  <objective><![CDATA[Read all fitness skills and list all important points.]]></objective>
-  <effort>minimal</effort>
-</decision>
-"""
-        return SimpleNamespace(
-            output=output,
-            all_messages=lambda: [ModelRequest.user_text_prompt(prompt)],
-        )
-
-    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
-
-    result = await _run_xml_orchestrator_decision(
-        "read all fitness skills and list all important points",
-        label="orchestrator",
-        indent=0,
-        message_history=[],
-        metadata=None,
-    )
-
-    assert len(calls) == 3
-    assert "reply is required for direct" in calls[2]
-    assert "route=fs, route=web, and route=plan require" in calls[2]
-    assert result.output.route == "plan"
-    assert result.output.objective == (
-        "Read all fitness skills and list all important points."
-    )
-
-
 def test_orchestrator_prompt_declares_validator_mount_access():
     from agents.orchestrator_agent import _orchestrator_prompt_body
 
@@ -2117,6 +2555,7 @@ def test_orchestrator_prompt_declares_fast_specialist_routes():
     assert "Stable conceptual" in prompt
     assert "not by topic keywords" in normalized
     assert "not executing the route" in prompt
+    assert "Return only route and content." in prompt
     assert "machine learning" not in prompt.lower()
     assert "direct|clarify" not in prompt
 
@@ -2169,16 +2608,16 @@ async def test_orchestrator_fs_decision_forwards_specialist_answer(monkeypatch):
 @pytest.mark.asyncio
 async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monkeypatch):
     from agents import orchestrator_agent
-    from agents.orchestrator_agent import OrchestratorDecision, run_orchestrator_turn
+    from agents.orchestrator_agent import OrchestratorChoice, run_orchestrator_turn
     from agents.runtime.specialist_result import SpecialistResult
 
     calls: list[str] = []
 
     async def fake_decision(*_args, **_kwargs):
         return SimpleNamespace(
-            output=OrchestratorDecision(
+            output=OrchestratorChoice(
                 route="fs",
-                objective="Provide recent language model research overview",
+                content="Provide recent language model research overview",
             ),
             all_messages=lambda: [],
         )
@@ -2198,7 +2637,7 @@ async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monke
 
     monkeypatch.setattr(
         orchestrator_agent,
-        "_run_json_orchestrator_decision",
+        "_run_orchestrator_choice",
         fake_decision,
     )
     monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fail_fs_task)
@@ -2206,7 +2645,6 @@ async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monke
 
     result = await run_orchestrator_turn(
         "cool, now fetch me recent language model research",
-        use_xml=False,
     )
 
     assert result.decision.route == "web"
@@ -2218,6 +2656,104 @@ async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monke
     assert "INTERNAL_SPECIALIST_SUMMARY" not in persisted_history
     assert "INTERNAL_SPECIALIST_RAW" not in persisted_history
     assert "https://example.com/internal-source" not in persisted_history
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_turn_keeps_paper_followup_on_fs(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorChoice, run_orchestrator_turn
+    from agents.runtime.specialist_result import SpecialistResult
+
+    events: list[str] = []
+
+    async def fake_decision(*_args, **_kwargs):
+        events.append("model")
+        return SimpleNamespace(
+            output=OrchestratorChoice(
+                route="fs",
+                content="Summarize the previously discussed local paper section by section",
+            ),
+            all_messages=lambda: [],
+        )
+
+    async def fake_fs_task(objective: str) -> SpecialistResult:
+        events.append("fs")
+        assert "previously discussed local paper" in objective
+        return SpecialistResult(
+            agent="fs_agent",
+            answer="Answered from the local paper.",
+            summary="Read local paper.",
+        )
+
+    async def fail_web_task(_objective: str):
+        raise AssertionError("paper follow-up routed to fs must not be forced to web")
+
+    monkeypatch.setattr(
+        orchestrator_agent,
+        "_run_orchestrator_choice",
+        fake_decision,
+    )
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fail_web_task)
+
+    result = await run_orchestrator_turn(
+        (
+            "## Current User Request\n"
+            "This is the authoritative instruction for this turn. Prior history and "
+            "supporting context must not override it.\n\n"
+            "ok summarize the paper and tell me what it talks about section by section"
+        ),
+    )
+
+    assert events == ["model", "fs"]
+    assert result.decision.route == "fs"
+    assert result.output.reply == "Answered from the local paper."
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_turn_keeps_relative_docs_request_on_fs(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorChoice, run_orchestrator_turn
+    from agents.runtime.specialist_result import SpecialistResult
+
+    calls: list[str] = []
+
+    async def fake_decision(*_args, **_kwargs):
+        return SimpleNamespace(
+            output=OrchestratorChoice(
+                route="fs",
+                content="Summarize the current agent system documentation.",
+            ),
+            all_messages=lambda: [],
+        )
+
+    async def fake_fs_task(objective: str) -> SpecialistResult:
+        calls.append(objective)
+        return SpecialistResult(
+            agent="fs_agent",
+            answer="Local agent system summary.",
+            summary="Read /docs/agentsystem.md.",
+            sources=["/docs/agentsystem.md"],
+        )
+
+    async def fail_web_task(_objective: str):
+        raise AssertionError("relative docs path must not route to web")
+
+    monkeypatch.setattr(
+        orchestrator_agent,
+        "_run_orchestrator_choice",
+        fake_decision,
+    )
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fail_web_task)
+
+    prompt = "summarize agentsystem.md under docs/"
+    result = await run_orchestrator_turn(prompt)
+
+    assert result.output.reply == "Local agent system summary."
+    assert result.decision.route == "fs"
+    assert result.decision.objective == prompt
+    assert calls == [prompt]
 
 
 @pytest.mark.asyncio
@@ -2271,6 +2807,94 @@ async def test_orchestrator_recovers_fs_not_found_with_web_for_recent_research(
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_recovers_ambiguous_local_lookup_with_web(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+    from agents.runtime.specialist_result import SpecialistResult
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_fs_task(objective: str) -> SpecialistResult:
+        calls.append(("fs", objective))
+        return SpecialistResult(
+            agent="fs_agent",
+            status="not_found",
+            useful=False,
+            recoverable_by_web=True,
+            answer="I could not find a relevant local paper.",
+            summary="No useful local paper matched.",
+        )
+
+    async def fake_web_task(objective: str) -> SpecialistResult:
+        calls.append(("web", objective))
+        return SpecialistResult(
+            agent="web_agent",
+            answer="The paper was recovered from the web.",
+            summary="Found external source.",
+        )
+
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
+
+    response, _messages = await _response_and_messages(
+        OrchestratorDecision(
+            route="fs",
+            objective="summarize the paper and explain its architecture",
+        ),
+        [],
+        original_prompt="summarize the paper and explain its architecture",
+    )
+
+    assert response.reply == "The paper was recovered from the web."
+    assert [kind for kind, _objective in calls] == ["fs", "web"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_recovers_local_paper_search_with_web(
+    monkeypatch,
+):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+    from agents.runtime.specialist_result import SpecialistResult
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_fs_task(objective: str) -> SpecialistResult:
+        calls.append(("fs", objective))
+        return SpecialistResult(
+            agent="fs_agent",
+            status="not_found",
+            useful=False,
+            recoverable_by_web=True,
+            answer="I could not find matching local papers.",
+            summary="No matching local papers.",
+        )
+
+    async def fake_web_task(objective: str) -> SpecialistResult:
+        calls.append(("web", objective))
+        return SpecialistResult(
+            agent="web_agent",
+            answer="Recovered matching papers from the web.",
+            summary="External paper recovery completed.",
+        )
+
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
+
+    response, _messages = await _response_and_messages(
+        OrchestratorDecision(
+            route="fs",
+            objective="check local papers regarding recent world model research",
+        ),
+        [],
+        original_prompt="check local papers regarding recent world model research",
+    )
+
+    assert response.reply == "Recovered matching papers from the web."
+    assert [kind for kind, _objective in calls] == ["fs", "web"]
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_does_not_recover_explicit_docs_miss_with_web(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
@@ -2305,6 +2929,49 @@ async def test_orchestrator_does_not_recover_explicit_docs_miss_with_web(monkeyp
     assert response.reply == "I could not find /docs/missing.md."
     assert messages == []
     assert calls == ["Read /docs/missing.md"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_recovers_inferred_local_match_with_web(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
+    from agents.runtime.specialist_result import SpecialistResult
+
+    calls: list[tuple[str, str]] = []
+
+    async def fake_fs_task(objective: str) -> SpecialistResult:
+        calls.append(("fs", objective))
+        return SpecialistResult(
+            agent="fs_agent",
+            status="not_found",
+            useful=False,
+            recoverable_by_web=True,
+            answer="The inferred local paper path was unavailable.",
+            summary="Local arXiv paper not found.",
+        )
+
+    async def fake_web_task(objective: str) -> SpecialistResult:
+        calls.append(("web", objective))
+        return SpecialistResult(
+            agent="web_agent",
+            answer="Recovered the paper from arXiv.",
+            summary="Fetched external paper.",
+        )
+
+    monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
+    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
+
+    response, _messages = await _response_and_messages(
+        OrchestratorDecision(
+            route="fs",
+            objective="Locate local paper 2605.00080v1 and summarize it",
+        ),
+        [],
+        original_prompt="what about 2605.00080v1?",
+    )
+
+    assert response.reply == "Recovered the paper from arXiv."
+    assert [kind for kind, _objective in calls] == ["fs", "web"]
 
 
 @pytest.mark.asyncio
@@ -2363,11 +3030,7 @@ async def test_orchestrator_plan_decision_uses_effort_budget(monkeypatch):
             "Orchestrator notes:\n- Findings available: 1"
         )
 
-    async def fake_observable_run(*_args, **_kwargs):
-        raise AssertionError("plan route must not run a final answer LLM pass")
-
     monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
-    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
 
     response, messages = await _response_and_messages(
         OrchestratorDecision(
@@ -2413,11 +3076,7 @@ async def test_orchestrator_plan_answer_falls_back_to_forwardable_research(
             "- Sources: https://www.goodreturns.in/gold-rates/"
         )
 
-    async def fake_observable_run(*_args, **_kwargs):
-        raise AssertionError("plan route must not run a final answer LLM pass")
-
     monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
-    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
 
     response, messages = await _response_and_messages(
         OrchestratorDecision(
@@ -2433,20 +3092,56 @@ async def test_orchestrator_plan_answer_falls_back_to_forwardable_research(
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_collection_preflight_skips_route_model(monkeypatch):
+    from agents import orchestrator_agent
+
+    async def fail_route_model(*_args, **_kwargs):
+        raise AssertionError("collection preflight must skip the route model")
+
+    async def fake_plan_workflow(
+        objective: str,
+        *,
+        max_tasks: int,
+        max_iterations: int,
+    ) -> str:
+        assert objective == "now summarize all papers locally in parallel"
+        assert (max_tasks, max_iterations) == (3, 2)
+        return "Forwardable answer:\nAll local papers were summarized."
+
+    monkeypatch.setattr(
+        orchestrator_agent,
+        "_run_orchestrator_choice",
+        fail_route_model,
+    )
+    monkeypatch.setattr(
+        orchestrator_agent,
+        "_run_plan_workflow",
+        fake_plan_workflow,
+    )
+
+    result = await orchestrator_agent.run_orchestrator_turn(
+        "now summarize all papers locally in parallel"
+    )
+
+    assert result.decision.route == "plan"
+    assert result.decision.objective == "now summarize all papers locally in parallel"
+    assert result.output.reply == "All local papers were summarized."
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_plan_route_persists_only_visible_turn(monkeypatch):
     from agents import orchestrator_agent
     from agents import structured_retry
-    from agents.orchestrator_agent import OrchestratorDecision, run_orchestrator_turn
+    from agents.orchestrator_agent import OrchestratorChoice, run_orchestrator_turn
 
     previous = ModelRequest.user_text_prompt("previous")
 
     async def fake_observable_run(_agent, prompt, **kwargs):
         assert kwargs.get("message_history") == [previous]
         return SimpleNamespace(
-            output=OrchestratorDecision(
+            output=OrchestratorChoice(
                 route="plan",
-                objective="read notes",
-                effort="minimal",
+                content="read notes",
             ),
             all_messages=lambda: [
                 *kwargs.get("message_history"),
@@ -2468,7 +3163,6 @@ async def test_orchestrator_plan_route_persists_only_visible_turn(monkeypatch):
     result = await run_orchestrator_turn(
         "current prompt",
         message_history=[previous],
-        use_xml=False,
     )
 
     assert result.output.reply == "Visible final answer."
@@ -2477,56 +3171,6 @@ async def test_orchestrator_plan_route_persists_only_visible_turn(monkeypatch):
     assert "current prompt" in str(result.all_messages()[1])
     assert "Visible final answer." in str(result.all_messages()[2])
     assert "Orchestrator notes" not in str(result.all_messages())
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_xml_retry_does_not_accumulate_invalid_history(monkeypatch):
-    from agents import orchestrator_agent
-    from agents.orchestrator_agent import _run_xml_orchestrator_decision
-
-    previous = ModelRequest.user_text_prompt("previous")
-    histories = []
-    prompts: list[str] = []
-
-    async def fake_observable_run(_agent, prompt, **kwargs):
-        prompts.append(prompt)
-        histories.append(kwargs.get("message_history"))
-        if len(histories) == 1:
-            return SimpleNamespace(
-                output="not a valid XML decision",
-                all_messages=lambda: [
-                    previous,
-                    ModelRequest.user_text_prompt("invalid model output"),
-                ],
-            )
-        assert "Previous invalid output:" not in prompt
-        return SimpleNamespace(
-            output=(
-                "<decision>"
-                "<route>direct</route>"
-                "<reply>ok</reply>"
-                "<objective></objective>"
-                "<effort>none</effort>"
-                "</decision>"
-            ),
-            all_messages=lambda: [previous, ModelRequest.user_text_prompt(prompt)],
-        )
-
-    monkeypatch.setattr(orchestrator_agent, "observable_run", fake_observable_run)
-
-    result = await _run_xml_orchestrator_decision(
-        "current prompt",
-        label="orchestrator",
-        indent=0,
-        message_history=[previous],
-        metadata=None,
-    )
-
-    assert result.output.route == "direct"
-    assert result.output.reply == "ok"
-    assert histories == [[previous], [previous]]
-    assert "current prompt" in prompts[1]
-    assert "Previous invalid output:" not in prompts[1]
 
 
 @pytest.mark.asyncio
@@ -2574,15 +3218,14 @@ async def test_manual_structured_retry_does_not_replay_invalid_output(monkeypatc
 
 def test_agent_output_validation_retries_are_disabled():
     from agents.fs_agent import fs_agent
-    from agents.orchestrator_agent import orchestrator, orchestrator_xml
+    from agents.orchestrator_agent import orchestrator
     from agents.plan_agent import plan_agent
-    from agents.web_agent import web_agent
+    from agents.web_agent import web_answer_agent
 
     assert orchestrator._max_result_retries == 0
-    assert orchestrator_xml._max_result_retries == 0
     assert plan_agent._max_result_retries == 0
     assert fs_agent._max_result_retries == 0
-    assert web_agent._max_result_retries == 0
+    assert web_answer_agent._max_result_retries == 0
 
 
 def test_save_history_includes_memory_dir(tmp_path):
@@ -2937,7 +3580,8 @@ def test_fs_task_prompt_routes_missing_file_to_recovery(monkeypatch, tmp_path):
     assert analysis.invalid_paths == ["/docs/not-present.md"]
     assert "Wrong-path recovery policy" in prompt
     assert "Recovery order" in prompt
-    assert "find_paths over path='/'" in prompt
+    assert "find_paths over the task read scope" in prompt
+    assert "Do not use path='/'" in prompt
     assert "grep_files searches file content only" in prompt
     assert "ask the user to confirm the exact path" in prompt
 
@@ -3120,7 +3764,6 @@ def test_fs_rag_paths_preserve_valid_paths_with_invalid_hint(monkeypatch, tmp_pa
                 "/docs/nested/child.md",
                 "/docs/candidate.md",
             ],
-            needs_rag=True,
         ),
         PathAnalysis(
             resolved_paths=["/docs/large.md", "/docs/nested"],
@@ -3130,6 +3773,126 @@ def test_fs_rag_paths_preserve_valid_paths_with_invalid_hint(monkeypatch, tmp_pa
     )
 
     assert paths == ["/docs/large.md", "/docs/nested", "/docs/nested/child.md"]
+
+
+@pytest.mark.asyncio
+async def test_fs_ambiguous_local_paper_uses_filesystem_discovery(
+    monkeypatch,
+    tmp_path,
+):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    papers = docs / "papers" / "arxiv"
+    papers.mkdir(parents=True)
+    (papers / "world-model.md").write_text(
+        "# World Model Survey\nRelevant evidence.",
+        encoding="utf-8",
+    )
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    prompts: list[str] = []
+
+    async def fail_rag(*_args, **_kwargs):
+        raise AssertionError("ambiguous paper lookup must use fs discovery first")
+
+    async def fake_fs_tools(prompt, *, task_roots):
+        prompts.append(prompt)
+        assert task_roots == ["/docs"]
+        return (
+            "The local World Model Survey explains predictive dynamics.",
+            [
+                ("find_paths", {"query": "world model", "path": "/docs"}),
+                (
+                    "grep_files",
+                    {"query": "world model", "path": "/docs"},
+                ),
+                (
+                    "read_file",
+                    {"path": "/docs/papers/arxiv/world-model.md"},
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(fs_agent, "rag_search_documents", fail_rag)
+    monkeypatch.setattr(fs_agent, "_run_fs_agent", fake_fs_tools)
+
+    result = await fs_agent.run_fs_task_result(
+        "check the papers locally related to world model, and summarize it"
+    )
+
+    assert result.status == "ok"
+    assert "predictive dynamics" in result.answer
+    assert "/docs/papers/arxiv/world-model.md" in result.sources
+    assert len(prompts) == 1
+    assert "use find_paths/list_files in the task scope" in prompts[0]
+    assert "then grep_files with relevant title or identifier terms" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_fs_non_paper_docs_use_filesystem_instead_of_papers_rag(
+    monkeypatch,
+    tmp_path,
+):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    papers = docs / "papers"
+    papers.mkdir(parents=True)
+    (docs / "agentsystem.md").write_text("Agent system notes.", encoding="utf-8")
+    (papers / "world-model.md").write_text("World model paper.", encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    async def fail_rag(*_args, **_kwargs):
+        raise AssertionError("non-paper docs task must not default to papers RAG")
+
+    async def fake_fs_tools(prompt, *, task_roots):
+        assert task_roots == ["/docs"]
+        assert "/docs/agentsystem.md" in prompt
+        assert "/docs/papers/world-model.md" in prompt
+        return (
+            "The local agent system documentation describes scoped routing.",
+            [("read_file", {"path": "/docs/agentsystem.md"})],
+        )
+
+    monkeypatch.setattr(fs_agent, "_retrieve_rag_evidence", fail_rag)
+    monkeypatch.setattr(fs_agent, "_run_fs_agent", fake_fs_tools)
+
+    result = await fs_agent.run_fs_task_result(
+        "summarize the local agent system documentation"
+    )
+
+    assert result.status == "ok"
+    assert result.sources == ["/docs/agentsystem.md"]
+    assert "scoped routing" in result.answer
+
+
+def test_fs_result_metadata_is_assembled_from_tool_calls():
+    from agents.fs_agent import _build_fs_output
+
+    output = _build_fs_output(
+        answer="Updated the skill.",
+        paths=[],
+        calls=[
+            ("read_file", {"path": "/skills/research/strategy.md"}),
+            ("edit_file", {"path": "/skills/research/strategy.md"}),
+        ],
+    )
+
+    assert output.paths == ["/skills/research/strategy.md"]
+    assert output.changes_made == [
+        "edit_file: /skills/research/strategy.md"
+    ]
 
 
 def test_fs_path_recovery_guard_requires_confirmation_without_candidate_read():
@@ -3226,3 +3989,79 @@ def test_fs_usage_limit_error_is_not_reported_as_file_access_problem():
 
     assert "tool-call budget" in message
     assert "file access problem" not in message
+
+
+def test_fs_context_limit_error_is_not_reported_as_path_problem():
+    from agents.fs_agent import _format_exception_report
+
+    message = _format_exception_report(
+        "summarize local papers",
+        RuntimeError(
+            "request (40196 tokens) exceeds the available context size "
+            "(8192 tokens); exceed_context_size_error"
+        ),
+    )
+
+    assert "exceeded its context limit" in message
+    assert "not a file path or permission problem" in message
+    assert "path needs to be corrected" not in message
+
+
+def test_fs_small_pdf_is_always_selected_for_rag(monkeypatch, tmp_path):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "paper.pdf").write_bytes(b"%PDF-1.4\nsmall")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    assert fs_agent._paths_that_need_rag(["/docs/paper.pdf"]) == [
+        "/docs/paper.pdf"
+    ]
+
+
+def test_fs_plan_worker_rag_uses_only_assigned_files(monkeypatch, tmp_path):
+    from agents import fs_agent
+    from agents.fs.contracts import PathAnalysis
+
+    docs = tmp_path / "docs"
+    paper_dir = docs / "papers" / "arxiv"
+    paper_dir.mkdir(parents=True)
+    for name in ("a.md", "b.md", "c.md"):
+        (paper_dir / name).write_text(name, encoding="utf-8")
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+    objective = "\n".join(
+        [
+            "Plan worker task:",
+            "Original user prompt: Summarize all assigned local papers.",
+            "Task objective: Process collection batch 1 of 2.",
+            "Task kind: local_rag",
+            "Query: Summarize every assigned local paper.",
+            "Relevant local files:",
+            "- /docs/papers/arxiv/a.md",
+            "- /docs/papers/arxiv/b.md",
+            "Return a concise result.",
+        ]
+    )
+    analysis = PathAnalysis(
+        resolved_paths=[
+            "/docs/papers/arxiv",
+            "/docs/papers/arxiv/a.md",
+            "/docs/papers/arxiv/b.md",
+        ]
+    )
+
+    assert fs_agent._preemptive_rag_paths(objective, analysis, ["/docs"]) == [
+        "/docs/papers/arxiv/a.md",
+        "/docs/papers/arxiv/b.md",
+    ]

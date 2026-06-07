@@ -763,6 +763,66 @@ def test_image_upload_context_tells_agent_to_use_read_image(monkeypatch, tmp_pat
     assert "call read_image for supported image paths" in captured["prompt"]
 
 
+def test_pdf_upload_context_tells_agent_to_use_rag(monkeypatch, tmp_path):
+    server = _load_server(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeResponse:
+        reply = "ok"
+
+    async def fake_run_turn(user_text, session, debug=False, trace_sink=None):
+        captured["prompt"] = user_text
+        return (
+            FakeResponse(),
+            [
+                *session.message_history,
+                server.ModelRequest.user_text_prompt(user_text),
+                server.ModelResponse(parts=[server.TextPart(content="ok")]),
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(server, "run_turn", fake_run_turn)
+
+    with TestClient(server.app) as client:
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin-password"},
+            ).status_code
+            == 200
+        )
+        csrf = _csrf(client)
+        create_chat = client.post(
+            "/api/chat/sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={"title": "pdf context"},
+        )
+        chat_id = create_chat.json()["session"]["id"]
+
+        upload = client.post(
+            f"/api/chat/sessions/{chat_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files={"file": ("paper.pdf", b"%PDF-1.4\nfixture", "application/pdf")},
+        )
+        assert upload.status_code == 200
+
+        response = client.post(
+            f"/api/chat/sessions/{chat_id}/messages",
+            headers={"X-CSRF-Token": csrf},
+            json={"content": "summarize the uploaded paper"},
+        )
+        assert response.status_code == 200
+
+    assert "paper.pdf [document, application/pdf" in captured["prompt"]
+    assert "PDF document; use filesystem/RAG retrieval" in captured["prompt"]
+    assert "PDF uploads are document files and must be inspected through RAG" in captured[
+        "prompt"
+    ]
+    assert "not read_file/read_lines/grep_files" in captured["prompt"]
+
+
 def test_delete_chat_session_removes_upload_directory(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
 
