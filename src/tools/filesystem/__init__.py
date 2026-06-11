@@ -33,6 +33,7 @@ from .toolset import make_filesystem_toolset
 # Export result models and constants
 from .types import (
     ReadResult,
+    PreviewResult,
     WriteResult,
     EditResult,
     DeleteResult,
@@ -61,6 +62,7 @@ __all__ = [
     "make_filesystem_toolset",
     # Result models
     "ReadResult",
+    "PreviewResult",
     "WriteResult",
     "EditResult",
     "DeleteResult",

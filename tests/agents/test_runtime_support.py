@@ -224,6 +224,92 @@ async def test_filesystem_task_scope_rejects_unrelated_mount_reads():
 
 
 @pytest.mark.asyncio
+async def test_filesystem_discovery_scope_rejects_full_candidate_reads():
+    from pydantic_ai.exceptions import ModelRetry
+
+    from agents.runtime.context import (
+        DuplicateFilesystemReadGuardToolset,
+        filesystem_run_scope,
+    )
+
+    class Wrapped:
+        async def call_tool(self, _name, _tool_args, _ctx, _tool):
+            raise AssertionError("full candidate read must not reach filesystem")
+
+    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    ctx = SimpleNamespace(run_id="run-preview-only", messages=[])
+    read_tool = SimpleNamespace(tool_def=SimpleNamespace(name="read_file"))
+
+    with filesystem_run_scope(["/docs"], discovery_preview_only=True):
+        with pytest.raises(ModelRetry, match="preview_file"):
+            await guard.call_tool(
+                "read_file",
+                {"path": "/docs/papers/world-model.md"},
+                ctx,
+                read_tool,
+            )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_topic_discovery_exposes_only_grep_and_preview():
+    from agents.runtime.context import (
+        DuplicateFilesystemReadGuardToolset,
+        filesystem_run_scope,
+    )
+
+    class Wrapped:
+        async def get_tools(self, _ctx):
+            return {
+                name: SimpleNamespace(tool_def=SimpleNamespace(name=name))
+                for name in (
+                    "grep_files",
+                    "preview_file",
+                    "find_paths",
+                    "list_directory",
+                    "read_file",
+                )
+            }
+
+        async def call_tool(self, _name, tool_args, _ctx, _tool):
+            return dict(tool_args)
+
+    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    ctx = SimpleNamespace(run_id="run-topic-tools", messages=[])
+    grep_tool = SimpleNamespace(tool_def=SimpleNamespace(name="grep_files"))
+
+    with filesystem_run_scope(
+        ["/docs"],
+        discovery_preview_only=True,
+        discovery_search_paths=["/docs/papers/arxiv"],
+    ) as run_state:
+        initial_tools = await guard.get_tools(ctx)
+        result = await guard.call_tool(
+            "grep_files",
+            {"query": "world model", "max_matches": 100},
+            ctx,
+            grep_tool,
+        )
+        next_tools = await guard.get_tools(ctx)
+
+    assert set(initial_tools) == {"grep_files"}
+    assert set(next_tools) == {"preview_file"}
+    assert run_state.successful_calls == [
+        (
+            "grep_files",
+            {
+                "query": "world model",
+                "max_matches": 12,
+                "path": "/docs/papers/arxiv",
+                "case_sensitive": False,
+            },
+        )
+    ]
+    assert result["path"] == "/docs/papers/arxiv"
+    assert result["case_sensitive"] is False
+    assert result["max_matches"] == 12
+
+
+@pytest.mark.asyncio
 async def test_filesystem_task_scope_rejects_copy_from_unrelated_mount(
     monkeypatch,
     tmp_path,
@@ -337,7 +423,20 @@ def test_fs_preflight_matches_bare_filename_case_and_separator_insensitively(
     assert analysis.invalid_paths == []
 
 
-def test_fs_task_prompt_includes_file_index_and_write_targets(monkeypatch):
+def test_fs_system_prompt_keeps_only_model_owned_instructions():
+    from agents.fs.prompts import FS_SYSTEM_PROMPT
+
+    assert len(FS_SYSTEM_PROMPT) < 1800
+    assert "topic_discovery" in FS_SYSTEM_PROMPT
+    assert "grep_files first, then preview_file" in FS_SYSTEM_PROMPT
+    assert "Do not call find_paths" in FS_SYSTEM_PROMPT
+    assert "Return only the practical user-facing answer" in FS_SYSTEM_PROMPT
+    assert "Python preflight" not in FS_SYSTEM_PROMPT
+    assert "validator" not in FS_SYSTEM_PROMPT
+    assert "Do not read the same file path twice" not in FS_SYSTEM_PROMPT
+
+
+def test_fs_task_prompt_includes_path_facts_and_write_targets(monkeypatch):
     from agents import fs_agent
 
     monkeypatch.setattr(
@@ -355,20 +454,19 @@ def test_fs_task_prompt_includes_file_index_and_write_targets(monkeypatch):
     )
     assert analysis.invalid_paths == ["/skills/local-fitness-skills"]
     assert analysis.write_targets == []
-    assert "Invalid exact path hints" in prompt
-    assert "/skills/fitness/diet.md" in prompt
-    assert "/skills/fitness/workout.md" in prompt
-    assert "Use the Readable file index below before calling discovery tools." in prompt
-    assert "Never invent paths." in prompt
-    assert "Never read the same path twice in one run." in prompt
+    assert "Invalid path hints" in prompt
+    assert "Missing-path chain:" in prompt
+    assert "find_paths on the task scope (/skills)" in prompt
+    assert "Readable file index" not in prompt
 
     prompt, analysis = fs_agent._fs_task_prompt(
         "create /skills/fitness/movement_recovery.md."
     )
     assert analysis.invalid_paths == ["/skills/fitness/movement_recovery.md"]
     assert analysis.write_targets == ["/skills/fitness/movement_recovery.md"]
-    assert "Potential new writable path hints" in prompt
+    assert "New write targets" in prompt
     assert "- /skills/fitness/movement_recovery.md" in prompt
+    assert "Mode: create_write" in prompt
     assert "Skill editing policy hook" in prompt
     assert "Source: /skills/skill_editing.md" in prompt
 
@@ -397,8 +495,7 @@ def test_fs_task_prompt_excludes_skills_for_ordinary_docs(monkeypatch):
     )
 
     assert analysis.all_path_hints() == []
-    assert "Readable roots for this task: /docs" in prompt
-    assert "/docs/papers/arxiv/world-model.md" in prompt
+    assert "Scope: /docs" in prompt
     assert "/skills" not in prompt
     assert "strategy.md" not in prompt
     task_roots = fs_agent._task_read_roots(
@@ -410,8 +507,8 @@ def test_fs_task_prompt_excludes_skills_for_ordinary_docs(monkeypatch):
         analysis,
         task_roots,
     ) == []
-    assert "use find_paths/list_files in the task scope" in prompt
-    assert "then grep_files with relevant title or identifier terms" in prompt
+    assert "Mode: topic_discovery" in prompt
+    assert "Search path: /docs" in prompt
 
 
 def test_fs_task_prompt_requires_model_tool_discovery_for_ambiguous_artifact(
@@ -430,10 +527,9 @@ def test_fs_task_prompt_requires_model_tool_discovery_for_ambiguous_artifact(
     )
 
     assert analysis.all_path_hints() == []
-    assert "Local-first discovery requirement" in prompt
-    assert "call grep_files for relevant content terms" in prompt
-    assert "queries=[...]" in prompt
-    assert "orchestrator can recover with web search" in prompt
+    assert "Mode: topic_discovery" in prompt
+    assert "Search path: /docs" in prompt
+    assert "web recovery is allowed" in prompt
 
 
 def test_fs_task_prompt_allows_web_recovery_for_local_paper_lookup(monkeypatch):
@@ -449,9 +545,45 @@ def test_fs_task_prompt_allows_web_recovery_for_local_paper_lookup(monkeypatch):
         "check local papers regarding recent world model research"
     )
 
-    assert "Local-first discovery requirement" in prompt
-    assert "Try local discovery before using any fallback" in prompt
-    assert "orchestrator can recover with web search" in prompt
+    assert "Mode: topic_discovery" in prompt
+    assert "Search path: /docs" in prompt
+    assert "web recovery is allowed" in prompt
+
+
+def test_fs_topic_lookup_inside_explicit_directory_still_uses_lexical_triage(
+    monkeypatch,
+    tmp_path,
+):
+    from agents import fs_agent
+
+    docs = tmp_path / "docs"
+    arxiv = docs / "papers" / "arxiv"
+    arxiv.mkdir(parents=True)
+    (arxiv / "world-model.md").write_text(
+        "# World Model\n\n## Abstract\nPredictive dynamics.",
+        encoding="utf-8",
+    )
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    objective = "check papers related to world models under /docs/arxiv"
+    prompt, analysis = fs_agent._fs_task_prompt(objective)
+    task_roots = fs_agent._task_read_roots(objective, analysis)
+
+    assert analysis.resolved_paths == ["/docs/papers/arxiv"]
+    assert analysis.invalid_paths == []
+    assert "Mode: topic_discovery" in prompt
+    assert "Search path: /docs/papers/arxiv" in prompt
+    assert fs_agent._requires_lexical_triage(objective, analysis) is True
+    assert fs_agent._preemptive_rag_paths(
+        objective,
+        analysis,
+        task_roots,
+    ) == []
 
 
 def test_fs_non_paper_prompt_keeps_all_docs_in_scope(monkeypatch, tmp_path):
@@ -479,9 +611,9 @@ def test_fs_non_paper_prompt_keeps_all_docs_in_scope(monkeypatch, tmp_path):
     )
 
     assert task_roots == ["/docs"]
-    assert "/docs/agentsystem.md" in prompt
-    assert "/docs/auth.md" in prompt
-    assert "/docs/papers/world-model.md" in prompt
+    assert "Mode: topic_discovery" in prompt
+    assert "Search path: /docs" in prompt
+    assert "Readable file index" not in prompt
     assert fs_agent._preemptive_rag_paths(
         "find the local authentication documentation and summarize it",
         analysis,
@@ -905,115 +1037,6 @@ def test_orchestrator_guardrail_ignores_current_turn_wrapper_text():
     assert corrected.route == "fs"
 
 
-def test_web_agent_keeps_arxiv_tools_off_for_general_current_lookup():
-    from agents.web_agent import _objective_allows_arxiv_tools
-
-    assert not _objective_allows_arxiv_tools("check today's gold price")
-
-
-def test_web_agent_enables_arxiv_tools_for_structured_arxiv_task():
-    from agents.web_agent import _objective_allows_arxiv_tools
-
-    objective = "\n".join(
-        [
-            "Plan worker task:",
-            "Original user prompt: Read arXiv 2401.12345",
-            "Task objective: Read arXiv 2401.12345",
-            "Task kind: arxiv",
-            "Query: 2401.12345",
-        ]
-    )
-
-    assert _objective_allows_arxiv_tools(objective)
-
-
-def test_web_agent_enables_arxiv_tools_for_explicit_arxiv_source():
-    from agents.web_agent import _objective_allows_arxiv_tools
-
-    assert _objective_allows_arxiv_tools("Search arXiv for recent RAG papers")
-
-
-def test_web_agent_scopes_this_year_arxiv_candidates(monkeypatch):
-    from datetime import datetime, timezone
-
-    from agents import web_agent
-
-    monkeypatch.setattr(
-        web_agent,
-        "_current_research_date",
-        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
-    )
-
-    assert web_agent._time_scoped_arxiv_ids(
-        "find a diffusion language model paper this year",
-        ["2506.13759", "2605.06548", "2508.10875"],
-    ) == ["2605.06548"]
-    assert web_agent._time_scoped_arxiv_ids(
-        "find a diffusion language model paper this year",
-        ["2506.13759", "2508.10875"],
-    ) == ["2506.13759", "2508.10875"]
-
-
-@pytest.mark.asyncio
-async def test_arxiv_selection_current_year_override_drops_stale_uncertainty(
-    monkeypatch,
-):
-    from datetime import datetime, timezone
-
-    from agents import web_agent
-
-    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
-        assert output_name == "ArxivSelectionDecision"
-        return SimpleNamespace(
-            output=web_agent.ArxivSelectionDecision(
-                arxiv_ids=["2508.10875"],
-                reason="Survey result looked better.",
-                uncertainties=["No exact current-year overview paper was found."],
-            )
-        )
-
-    monkeypatch.setattr(
-        web_agent,
-        "observable_run_with_manual_validation_retries",
-        fake_model_run,
-    )
-    monkeypatch.setattr(
-        web_agent,
-        "_current_research_date",
-        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
-    )
-
-    selected_ids, uncertainties = await web_agent._select_arxiv_ids_from_results(
-        objective="find an overview diffusion language model paper this year",
-        query_plan=web_agent.WebQueryPlan(
-            query="diffusion language model papers 2026 overview",
-            preferred_source="arxiv",
-        ),
-        search_results=[
-            {
-                "title": "[2605.06548] Continuous Latent Diffusion Language Model",
-                "url": "https://arxiv.org/abs/2605.06548",
-                "snippet": "Submitted on 7 May 2026.",
-                "position": 1,
-            },
-            {
-                "title": "[2508.10875] A Survey on Diffusion Language Models",
-                "url": "https://arxiv.org/abs/2508.10875",
-                "snippet": "A 2025 survey.",
-                "position": 2,
-            },
-        ],
-        fallback_ids=["2605.06548", "2508.10875"],
-        max_ids=1,
-    )
-
-    assert selected_ids == ["2605.06548"]
-    assert uncertainties == [
-        "Selector returned no valid current-year ID; using first current-year "
-        "candidate because the user asked for this year."
-    ]
-
-
 @pytest.mark.parametrize(
     ("api_result", "expected_text", "expected_url"),
     [
@@ -1426,6 +1449,7 @@ def test_preferred_api_tool_accepts_exact_tool_name_or_source_alias():
         == "weather_forecast"
     )
     assert WebSourceDecision(kind="recent_news").method == "web"
+    assert WebSourceDecision(kind="scholarly").method == "web"
 
 
 @pytest.mark.asyncio
@@ -1665,27 +1689,12 @@ async def test_run_web_task_normalizes_weather_location_without_model_retry(monk
     assert ("weather", "Lund, Sweden:2026-06-06") in events
 
 
-@pytest.mark.asyncio
-async def test_run_web_task_saves_arxiv_paper_to_docs_and_scopes_rag(
-    monkeypatch,
-    tmp_path,
-):
-    from datetime import datetime, timezone
 
-    from rag import Document
+@pytest.mark.asyncio
+async def test_run_web_task_searches_arxiv_through_generic_web_flow(monkeypatch):
     from agents import web_agent
 
     events: list[tuple[str, str]] = []
-    paper = {
-        "arxiv_id": "2508.10875",
-        "title": "Diffusion Language Models Survey",
-        "authors": [{"name": "Li"}],
-        "summary": "Survey abstract.",
-        "pdf_url": "https://arxiv.org/pdf/2508.10875",
-        "abs_url": "https://arxiv.org/abs/2508.10875",
-        "published": "2025-08-15",
-        "categories": ["cs.CL"],
-    }
 
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
@@ -1693,268 +1702,25 @@ async def test_run_web_task_saves_arxiv_paper_to_docs_and_scopes_rag(
             return SimpleNamespace(
                 output=web_agent.WebSourceDecision(
                     kind="scholarly",
-                    target="diffusion language model survey",
+                    target="diffusion language models",
                 )
             )
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
-                    query="diffusion language model survey",
-                    preferred_source="arxiv",
+                    query="diffusion language models",
                     search_result_limit=4,
-                    crawl_url_limit=1,
-                    checks=["Scholarly paper request should use arXiv."],
+                    crawl_url_limit=0,
                 )
             )
-        if output_name == "ArxivSelectionDecision":
+        if output_name == "WebPreviewDecision":
             return SimpleNamespace(
-                output=web_agent.ArxivSelectionDecision(
-                    arxiv_ids=["2508.10875"],
-                    reason="Survey paper best matches the overview request.",
+                output=web_agent.WebPreviewDecision(
+                    answer_from_preview=True,
+                    reason="The result preview identifies the requested paper.",
                 )
             )
-        return SimpleNamespace(output="Saved and summarized the survey.")
-
-    async def fake_web_search(_mcp_url, query, *, max_results=None):
-        events.append(("web_search", query))
-        assert max_results == 3
-        return [
-            {
-                "title": "[2112.10752] High-Resolution Image Synthesis",
-                "url": "https://arxiv.org/abs/2112.10752",
-                "snippet": "Latent diffusion models for image synthesis.",
-                "position": 1,
-            },
-            {
-                "title": "[2508.10875] Diffusion Language Models Survey",
-                "url": "https://arxiv.org/abs/2508.10875",
-                "snippet": "A survey on diffusion language models.",
-                "position": 2,
-            }
-        ]
-
-    async def fake_fetch(_mcp_url, ids):
-        events.append(("arxiv_fetch", ",".join(ids)))
-        return [paper]
-
-    async def fake_crawl_docs(_mcp_url, urls):
-        events.append(("crawl_docs", ",".join(urls)))
-        return [
-            Document(
-                doc_id="html-doc",
-                source="https://arxiv.org/html/2508.10875",
-                title="HTML",
-                text="Section 1 Introduction\nSection 2 Milestones",
-                mime="text/markdown",
-                meta={},
-            )
-        ]
-
-    async def fake_download_pdfs(papers):
-        events.append(("download_pdf", ",".join(p["arxiv_id"] for p in papers)))
-        papers[0]["local_pdf_path"] = "/docs/papers/arxiv/2508.10875.pdf"
-        return ["/docs/papers/arxiv/2508.10875.pdf"]
-
-    async def fake_ingest(docs):
-        events.append(("ingest", str(len(docs))))
-
-    async def fake_rag_search(**kwargs):
-        docs = kwargs.get("docs") or []
-        events.append(("rag_docs", ",".join(docs)))
-        assert docs == ["/docs/papers/arxiv/2508.10875.md"]
-        return [
-            {
-                "node_id": "node-1",
-                "source": docs[0],
-                "title": "Diffusion Language Models Survey",
-                "text": "Section breakdown evidence.",
-            }
-        ]
-
-    monkeypatch.setattr(
-        web_agent,
-        "observable_run_with_manual_validation_retries",
-        fake_model_run,
-    )
-    monkeypatch.setattr(web_agent, "web_search_results", fake_web_search)
-    monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
-    monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
-    monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
-    monkeypatch.setattr(
-        web_agent,
-        "_current_research_date",
-        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
-    )
-    monkeypatch.setattr(
-        web_agent,
-        "rag_service",
-        SimpleNamespace(ingest_documents=fake_ingest),
-    )
-    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
-    monkeypatch.setattr(
-        web_agent,
-        "get_runtime_settings",
-        lambda: SimpleNamespace(docs_dir=tmp_path),
-    )
-
-    result = await web_agent.run_web_task(
-        "find a paper on the latest research in diffusion language model"
-    )
-
-    saved = tmp_path / "papers" / "arxiv" / "2508.10875.md"
-    assert saved.exists()
-    content = saved.read_text(encoding="utf-8")
-    assert "Diffusion Language Models Survey" in content
-    assert "Section 2 Milestones" in content
-    assert "Local PDF Path: not saved" in content
-    assert "Full Text Source: https://arxiv.org/html/2508.10875" in content
-    assert "/docs/papers/arxiv/2508.10875.md" in result
-    assert "/docs/papers/arxiv/2508.10875.pdf" not in result
-    assert "Saved local paper path(s): /docs/papers/arxiv/2508.10875.md" in result
-    assert (
-        "web_search",
-        "site:arxiv.org/abs find a paper on the latest research in diffusion language model June 2026",
-    ) in events
-    assert ("model", "ArxivSelectionDecision") in events
-    assert ("arxiv_fetch", "2508.10875") in events
-    assert ("arxiv_fetch", "2112.10752") not in events
-    assert ("download_pdf", "2508.10875") not in events
-    assert ("rag_docs", "/docs/papers/arxiv/2508.10875.md") in events
-
-
-@pytest.mark.asyncio
-async def test_arxiv_fetch_downloads_pdf_when_explicitly_requested(
-    monkeypatch,
-    tmp_path,
-):
-    from rag import Document
-    from agents import web_agent
-
-    events: list[tuple[str, str]] = []
-    paper = {
-        "arxiv_id": "2508.10875",
-        "title": "Diffusion Language Models Survey",
-        "summary": "Survey abstract.",
-        "pdf_url": "https://arxiv.org/pdf/2508.10875",
-    }
-
-    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
-        if output_name == "WebSourceDecision":
-            return SimpleNamespace(
-                output=web_agent.WebSourceDecision(
-                    kind="scholarly",
-                    target="diffusion language model survey",
-                    include_pdf=True,
-                )
-            )
-        if output_name == "WebQueryPlan":
-            return SimpleNamespace(
-                output=web_agent.WebQueryPlan(
-                    query="diffusion language model survey",
-                    preferred_source="arxiv",
-                    crawl_url_limit=1,
-                )
-            )
-        return SimpleNamespace(output="Saved the paper and original PDF.")
-
-    async def fake_fetch(_mcp_url, _ids):
-        return [paper]
-
-    async def fake_crawl_docs(_mcp_url, _urls):
-        return [
-            Document(
-                doc_id="html-doc",
-                source="https://arxiv.org/html/2508.10875",
-                title="HTML",
-                text="Full paper text.",
-                mime="text/markdown",
-                meta={},
-            )
-        ]
-
-    async def fake_download_pdfs(papers):
-        events.append(("download_pdf", papers[0]["arxiv_id"]))
-        papers[0]["local_pdf_path"] = "/docs/papers/arxiv/2508.10875.pdf"
-        return ["/docs/papers/arxiv/2508.10875.pdf"]
-
-    async def fake_ingest(_docs):
-        return None
-
-    async def fake_rag_search(**_kwargs):
-        return []
-
-    monkeypatch.setattr(
-        web_agent,
-        "observable_run_with_manual_validation_retries",
-        fake_model_run,
-    )
-    monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
-    monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
-    monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
-    monkeypatch.setattr(
-        web_agent,
-        "rag_service",
-        SimpleNamespace(ingest_documents=fake_ingest),
-    )
-    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
-    monkeypatch.setattr(
-        web_agent,
-        "get_runtime_settings",
-        lambda: SimpleNamespace(docs_dir=tmp_path),
-    )
-
-    result = await web_agent.run_web_task(
-        "fetch arXiv:2508.10875 locally and include the original PDF"
-    )
-
-    assert ("download_pdf", "2508.10875") in events
-    assert "/docs/papers/arxiv/2508.10875.pdf" in result
-
-
-@pytest.mark.asyncio
-async def test_run_web_task_uses_arxiv_web_search_for_semantic_discovery(
-    monkeypatch,
-    tmp_path,
-):
-    from datetime import datetime, timezone
-
-    from agents import web_agent
-
-    events: list[tuple[str, str]] = []
-    paper = {
-        "arxiv_id": "2502.09992",
-        "title": "Large Language Diffusion Models",
-        "authors": [{"name": "Nie"}],
-        "summary": "LLaDA abstract.",
-        "pdf_url": "https://arxiv.org/pdf/2502.09992",
-    }
-
-    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
-        events.append(("model", output_name))
-        if output_name == "WebSourceDecision":
-            return SimpleNamespace(
-                output=web_agent.WebSourceDecision(
-                    kind="scholarly",
-                    target="diffusion language model",
-                )
-            )
-        if output_name == "WebQueryPlan":
-            return SimpleNamespace(
-                output=web_agent.WebQueryPlan(
-                    query="diffusion language model",
-                    preferred_source="arxiv",
-                    search_result_limit=6,
-                    crawl_url_limit=1,
-                )
-            )
-        if output_name == "ArxivSelectionDecision":
-            return SimpleNamespace(
-                output=web_agent.ArxivSelectionDecision(
-                    arxiv_ids=["2502.09992"],
-                    reason="Matches diffusion language models.",
-                )
-            )
-        return SimpleNamespace(output="Selected Large Language Diffusion Models.")
+        return SimpleNamespace(output="Large Language Diffusion Models is relevant.")
 
     async def fake_web_search(_mcp_url, query, *, max_results=None):
         events.append(("web_search", query))
@@ -1968,26 +1734,8 @@ async def test_run_web_task_uses_arxiv_web_search_for_semantic_discovery(
             }
         ]
 
-    async def fake_fetch(_mcp_url, ids):
-        events.append(("arxiv_fetch", ",".join(ids)))
-        return [paper]
-
-    async def fake_crawl_docs(_mcp_url, _urls):
-        return []
-
-    async def fake_download_pdfs(papers):
-        events.append(("download_pdf", ",".join(p["arxiv_id"] for p in papers)))
-        papers[0]["local_pdf_path"] = "/docs/papers/arxiv/2502.09992.pdf"
-        return ["/docs/papers/arxiv/2502.09992.pdf"]
-
-    async def fake_ingest(_docs):
-        return None
-
-    async def fake_rag_search(**kwargs):
-        docs = kwargs.get("docs") or []
-        events.append(("rag_docs", ",".join(docs)))
-        assert docs == ["/docs/papers/arxiv/2502.09992.md"]
-        return []
+    async def fail_crawl(*_args, **_kwargs):
+        raise AssertionError("preview-sufficient scholarly search must not crawl")
 
     monkeypatch.setattr(
         web_agent,
@@ -1995,224 +1743,15 @@ async def test_run_web_task_uses_arxiv_web_search_for_semantic_discovery(
         fake_model_run,
     )
     monkeypatch.setattr(web_agent, "web_search_results", fake_web_search)
-    monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
-    monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
-    monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
-    monkeypatch.setattr(
-        web_agent,
-        "_current_research_date",
-        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
-    )
-    monkeypatch.setattr(
-        web_agent,
-        "rag_service",
-        SimpleNamespace(ingest_documents=fake_ingest),
-    )
-    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
-    monkeypatch.setattr(
-        web_agent,
-        "get_runtime_settings",
-        lambda: SimpleNamespace(docs_dir=tmp_path),
-    )
+    monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fail_crawl)
 
     result = await web_agent.run_web_task(
-        "just search diffusion language model on arXiv"
+        "search arXiv for diffusion language models"
     )
 
-    assert "Selected Large Language Diffusion Models." in result
-    assert "/docs/papers/arxiv/2502.09992.md" in result
-    assert "/docs/papers/arxiv/2502.09992.pdf" in result
-    assert "Saved local paper path(s): /docs/papers/arxiv/2502.09992.md" in result
-    assert (
-        "web_search",
-        "site:arxiv.org/abs just search diffusion language model on arXiv June 2026",
-    ) in events
-    assert (
-        "web_search",
-        "site:arxiv.org/abs just search diffusion language model on arXiv 2026",
-    ) in events
-    assert (
-        "web_search",
-        "site:arxiv.org/abs just search diffusion language model on arXiv 2024 2025 2026",
-    ) in events
-    assert ("web_search", "site:arxiv.org/abs diffusion language model") in events
-    assert ("model", "ArxivSelectionDecision") in events
-    assert ("arxiv_fetch", "2502.09992") in events
-    assert ("download_pdf", "2502.09992") in events
-
-
-@pytest.mark.asyncio
-async def test_run_web_task_saves_fallback_arxiv_record_when_fetch_misses(
-    monkeypatch,
-    tmp_path,
-):
-    from datetime import datetime, timezone
-
-    from agents import web_agent
-
-    events: list[tuple[str, str]] = []
-
-    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
-        events.append(("model", output_name))
-        if output_name == "WebSourceDecision":
-            return SimpleNamespace(
-                output=web_agent.WebSourceDecision(
-                    kind="scholarly",
-                    target="overview of diffusion language model papers",
-                )
-            )
-        if output_name == "WebQueryPlan":
-            return SimpleNamespace(
-                output=web_agent.WebQueryPlan(
-                    query="overview of diffusion language model papers from 2026",
-                    preferred_source="arxiv",
-                    search_result_limit=4,
-                    crawl_url_limit=1,
-                )
-            )
-        if output_name == "ArxivSelectionDecision":
-            return SimpleNamespace(
-                output=web_agent.ArxivSelectionDecision(
-                    arxiv_ids=["2605.06548"],
-                    reason="Most relevant 2026 DLM paper.",
-                    uncertainties=["No survey paper was visible."],
-                )
-            )
-        return SimpleNamespace(
-            output="Selected Continuous Latent Diffusion Language Model."
-        )
-
-    async def fake_web_search(_mcp_url, query, *, max_results=None):
-        events.append(("web_search", query))
-        return [
-            {
-                "title": "[2605.06548] Continuous Latent Diffusion Language Model",
-                "url": "https://arxiv.org/abs/2605.06548",
-                "snippet": "Submitted on 7 May 2026. Introduces Cola DLM.",
-                "position": 1,
-            }
-        ]
-
-    async def fake_fetch(_mcp_url, ids):
-        events.append(("arxiv_fetch", ",".join(ids)))
-        return []
-
-    async def fake_crawl_docs(_mcp_url, urls):
-        events.append(("crawl_docs", ",".join(urls)))
-        return []
-
-    async def fake_download_pdfs(papers):
-        events.append(("download_pdf", ",".join(p["arxiv_id"] for p in papers)))
-        papers[0]["local_pdf_path"] = "/docs/papers/arxiv/2605.06548.pdf"
-        return ["/docs/papers/arxiv/2605.06548.pdf"]
-
-    async def fake_ingest(docs):
-        events.append(("ingest", str(len(docs))))
-
-    async def fake_ingest_local_pdfs(paths):
-        events.append(("ingest_pdf", ",".join(paths)))
-        return paths
-
-    async def fake_rag_search(**kwargs):
-        docs = kwargs.get("docs") or []
-        events.append(("rag_docs", ",".join(docs)))
-        assert docs == [
-            "/docs/papers/arxiv/2605.06548.md",
-            "/docs/papers/arxiv/2605.06548.pdf",
-        ]
-        return []
-
-    monkeypatch.setattr(
-        web_agent,
-        "observable_run_with_manual_validation_retries",
-        fake_model_run,
-    )
-    monkeypatch.setattr(web_agent, "web_search_results", fake_web_search)
-    monkeypatch.setattr(web_agent, "arxiv_fetch_papers", fake_fetch)
-    monkeypatch.setattr(web_agent, "web_crawl_documents", fake_crawl_docs)
-    monkeypatch.setattr(web_agent, "_download_arxiv_pdfs", fake_download_pdfs)
-    monkeypatch.setattr(
-        web_agent,
-        "_ingest_local_arxiv_pdfs",
-        fake_ingest_local_pdfs,
-    )
-    monkeypatch.setattr(
-        web_agent,
-        "_current_research_date",
-        lambda: datetime(2026, 6, 5, tzinfo=timezone.utc),
-    )
-    monkeypatch.setattr(
-        web_agent,
-        "rag_service",
-        SimpleNamespace(ingest_documents=fake_ingest),
-    )
-    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
-    monkeypatch.setattr(
-        web_agent,
-        "get_runtime_settings",
-        lambda: SimpleNamespace(docs_dir=tmp_path),
-    )
-
-    result = await web_agent.run_web_task(
-        "search an overview of diffusion language model paper this year and fetch the paper locally"
-    )
-
-    saved = tmp_path / "papers" / "arxiv" / "2605.06548.md"
-    assert saved.exists()
-    content = saved.read_text(encoding="utf-8")
-    assert "Continuous Latent Diffusion Language Model" in content
-    assert "https://arxiv.org/abs/2605.06548" in content
-    assert "Local PDF Path: /docs/papers/arxiv/2605.06548.pdf" in content
-    assert "Local PDF RAG Indexed: yes" in content
-    assert "full paper PDF was saved locally" in content
-    assert "/docs/papers/arxiv/2605.06548.md" in result
-    assert "/docs/papers/arxiv/2605.06548.pdf" in result
-    assert "Saved local paper path(s): /docs/papers/arxiv/2605.06548.md" in result
-    assert ("arxiv_fetch", "2605.06548") in events
-    assert ("download_pdf", "2605.06548") in events
-    assert (
-        "ingest_pdf",
-        "/docs/papers/arxiv/2605.06548.pdf",
-    ) in events
-    assert (
-        "rag_docs",
-        "/docs/papers/arxiv/2605.06548.md,/docs/papers/arxiv/2605.06548.pdf",
-    ) in events
-
-
-@pytest.mark.asyncio
-async def test_ingest_local_arxiv_pdfs_resolves_validator_paths(
-    monkeypatch,
-    tmp_path,
-):
-    from agents import web_agent
-
-    docs = tmp_path / "docs"
-    paper_dir = docs / "papers" / "arxiv"
-    paper_dir.mkdir(parents=True)
-    pdf_path = paper_dir / "2605.06548.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\nfixture")
-    validator = FilesystemValidator(
-        FilesystemValidatorConfig(
-            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
-        )
-    )
-    captured: list[list[str]] = []
-
-    class FakeRagService:
-        async def ingest_local(self, paths):
-            captured.append(paths)
-            return ["pdf-doc"]
-
-    monkeypatch.setattr(web_agent, "rag_validator", validator)
-    monkeypatch.setattr(web_agent, "rag_service", FakeRagService())
-
-    result = await web_agent._ingest_local_arxiv_pdfs(
-        ["/docs/papers/arxiv/2605.06548.pdf"]
-    )
-
-    assert result == ["/docs/papers/arxiv/2605.06548.pdf"]
-    assert captured == [[str(pdf_path)]]
+    assert "Large Language Diffusion Models is relevant." in result
+    assert ("web_search", "site:arxiv.org diffusion language models") in events
+    assert ("model", "ArxivSelectionDecision") not in events
 
 
 def test_current_turn_prompt_prioritizes_user_request():
@@ -3578,12 +3117,10 @@ def test_fs_task_prompt_routes_missing_file_to_recovery(monkeypatch, tmp_path):
     prompt, analysis = fs_agent._fs_task_prompt("read /docs/not-present.md")
 
     assert analysis.invalid_paths == ["/docs/not-present.md"]
-    assert "Wrong-path recovery policy" in prompt
-    assert "Recovery order" in prompt
-    assert "find_paths over the task read scope" in prompt
-    assert "Do not use path='/'" in prompt
-    assert "grep_files searches file content only" in prompt
-    assert "ask the user to confirm the exact path" in prompt
+    assert "Missing-path chain:" in prompt
+    assert "find_paths on the task scope (/docs)" in prompt
+    assert "-> grep_files if content can identify the file" in prompt
+    assert "Ask for confirmation before edits" in prompt
 
 
 def test_fs_task_prompt_includes_candidate_paths_for_confirmation(monkeypatch, tmp_path):
@@ -3603,7 +3140,7 @@ def test_fs_task_prompt_includes_candidate_paths_for_confirmation(monkeypatch, t
 
     assert analysis.invalid_paths == ["/docs/acutal.md"]
     assert analysis.candidate_paths == ["/docs/actual.md"]
-    assert "Possible replacement path candidates" in prompt
+    assert "Replacement candidates" in prompt
     assert "- /docs/actual.md" in prompt
 
 
@@ -3633,11 +3170,11 @@ def test_fs_task_prompt_finds_cross_root_candidate_for_missing_writable_path(
     assert analysis.invalid_paths == ["/skills/agentsystem.md"]
     assert analysis.write_targets == ["/skills/agentsystem.md"]
     assert analysis.candidate_paths == ["/docs/agentsystem.md"]
-    assert "Potential new writable path hints" in prompt
+    assert "New write targets" in prompt
     assert "- /skills/agentsystem.md" in prompt
-    assert "Possible replacement path candidates" in prompt
+    assert "Replacement candidates" in prompt
     assert "- /docs/agentsystem.md" in prompt
-    assert "read that candidate first instead of listing directories" in prompt
+    assert "use one clear replacement candidate for a read-only request" in prompt
 
 
 def test_fs_task_prompt_tells_agent_to_use_resolved_paths_first(monkeypatch, tmp_path):
@@ -3656,8 +3193,8 @@ def test_fs_task_prompt_tells_agent_to_use_resolved_paths_first(monkeypatch, tmp
     prompt, analysis = fs_agent._fs_task_prompt("read /docs/actual.md")
 
     assert analysis.resolved_paths == ["/docs/actual.md"]
-    assert "perform the requested read, edit, or write directly" in prompt
-    assert "before doing any broad discovery" in prompt
+    assert "Mode: exact_path" in prompt
+    assert "find_paths" not in prompt
 
 
 def test_fs_path_recovery_guard_allows_read_only_candidate_answer(
@@ -3798,28 +3335,50 @@ async def test_fs_ambiguous_local_paper_uses_filesystem_discovery(
 
     prompts: list[str] = []
 
-    async def fail_rag(*_args, **_kwargs):
-        raise AssertionError("ambiguous paper lookup must use fs discovery first")
+    retrieved_paths: list[str] = []
 
-    async def fake_fs_tools(prompt, *, task_roots):
+    async def fake_rag(objective, paths):
+        assert "world model" in objective
+        retrieved_paths.extend(paths)
+        return [
+            {
+                "node_id": "world-model-node",
+                "source": paths[0],
+                "title": "World Model Survey",
+                "text": "The paper explains predictive dynamics.",
+            }
+        ]
+
+    async def fake_synthesis(**_kwargs):
+        return "The selected local World Model Survey explains predictive dynamics."
+
+    async def fake_fs_tools(
+        prompt,
+        *,
+        task_roots,
+        discovery_preview_only=False,
+        discovery_search_paths=None,
+    ):
         prompts.append(prompt)
         assert task_roots == ["/docs"]
+        assert discovery_preview_only is True
+        assert discovery_search_paths == ["/docs"]
         return (
-            "The local World Model Survey explains predictive dynamics.",
+            "The World Model Survey is the strongest lexical candidate.",
             [
-                ("find_paths", {"query": "world model", "path": "/docs"}),
                 (
                     "grep_files",
                     {"query": "world model", "path": "/docs"},
                 ),
                 (
-                    "read_file",
+                    "preview_file",
                     {"path": "/docs/papers/arxiv/world-model.md"},
                 ),
             ],
         )
 
-    monkeypatch.setattr(fs_agent, "rag_search_documents", fail_rag)
+    monkeypatch.setattr(fs_agent, "_retrieve_rag_evidence", fake_rag)
+    monkeypatch.setattr(fs_agent, "_synthesize_rag_answer", fake_synthesis)
     monkeypatch.setattr(fs_agent, "_run_fs_agent", fake_fs_tools)
 
     result = await fs_agent.run_fs_task_result(
@@ -3829,9 +3388,10 @@ async def test_fs_ambiguous_local_paper_uses_filesystem_discovery(
     assert result.status == "ok"
     assert "predictive dynamics" in result.answer
     assert "/docs/papers/arxiv/world-model.md" in result.sources
+    assert retrieved_paths == ["/docs/papers/arxiv/world-model.md"]
     assert len(prompts) == 1
-    assert "use find_paths/list_files in the task scope" in prompts[0]
-    assert "then grep_files with relevant title or identifier terms" in prompts[0]
+    assert "Mode: topic_discovery" in prompts[0]
+    assert "Search path: /docs" in prompts[0]
 
 
 @pytest.mark.asyncio
@@ -3853,19 +3413,52 @@ async def test_fs_non_paper_docs_use_filesystem_instead_of_papers_rag(
     )
     monkeypatch.setattr(fs_agent, "validator", validator)
 
-    async def fail_rag(*_args, **_kwargs):
-        raise AssertionError("non-paper docs task must not default to papers RAG")
+    retrieved_paths: list[str] = []
 
-    async def fake_fs_tools(prompt, *, task_roots):
+    async def fake_rag(objective, paths):
+        assert "agent system" in objective
+        retrieved_paths.extend(paths)
+        return [
+            {
+                "node_id": "agent-system-node",
+                "source": paths[0],
+                "title": "Agent System",
+                "text": "The documentation describes scoped routing.",
+            }
+        ]
+
+    async def fake_synthesis(**_kwargs):
+        return "The local agent system documentation describes scoped routing."
+
+    async def fake_fs_tools(
+        prompt,
+        *,
+        task_roots,
+        discovery_preview_only=False,
+        discovery_search_paths=None,
+    ):
         assert task_roots == ["/docs"]
-        assert "/docs/agentsystem.md" in prompt
-        assert "/docs/papers/world-model.md" in prompt
+        assert discovery_preview_only is True
+        assert discovery_search_paths == ["/docs"]
+        assert "Mode: topic_discovery" in prompt
+        assert "Search path: /docs" in prompt
+        assert "Readable file index" not in prompt
         return (
-            "The local agent system documentation describes scoped routing.",
-            [("read_file", {"path": "/docs/agentsystem.md"})],
+            "The agent system document is the strongest candidate.",
+            [
+                (
+                    "grep_files",
+                    {"query": "agent system", "path": "/docs"},
+                ),
+                (
+                    "preview_file",
+                    {"path": "/docs/agentsystem.md"},
+                ),
+            ],
         )
 
-    monkeypatch.setattr(fs_agent, "_retrieve_rag_evidence", fail_rag)
+    monkeypatch.setattr(fs_agent, "_retrieve_rag_evidence", fake_rag)
+    monkeypatch.setattr(fs_agent, "_synthesize_rag_answer", fake_synthesis)
     monkeypatch.setattr(fs_agent, "_run_fs_agent", fake_fs_tools)
 
     result = await fs_agent.run_fs_task_result(
@@ -3874,6 +3467,7 @@ async def test_fs_non_paper_docs_use_filesystem_instead_of_papers_rag(
 
     assert result.status == "ok"
     assert result.sources == ["/docs/agentsystem.md"]
+    assert retrieved_paths == ["/docs/agentsystem.md"]
     assert "scoped routing" in result.answer
 
 

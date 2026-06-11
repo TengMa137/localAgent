@@ -22,6 +22,7 @@ from agents.runtime.query_policy import (
     requests_collection_plan,
     requests_file_operation,
     requests_local_discovery,
+    requests_topic_file_discovery,
 )
 from agents.worker import TaskSpec
 from agents.runtime.turn_context import EvidenceItem
@@ -95,6 +96,7 @@ def test_query_policy_local_file_actions_require_an_operation(text, expected):
         ("check my recent notes", True),
         ("inspect the saved document", True),
         ("find it in the same folder", True),
+        ("what about 2605.00080v1 in the same folder?", True),
         ("find the latest paper", True),
         ("search the web for the paper", False),
         ("explain how files work in Python", False),
@@ -102,6 +104,21 @@ def test_query_policy_local_file_actions_require_an_operation(text, expected):
 )
 def test_query_policy_local_discovery_is_narrow_and_local_first(text, expected):
     assert requests_local_discovery(text) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("summarize the authentication documentation", True),
+        ("find files related to world models", True),
+        ("review architecture notes", True),
+        ("edit the authentication documentation", False),
+        ("write a new local note", False),
+        ("explain authentication", False),
+    ],
+)
+def test_query_policy_topic_file_discovery_is_read_only(text, expected):
+    assert requests_topic_file_discovery(text) is expected
 
 
 @pytest.mark.parametrize(
@@ -148,6 +165,13 @@ def test_query_policy_referential_artifact_is_ambiguous_not_explicit_local():
 def test_query_policy_now_does_not_force_web_but_explicit_web_does():
     assert infer_task_kind("ok, now explain this design") is None
     assert infer_task_kind("search the web for this design") == TaskKind.WEB_SEARCH
+
+
+def test_query_policy_external_arxiv_lookup_uses_web_search():
+    assert (
+        infer_task_kind("search the web for arXiv 2605.00080")
+        == TaskKind.WEB_SEARCH
+    )
 
 
 def test_query_policy_resolved_local_files_win_over_external_identifiers():
@@ -524,6 +548,19 @@ def test_normalize_plan_drops_initial_answer_for_current_info_objective():
     assert normalized.initial_answer is None
     assert normalized.tasks[0].kind == TaskKind.WEB_SEARCH
     assert normalized.tasks[0].requires_current_info is True
+
+
+def test_normalize_plan_uses_web_search_for_unresolved_arxiv_id():
+    normalized = _normalize_plan(
+        PlanOutput(initial_answer="Ungrounded paper summary."),
+        objective="Summarize arXiv 2605.00080",
+        matched_files=[],
+        as_of="now",
+    )
+
+    assert normalized.initial_answer is None
+    assert normalized.tasks[0].kind == TaskKind.WEB_SEARCH
+    assert normalized.tasks[0].query == "Summarize arXiv 2605.00080"
 
 
 def test_normalize_plan_keeps_initial_answer_for_non_web_terminal_issue():

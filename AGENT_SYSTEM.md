@@ -101,7 +101,7 @@ Routes:
 - `direct`: answer from reasoning, visible history, or memory.
 - `fs`: scope one filesystem task, use deterministic local retrieval for
   explicit directories or large inputs, and forward its text answer.
-- `web`: run one focused web/current/URL/arXiv specialist task and forward its
+- `web`: run one focused web/current/URL/external-paper specialist task and forward its
   answer.
 - `plan`: decompose complex work into typed tasks, run workers, and synthesize
   useful evidence.
@@ -143,16 +143,33 @@ which owns `find_paths`, `list_files`, and `grep_files`. The filesystem model
 returns plain text, while Python derives paths and changes from validated
 preflight state and successful tool calls.
 
-For ambiguous local discovery, the filesystem model is instructed to call
-`find_paths` for names and `grep_files` for content before reporting a miss.
-Both tools accept either one `query` or several literal `queries`; `match_mode`
-is `any` or `all`. For `grep_files`, `all` means every term must occur somewhere
-in the same file.
+The filesystem system prompt contains only model-owned instructions. Each task
+adds one scoped tool chain and non-empty path facts; validator checks, duplicate
+call rules, write approval, and the full preflight file index stay in Python
+instead of being repeated to the model.
+
+Topic-based local discovery follows a staged retrieval policy:
+
+1. `grep_files` performs lexical content search inside the scoped local root.
+2. `preview_file` returns only bounded opening sentences from the strongest
+   candidates for abstract/introduction-style relevance triage.
+3. Python sends every previewed candidate through deterministic RAG and the
+   RAG answer model writes the substantive answer.
+
+In this mode, the first model step is given only `grep_files`; after a
+successful grep, later steps are given only `preview_file`, with at most three
+previews. Python inserts the single validated search path when omitted. Grep
+returns at most 12 bounded excerpts, at most two per file, so one-line Markdown
+documents cannot fill the context window. A unique same-name directory
+candidate such as `/docs/papers/arxiv` for `docs/arxiv` is resolved before the
+model runs.
+
+Exact-path requests keep the normal direct-read policy for small text files,
+while PDFs, directories, and oversized files always use RAG.
 
 PDFs are always handed to RAG rather than text tools. `rag_lib` extracts PDF
-pages with `pypdf`; fetched arXiv PDFs are resolved through the validator,
-ingested with `ingest_local`, and included in the paper-scoped RAG query. Web
-uploads classify PDFs as documents and explicitly direct the agent to RAG.
+pages with `pypdf`; web uploads classify PDFs as documents and explicitly
+direct the agent to RAG.
 
 ### 4. Plan Route
 

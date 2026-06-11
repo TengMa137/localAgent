@@ -66,6 +66,7 @@ FS_WRITE_TOOLS = {
 }
 FS_READ_DISCOVERY_TOOLS = {
     "read_file",
+    "preview_file",
     "read_image",
     "read_lines",
     "stat_path",
@@ -76,6 +77,9 @@ FS_READ_DISCOVERY_TOOLS = {
 }
 FS_EMPTY_DISCOVERY_TOOLS = {"find_paths", "list_files", "grep_files"}
 MAX_EMPTY_DISCOVERY_CALLS = 8
+TOPIC_DISCOVERY_TOOLS = {"grep_files", "preview_file"}
+MAX_TOPIC_GREP_MATCHES = 12
+MAX_TOPIC_PREVIEWS = 3
 
 
 @dataclass
@@ -83,6 +87,8 @@ class FilesystemRunState:
     """Task-local filesystem scope and successful tool-call audit."""
 
     allowed_read_roots: tuple[str, ...]
+    discovery_preview_only: bool = False
+    discovery_search_paths: tuple[str, ...] = ()
     successful_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
 
@@ -95,9 +101,16 @@ _filesystem_run_state: ContextVar[FilesystemRunState | None] = ContextVar(
 @contextmanager
 def filesystem_run_scope(
     allowed_read_roots: list[str] | tuple[str, ...],
+    *,
+    discovery_preview_only: bool = False,
+    discovery_search_paths: list[str] | tuple[str, ...] = (),
 ):
     """Restrict one filesystem model run and collect executed tool metadata."""
-    state = FilesystemRunState(tuple(dict.fromkeys(allowed_read_roots)))
+    state = FilesystemRunState(
+        tuple(dict.fromkeys(allowed_read_roots)),
+        discovery_preview_only=discovery_preview_only,
+        discovery_search_paths=tuple(dict.fromkeys(discovery_search_paths)),
+    )
     token = _filesystem_run_state.set(state)
     try:
         yield state
@@ -179,10 +192,71 @@ class DuplicateFilesystemReadGuardToolset(WrapperToolset):
     seen_calls: dict[str, set[str]] = field(default_factory=dict)
     empty_discovery_counts: dict[str, int] = field(default_factory=dict)
 
+    async def get_tools(self, ctx):
+        tools = await super().get_tools(ctx)
+        run_state = _filesystem_run_state.get()
+        if run_state is None or not run_state.discovery_preview_only:
+            return tools
+        completed = [name for name, _args in run_state.successful_calls]
+        if "grep_files" not in completed:
+            allowed = {"grep_files"}
+        elif completed.count("preview_file") < MAX_TOPIC_PREVIEWS:
+            allowed = {"preview_file"}
+        else:
+            allowed = set()
+        return {
+            name: tool
+            for name, tool in tools.items()
+            if name in allowed
+        }
+
     async def call_tool(self, name, tool_args, ctx, tool):
         tool_name = getattr(getattr(tool, "tool_def", None), "name", name) or name
         run_key = self._run_key(ctx)
         run_state = _filesystem_run_state.get()
+
+        if run_state is not None and run_state.discovery_preview_only:
+            if tool_name not in TOPIC_DISCOVERY_TOOLS:
+                raise ModelRetry(
+                    "Topic discovery exposes only grep_files and preview_file. "
+                    "Call grep_files on the supplied search path, preview 1-3 "
+                    "returned candidates, then answer."
+                )
+            completed = [name for name, _args in run_state.successful_calls]
+            if tool_name == "grep_files" and "grep_files" in completed:
+                raise ModelRetry(
+                    "The lexical search is complete. Preview the strongest "
+                    "returned candidates instead of searching again."
+                )
+            if tool_name == "preview_file":
+                if "grep_files" not in completed:
+                    raise ModelRetry(
+                        "Call grep_files once before previewing candidates."
+                    )
+                if completed.count("preview_file") >= MAX_TOPIC_PREVIEWS:
+                    raise ModelRetry(
+                        "Three candidate previews are enough. Stop tool use and "
+                        "return the relevance assessment."
+                    )
+            if tool_name == "grep_files":
+                search_paths = run_state.discovery_search_paths
+                if len(search_paths) == 1 and str(tool_args.get("path") or "/") in {
+                    "",
+                    ".",
+                    "/",
+                }:
+                    tool_args = {**tool_args, "path": search_paths[0]}
+                requested_max = int(
+                    tool_args.get("max_matches") or MAX_TOPIC_GREP_MATCHES
+                )
+                tool_args = {
+                    **tool_args,
+                    "case_sensitive": False,
+                    "max_matches": min(
+                        requested_max,
+                        MAX_TOPIC_GREP_MATCHES,
+                    ),
+                }
 
         if tool_name in FS_READ_DISCOVERY_TOOLS and run_state is not None:
             path = str(tool_args.get("path") or "/")
@@ -196,6 +270,19 @@ class DuplicateFilesystemReadGuardToolset(WrapperToolset):
                     f"scope ({allowed}). Use one of those roots directly; do "
                     "not search unrelated mounts."
                 )
+
+        if (
+            run_state is not None
+            and run_state.discovery_preview_only
+            and tool_name in {"read_file", "read_lines"}
+        ):
+            raise ModelRetry(
+                "Topic-based local discovery must not load a candidate document "
+                "with read_file or read_lines. Search with grep_files, inspect "
+                "promising matches with preview_file, then return the best "
+                "candidate assessment. Python will retrieve substantive content "
+                "from the previewed paths through RAG."
+            )
 
         if tool_name in FS_WRITE_TOOLS and run_state is not None:
             target = str(_fs_write_path(tool_name, tool_args) or "")

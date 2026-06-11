@@ -4,8 +4,6 @@ WEB_SOURCE_SYSTEM_PROMPT = """
 Classify the evidence type for a request already routed to web. Return:
 - kind: exactly one of open_web, scholarly, weather, encyclopedia, recent_news.
 - target: the smallest useful retrieval subject, without instruction words.
-- include_pdf: false by default. Set true only when the user explicitly
-  requests the original PDF/PDF file.
 - reason: one concise semantic justification.
 
 Preserve user-provided disambiguators that affect lookup accuracy, including
@@ -17,7 +15,8 @@ Kinds:
   place, organization, object, or past event.
 - recent_news: recent reporting, headlines, articles, media coverage, or
   developments in an ongoing event.
-- scholarly: paper discovery, selection, fetch, or inspection.
+- scholarly: external paper discovery or inspection through normal web search
+  and crawling.
 - open_web: all other external retrieval, especially current office-holders,
   changing facts, official/primary sources, law/policy text, product/version
   documentation, market data, troubleshooting, and source comparison.
@@ -38,8 +37,8 @@ Never classify only from topic words. Classify the evidence the user requested.
 Paper requests arrive here only after explicit external intent or an unsuccessful
 local filesystem lookup. Complete the external scholarly retrieval; do not send
 the task back to local discovery.
-Do not request a PDF merely because the user says fetch, save, or download a
-paper; full-text Markdown is the default local research artifact.
+Do not imply that a paper or PDF will be saved locally. The web workflow only
+searches and crawls external sources.
 """
 
 
@@ -53,8 +52,8 @@ why the query is aligned before executing it.
 
 Mirror the selected method in preferred_source. For weather_forecast and
 wiki_summary also set preferred_tool to the same exact name, leave
-source_domains empty, and set crawl_url_limit=0. For web and arxiv set
-preferred_tool=null. Recent news uses web search directly.
+source_domains empty, and set crawl_url_limit=0. For web set
+preferred_tool=null. Recent news and scholarly requests use web search directly.
 
 Set search_result_limit to the smallest useful number. Use 2-3 for simple
 facts, 4-6 for normal lookups, and up to 10 only for broad comparisons or
@@ -74,8 +73,8 @@ date unless the user explicitly requests historical data for that date. Put the
 absolute date in checks/as_of instead.
 
 For latest/recent scholarly-paper discovery, keep the query topic-focused and
-avoid forcing only today or this month. The runtime searches arXiv-scoped web
-results across current-month, current-year, and recent-year windows.
+avoid forcing only today or this month. Use source_domains when the request
+explicitly names a scholarly source such as arxiv.org.
 
 Optionally set source_domains to a small set of relevant domains for open-web
 tasks. Do not choose every domain.
@@ -105,21 +104,6 @@ snippets, or the user requested exact page text or full document content.
 Cross-source validation can use multiple previews when they contain the facts;
 it does not automatically require crawling. Never select a URL merely because
 its title promises detailed data. Respect the crawl URL budget.
-"""
-
-
-ARXIV_SELECTION_SYSTEM_PROMPT = """
-You select arXiv paper IDs from arXiv-scoped web search previews.
-
-Use the objective, query preflight, and result titles/snippets/URLs. Return only
-IDs in the provided candidate list. Prefer papers matching the requested topic
-and paper type. For an overview, survey, or review request, prefer that paper
-type over unrelated papers. For "this year" or "latest", if no current-period
-match is visible, choose the most recent relevant paper and state the date
-limitation in uncertainties.
-
-Do not choose an ID only because it appears first. Return at most the requested
-fetch budget.
 """
 
 

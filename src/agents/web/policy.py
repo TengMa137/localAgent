@@ -22,10 +22,6 @@ SOURCE_TOOL_ALIASES = {
 }
 
 
-def preferred_source_is_arxiv(plan: WebQueryPlan) -> bool:
-    return plan.preferred_source.strip().casefold() == "arxiv"
-
-
 def preferred_api_tool(plan: WebQueryPlan) -> str | None:
     preferred_tool = (plan.preferred_tool or "").strip().casefold()
     if preferred_tool in SPECIALIZED_MCP_TOOLS:

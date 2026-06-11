@@ -34,25 +34,6 @@ def format_search_results(
     return "\n".join(lines)
 
 
-def format_papers(papers: List[dict]) -> str:
-    if not papers:
-        return "No arXiv papers returned."
-
-    lines: list[str] = []
-    for paper in papers[:5]:
-        lines.append(
-            "\n".join(
-                [
-                    f"- arxiv_id: {str(paper.get('arxiv_id') or '').strip()}",
-                    f"  title: {str(paper.get('title') or '').strip()}",
-                    f"  authors: {paper.get('authors') or []}",
-                    f"  summary: {str(paper.get('summary') or '').strip()[:800]}",
-                ]
-            )
-        )
-    return "\n".join(lines)
-
-
 def format_preview_decision(decision: WebPreviewDecision | None) -> str:
     if decision is None:
         return "No search preview decision was needed."
@@ -109,8 +90,6 @@ def output_status(output: WebAgentResult) -> tuple[str, bool]:
     if (
         "no web search results returned" in lowered
         or "no urls were selected" in lowered
-        or "no arxiv ids were discovered" in lowered
-        or "no local arxiv paper file was saved" in lowered
         or answer == "No answer returned."
     ) and not output.findings:
         return "not_found", False

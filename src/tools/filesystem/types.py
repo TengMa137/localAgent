@@ -14,6 +14,17 @@ class ReadResult(BaseModel):
     chars_read: int = Field(description="Number of characters actually returned")
 
 
+class PreviewResult(BaseModel):
+    """Bounded opening preview used to triage lexical search candidates."""
+
+    path: str = Field(description="Virtual path previewed")
+    content: str = Field(description="Opening sentences returned for relevance triage")
+    sentences_read: int = Field(description="Number of sentence-like segments returned")
+    total_chars: int = Field(description="Total file size in characters")
+    chars_read: int = Field(description="Number of preview characters returned")
+    truncated: bool = Field(description="True if more file content exists")
+
+
 class WriteResult(BaseModel):
     """Result of writing a file."""
 
@@ -67,7 +78,7 @@ class GrepMatch(BaseModel):
     path: str = Field(description="Virtual path containing the match")
     line: int = Field(description="1-based line number")
     column: int = Field(description="1-based column number")
-    text: str = Field(description="Full line text containing the match")
+    text: str = Field(description="Bounded line excerpt containing the match")
 
 
 class GrepResult(BaseModel):

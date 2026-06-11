@@ -1,7 +1,7 @@
 # test filessystem tool functionality, e.g. read_file, write_file, edit_file...
 from pydantic_ai.messages import BinaryImage, ToolReturn
 import pytest
-from tools.filesystem.types import ReadResult, WriteResult
+from tools.filesystem.types import PreviewResult, ReadResult, WriteResult
 from tools.filesystem.errors import EditError, ValidationError
 
 
@@ -10,6 +10,7 @@ def test_filesystem_tools_are_registered(filesystem_toolset):
 
     expected = {
         "read_file",
+        "preview_file",
         "read_image",
         "write_file",
         "read_lines",
@@ -107,6 +108,68 @@ async def test_read_truncation(filesystem_toolset, tools_in_toolset, ctx, tmp_pa
     assert result.content == "abc"
     assert result.truncated is True
     assert result.total_chars == 6
+
+
+@pytest.mark.asyncio
+async def test_preview_file_returns_only_opening_sentences(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
+    text = (
+        "# World Models\n\n"
+        "This paper learns predictive dynamics. "
+        "It uses a compact latent state. "
+        "Later sections contain implementation details."
+    )
+    (tmp_path / "paper.md").write_text(text)
+
+    result = await filesystem_toolset.call_tool(
+        "preview_file",
+        {
+            "path": "/data/paper.md",
+            "max_sentences": 2,
+            "max_chars": 500,
+        },
+        ctx,
+        tools_in_toolset["preview_file"],
+    )
+
+    assert isinstance(result, PreviewResult)
+    assert "predictive dynamics" in result.content
+    assert "Later sections" not in result.content
+    assert result.sentences_read == 2
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_preview_file_prefers_abstract_over_front_matter(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
+    (tmp_path / "paper.md").write_text(
+        "# A Paper\n\n"
+        "Authors and affiliations without useful topic detail.\n\n"
+        "## Abstract\n"
+        "We introduce a latent world model for planning. "
+        "The method predicts future observations.\n\n"
+        "## Introduction\n"
+        "This section is not part of the preview.",
+    )
+
+    result = await filesystem_toolset.call_tool(
+        "preview_file",
+        {"path": "/data/paper.md", "max_sentences": 4, "max_chars": 500},
+        ctx,
+        tools_in_toolset["preview_file"],
+    )
+
+    assert "latent world model" in result.content
+    assert "Authors and affiliations" not in result.content
+    assert "Introduction" not in result.content
 
 
 @pytest.mark.asyncio
@@ -436,6 +499,53 @@ async def test_grep_files_truncates_at_max_matches(filesystem_toolset, tools_in_
     )
 
     assert result.count == 1
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_grep_files_bounds_long_line_excerpts(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
+    long_line = ("prefix " * 700) + "world model" + (" suffix" * 700)
+    (tmp_path / "paper.md").write_text(long_line)
+
+    result = await filesystem_toolset.call_tool(
+        "grep_files",
+        {"path": "/data", "query": "world model"},
+        ctx,
+        tools_in_toolset["grep_files"],
+    )
+
+    assert result.count == 1
+    assert "world model" in result.matches[0].text
+    assert len(result.matches[0].text) <= 506
+
+
+@pytest.mark.asyncio
+async def test_grep_files_limits_matches_per_file_for_candidate_diversity(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
+    (tmp_path / "a.md").write_text("\n".join(["world model"] * 8))
+    (tmp_path / "b.md").write_text("world model")
+
+    result = await filesystem_toolset.call_tool(
+        "grep_files",
+        {"path": "/data", "query": "world model"},
+        ctx,
+        tools_in_toolset["grep_files"],
+    )
+
+    assert [match.path for match in result.matches] == [
+        "/data/a.md",
+        "/data/a.md",
+        "/data/b.md",
+    ]
     assert result.truncated is True
 
 

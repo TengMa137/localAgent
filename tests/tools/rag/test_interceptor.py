@@ -104,14 +104,6 @@ class TestStableDocId:
 
 
 class TestMakeTitle:
-    def test_arxiv_scope(self):
-        t = make_title(
-            source="https://arxiv.org/abs/2401.00001",
-            raw_title="Attention Is All You Need",
-            arxiv_id="2401.00001",
-        )
-        assert t == "arxiv:2401.00001 — Attention Is All You Need"
-
     def test_domain_scope_with_raw_title(self):
         t = make_title(source="https://example.com/page", raw_title="Hypertrophy Guide")
         assert t == "example.com — Hypertrophy Guide"
@@ -344,30 +336,13 @@ class TestIngest:
 
 class TestWebSearch:
     @pytest.mark.asyncio
-    async def test_web_only_toolset_excludes_arxiv_tools(self, mock_rag, ctx):
-        toolset = make_web_toolset(
-            "http://mcp:8000/sse",
-            mock_rag,
-            include_arxiv=False,
-        )
+    async def test_web_toolset_has_no_arxiv_fetch_tool(self, mock_rag, ctx):
+        toolset = make_web_toolset("http://mcp:8000/sse", mock_rag)
         tools = await toolset.get_tools(ctx)
 
         assert "web_search_tool" in tools
         assert "web_crawl_tool" in tools
         assert "arxiv_fetch_tool" not in tools
-
-    @pytest.mark.asyncio
-    async def test_arxiv_enabled_toolset_includes_arxiv_tools(self, mock_rag, ctx):
-        toolset = make_web_toolset(
-            "http://mcp:8000/sse",
-            mock_rag,
-            include_arxiv=True,
-        )
-        tools = await toolset.get_tools(ctx)
-
-        assert "web_search_tool" in tools
-        assert "web_crawl_tool" in tools
-        assert "arxiv_fetch_tool" in tools
         assert "weather_forecast_tool" in tools
         assert "wiki_summary_tool" in tools
 

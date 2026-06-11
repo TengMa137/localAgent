@@ -107,7 +107,7 @@ Each task must be:
   - Self-contained: worker has everything it needs in the task spec
   - Specific: include exact search terms, date ranges, URLs, or file paths
   - Scoped: one clear information need per task, not "research X generally"
-  - Routed: set kind to one of local_rag, web_search, url_crawl, arxiv
+  - Routed: set kind to one of local_rag, web_search, url_crawl
 
 Good task examples:
   ✓ "Find the abstract and contributions of arXiv paper 2401.12345"
@@ -128,7 +128,7 @@ Bad task examples:
 - Use kind=local_rag for local file tasks
 - Use kind=web_search for current or web lookup tasks
 - Use kind=url_crawl for user-provided URLs
-- Use kind=arxiv for arXiv paper lookup
+- Use kind=web_search for external arXiv paper lookup
 - Workers execute via fs_agent or web_agent from TaskSpec — inject query, URLs, and files clearly
 """
 
@@ -510,7 +510,7 @@ class PlanNormalizer:
         return raw_task.kind or infer_task_kind(raw_task.objective, matched_files=files)
 
     def _required_tasks(self, tasks: list[TaskSpec]) -> list[TaskSpec]:
-        """Build structural local, URL, or arXiv tasks omitted by the planner."""
+        """Build structural local, URL, or external paper tasks omitted by the planner."""
         required: list[TaskSpec] = []
         local_files = _dedupe([*self.matched_files, *self.objective_files])
         if requests_collection_plan(self.objective) and local_files:
@@ -548,12 +548,15 @@ class PlanNormalizer:
                 )
             )
 
-        if self.objective_arxiv_ids and not self._has_kind(tasks, TaskKind.ARXIV):
+        if self.objective_arxiv_ids and not self._has_kind(
+            tasks,
+            TaskKind.WEB_SEARCH,
+        ):
             required.append(
                 TaskSpec(
-                    kind=TaskKind.ARXIV,
+                    kind=TaskKind.WEB_SEARCH,
                     objective=(
-                        "Fetch and retrieve evidence for the arXiv paper(s): "
+                        "Search the web and retrieve evidence for the arXiv paper(s): "
                         f"{self.objective}"
                     ),
                     query=self.objective,

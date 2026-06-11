@@ -6,12 +6,11 @@ Identity / dedup : doc_id  (stable hash of source, never shown to LLM)
 Retrieval handle : title   (human-readable, scoped to avoid collisions)
 
 Title format:  "<scope> — <description>"
-  arxiv:2401.00001 — Attention Is All You Need
   example.com — Hypertrophy Training Guide
   pubmed.ncbi.nlm.nih — Effects of Volume on Muscle Growth
 
 The scope prefix makes titles unique in practice even when two pages share
-a generic description, because they'll have different domains or IDs.
+a generic description, because they'll have different domains.
 """
 
 import hashlib
@@ -47,38 +46,28 @@ def make_title(
     *,
     source: str,
     raw_title: str | None = None,
-    arxiv_id: str | None = None,
     fallback_text: str = "",
 ) -> str:
     """
     Build a scoped, collision-resistant title for the LLM to use.
 
     Priority:
-      1. arxiv_id  -> "arxiv:<id> — <raw_title or slug>"
-      2. raw_title -> "<domain> — <raw_title>"
-      3. fallback  -> "<domain> — <slug of first 8 words of text>"
+      1. raw_title -> "<domain> — <raw_title>"
+      2. fallback  -> "<domain> — <slug of first 8 words of text>"
 
     Args:
         source:      canonical URL or file path (always required)
         raw_title:   page <title>, paper title, or filename (optional)
-        arxiv_id:    arXiv paper ID if applicable (optional)
         fallback_text: first few hundred chars of content, used when no title
 
     Examples:
         make_title(source="https://example.com/page", raw_title="Hypertrophy Guide")
         -> "example.com — Hypertrophy Guide"
 
-        make_title(source="https://arxiv.org/abs/2401.00001",
-                   raw_title="Attention Is All You Need", arxiv_id="2401.00001")
-        -> "arxiv:2401.00001 — Attention Is All You Need"
-
         make_title(source="https://blog.example.com/post", fallback_text="## Training Volume...")
         -> "blog.example.com — Training Volume"
     """
-    if arxiv_id:
-        scope = f"arxiv:{arxiv_id}"
-    else:
-        scope = _domain(source)
+    scope = _domain(source)
 
     if raw_title and raw_title.strip():
         description = raw_title.strip()

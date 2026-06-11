@@ -10,7 +10,6 @@ class TaskKind(str, Enum):
     LOCAL_RAG = "local_rag"
     WEB_SEARCH = "web_search"
     URL_CRAWL = "url_crawl"
-    ARXIV = "arxiv"
 
 
 URL_RE = re.compile(r"https?://[^\s<>)\"']+")
@@ -44,6 +43,10 @@ EXPLICIT_LOCAL_SOURCE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+LOCAL_DIRECTORY_CONTEXT_RE = re.compile(
+    r"\b(?:same|current)\s+(?:folder|directory)\b",
+    re.IGNORECASE,
+)
 REFERENTIAL_LOCAL_ARTIFACT_RE = re.compile(
     r"\b(?:the|that|this|previous|previously discussed)\s+"
     r"(?:file|document|doc|notes?|paper|source)\b",
@@ -51,6 +54,20 @@ REFERENTIAL_LOCAL_ARTIFACT_RE = re.compile(
 )
 PAPER_LOOKUP_RE = re.compile(
     r"\b(?:paper|papers|article|articles|study|studies|publication|publications)\b",
+    re.IGNORECASE,
+)
+TOPIC_FILE_DISCOVERY_RE = re.compile(
+    r"\b(?:"
+    r"files?|documents?|documentation|docs?|notes?|papers?|articles?|"
+    r"studies|publications?|sources?"
+    r")\b",
+    re.IGNORECASE,
+)
+TOPIC_DISCOVERY_ACTION_RE = re.compile(
+    r"\b(?:"
+    r"check|read|open|inspect|review|summari[sz]e|analy[sz]e|explain|"
+    r"search|find|use|tell\s+me"
+    r")\b",
     re.IGNORECASE,
 )
 COLLECTION_ARTIFACT_RE = re.compile(
@@ -144,8 +161,11 @@ def explicitly_requests_local_source(text: str) -> bool:
     """Return true when the user names local storage as the required source."""
     return bool(
         not explicitly_requests_web(text)
-        and requests_file_operation(text)
         and EXPLICIT_LOCAL_SOURCE_RE.search(text)
+        and (
+            requests_file_operation(text)
+            or LOCAL_DIRECTORY_CONTEXT_RE.search(text)
+        )
     )
 
 
@@ -165,6 +185,15 @@ def requests_paper_lookup(text: str) -> bool:
         not explicitly_requests_web(text)
         and requests_file_operation(text)
         and PAPER_LOOKUP_RE.search(text)
+    )
+
+
+def requests_topic_file_discovery(text: str) -> bool:
+    """Return true for read-only topic discovery over general local artifacts."""
+    return bool(
+        not explicitly_requests_web(text)
+        and TOPIC_DISCOVERY_ACTION_RE.search(text)
+        and TOPIC_FILE_DISCOVERY_RE.search(text)
     )
 
 
@@ -227,7 +256,7 @@ def infer_task_kind(
     if requests_local_discovery(text):
         return TaskKind.LOCAL_RAG
     if extract_arxiv_ids(text) or "arxiv" in text.lower():
-        return TaskKind.ARXIV
+        return TaskKind.WEB_SEARCH
     if explicitly_requests_web(text) or likely_requires_current_info(text):
         return TaskKind.WEB_SEARCH
     return None

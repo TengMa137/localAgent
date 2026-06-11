@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field, model_validator
 
 RetrievalMethod = Literal[
     "web",
-    "arxiv",
     "weather_forecast",
     "wiki_summary",
 ]
@@ -25,14 +24,13 @@ SourceKind = Literal[
 class WebSourceDecision(BaseModel):
     kind: SourceKind
     target: str = ""
-    include_pdf: bool = False
     reason: str = ""
 
     @property
     def method(self) -> RetrievalMethod:
         return {
             "open_web": "web",
-            "scholarly": "arxiv",
+            "scholarly": "web",
             "weather": "weather_forecast",
             "encyclopedia": "wiki_summary",
             "recent_news": "web",
@@ -42,7 +40,6 @@ class WebSourceDecision(BaseModel):
 class WebQueryPlan(BaseModel):
     query: str
     retrieval_target: str | None = None
-    download_pdf: bool = False
     objective: str | None = None
     as_of: str | None = None
     preferred_source: str = "web"
@@ -85,21 +82,6 @@ class WebPreviewDecision(BaseModel):
     def coerce_none_lists(cls, values):
         if isinstance(values, dict):
             for field in ("selected_urls", "uncertainties"):
-                if values.get(field) is None:
-                    values[field] = []
-        return values
-
-
-class ArxivSelectionDecision(BaseModel):
-    arxiv_ids: List[str] = Field(default_factory=list)
-    reason: str = ""
-    uncertainties: List[str] = Field(default_factory=list)
-
-    @model_validator(mode="before")
-    @classmethod
-    def coerce_none_lists(cls, values):
-        if isinstance(values, dict):
-            for field in ("arxiv_ids", "uncertainties"):
                 if values.get(field) is None:
                     values[field] = []
         return values

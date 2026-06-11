@@ -11,10 +11,12 @@ run:
 * distinguish existing paths, invalid paths, and valid new write targets;
 * scope ordinary file tasks to ``/docs`` and enable ``/skills`` only for
   explicit skill requests;
-* inject replacement candidates, skill-editing policy, and a scoped file index;
+* use a scoped file index for path preflight and inject only actionable path facts;
 * enforce write approval, duplicate-read guards, and tool-call limits;
 * send explicit directories and large files to RAG before they can expand the
   model context;
+* make topic-based discovery use lexical search and bounded candidate previews,
+  then send previewed candidates through RAG even when the files are small;
 * prevent unconfirmed replacement paths from being treated as edit targets;
 * derive executed paths and changes from successful Python tool calls;
 * normalize failures and the text answer into one ``SpecialistResult``.
@@ -46,6 +48,7 @@ from .runtime.query_policy import (
     ambiguously_references_local_artifact,
     requests_local_discovery,
     requests_paper_lookup,
+    requests_topic_file_discovery,
 )
 from .runtime.specialist_result import SpecialistResult
 from .runtime.skills_context import scan_skills_context
@@ -63,6 +66,10 @@ from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 MAX_SKILL_EDITING_POLICY_CHARS = 5000
 SKILL_EDITING_POLICY_PATH = "/skills/skill_editing.md"
 SKILL_INTENT_RE = re.compile(r"\bskills?\b", re.IGNORECASE)
+EXPLICIT_CREATE_WRITE_RE = re.compile(
+    r"\b(?:create|write|save|add|make)\b",
+    re.IGNORECASE,
+)
 
 fs_agent = Agent(
     model=model,
@@ -108,9 +115,7 @@ def _roots_context(task_roots: list[str] | None = None) -> str:
     ) or "none"
     return (
         f"Readable roots for this task: {readable}\n"
-        f"Writable roots: {writable}\n"
-        "Use only the task readable roots. The readable file index lists known "
-        "files inside that scope."
+        f"Writable roots: {writable}"
     )
 
 
@@ -183,20 +188,15 @@ def _task_read_roots(objective: str, analysis: PathAnalysis) -> list[str]:
     return _dedupe(roots)
 
 
-def _files_in_roots(files: list[str], roots: list[str]) -> list[str]:
-    return [
-        path
-        for path in files
-        if any(_is_same_or_child_path(path, root) for root in roots)
-    ]
-
-
 def _preemptive_rag_paths(
     objective: str,
     analysis: PathAnalysis,
     task_roots: list[str],
 ) -> list[str]:
     """Select known large local inputs before the model can read them."""
+    if _requires_lexical_triage(objective, analysis):
+        return []
+
     assigned_paths = _plan_worker_relevant_files(objective)
     if assigned_paths:
         resolved = set(analysis.resolved_paths)
@@ -280,37 +280,123 @@ def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
     """Build the fs_agent prompt and path preflight analysis."""
     files = _readable_file_index()
     sanitized_objective, analysis = PathPreflight(files).analyze(objective)
+    _promote_topic_directory_candidate(objective, analysis)
     task_roots = _task_read_roots(objective, analysis)
-    scoped_files = _files_in_roots(files, task_roots)
+    explicit_create_write = bool(EXPLICIT_CREATE_WRITE_RE.search(objective))
     skills_context = (
         scan_skills_context()
-        if _objective_uses_skills(objective, analysis)
+        if (
+            _objective_uses_skills(objective, analysis)
+            and not analysis.resolved_paths
+            and not (explicit_create_write and analysis.write_targets)
+        )
         else ""
     )
     context = FsPromptContext(
-        roots_context=_roots_context(task_roots),
         sanitized_objective=sanitized_objective,
-        files=scoped_files,
         analysis=analysis,
         skills_context=skills_context,
         skill_policy=_skill_editing_policy_context(analysis),
         task_roots=task_roots,
         local_discovery_required=requests_local_discovery(objective),
+        lexical_triage_required=_requires_lexical_triage(objective, analysis),
         web_fallback_allowed=(
             ambiguously_references_local_artifact(objective)
             or requests_paper_lookup(objective)
         ),
+        explicit_create_write=explicit_create_write,
     )
     return context.render(), analysis
+
+
+def _promote_topic_directory_candidate(
+    objective: str,
+    analysis: PathAnalysis,
+) -> None:
+    """Resolve one fuzzy directory hint before topic-discovery tool use."""
+    if not (
+        requests_local_discovery(objective)
+        or requests_topic_file_discovery(objective)
+    ):
+        return
+    if analysis.resolved_paths or analysis.write_targets:
+        return
+    if len(analysis.invalid_paths) != 1:
+        return
+    candidates = _dedupe(analysis.candidate_paths)
+    if len(candidates) != 1:
+        return
+    candidate = candidates[0]
+    invalid_name = analysis.invalid_paths[0].rstrip("/").rsplit("/", 1)[-1]
+    candidate_name = candidate.rstrip("/").rsplit("/", 1)[-1]
+    if invalid_name.casefold() != candidate_name.casefold():
+        return
+    try:
+        _, resolved, _ = validator.get_path_config(candidate, op="read")
+    except Exception:
+        return
+    if not resolved.is_dir():
+        return
+
+    analysis.resolved_paths = [candidate]
+    analysis.invalid_paths = []
+    analysis.candidate_paths = []
+
+
+def _lexical_search_paths(
+    analysis: PathAnalysis,
+    task_roots: list[str],
+) -> list[str]:
+    """Return the narrowest validated directories for lexical discovery."""
+    directories: list[str] = []
+    for path in analysis.resolved_paths:
+        try:
+            _, resolved, _ = validator.get_path_config(path, op="read")
+        except Exception:
+            continue
+        if resolved.is_dir():
+            directories.append(path)
+    return _dedupe(directories) or task_roots
+
+
+def _requires_lexical_triage(
+    objective: str,
+    analysis: PathAnalysis,
+) -> bool:
+    """Use search/preview/RAG when relevance must be discovered without a path."""
+    if not (
+        requests_local_discovery(objective)
+        or requests_topic_file_discovery(objective)
+    ):
+        return False
+    if not analysis.all_path_hints():
+        return True
+    if not analysis.resolved_paths or analysis.invalid_paths or analysis.write_targets:
+        return False
+
+    for path in analysis.resolved_paths:
+        try:
+            _, resolved, _ = validator.get_path_config(path, op="read")
+        except Exception:
+            return False
+        if not resolved.is_dir():
+            return False
+    return True
 
 
 async def _run_fs_agent(
     prompt: str,
     *,
     task_roots: list[str],
+    discovery_preview_only: bool = False,
+    discovery_search_paths: list[str] | None = None,
 ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
     """Run one scoped filesystem tool loop with an unstructured text result."""
-    with filesystem_run_scope(task_roots) as run_state:
+    with filesystem_run_scope(
+        task_roots,
+        discovery_preview_only=discovery_preview_only,
+        discovery_search_paths=discovery_search_paths or [],
+    ) as run_state:
         result = await observable_run(
             fs_agent,
             prompt,
@@ -390,6 +476,17 @@ def _executed_paths(
             if value and value not in {"/", "."}:
                 paths.append(value)
     return _dedupe(paths)
+
+
+def _previewed_paths(
+    calls: list[tuple[str, dict[str, Any]]],
+) -> list[str]:
+    """Return candidate files explicitly triaged with bounded previews."""
+    return _dedupe(
+        str(args.get("path") or "").strip()
+        for tool_name, args in calls
+        if tool_name == "preview_file"
+    )
 
 
 def _executed_changes(
@@ -712,6 +809,11 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
         _rt(f"[fs_agent] write target hints: {path_analysis.write_targets}", "dim", 1)
 
     try:
+        calls: list[tuple[str, dict[str, Any]]] = []
+        discovery_preview_only = _requires_lexical_triage(
+            objective,
+            path_analysis,
+        )
         preemptive_rag_paths = _preemptive_rag_paths(
             objective,
             path_analysis,
@@ -736,9 +838,21 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
                 evidence=evidence,
             )
         else:
+            run_options = (
+                {
+                    "discovery_preview_only": True,
+                    "discovery_search_paths": _lexical_search_paths(
+                        path_analysis,
+                        task_roots,
+                    ),
+                }
+                if discovery_preview_only
+                else {}
+            )
             answer, calls = await _run_fs_agent(
                 prompt,
                 task_roots=task_roots,
+                **run_options,
             )
             output = _build_fs_output(
                 answer=answer,
@@ -751,11 +865,21 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
 
     output = _apply_path_recovery_guard(output, path_analysis)
     rag_paths = _rag_paths_for_output(output, path_analysis)
-    post_rag_paths = [
-        path
-        for path in _paths_that_need_rag(rag_paths)
-        if path not in preemptive_rag_paths
-    ]
+    previewed_paths = _previewed_paths(calls)
+    post_rag_paths = _dedupe(
+        [
+            *(
+                path
+                for path in previewed_paths
+                if path not in preemptive_rag_paths
+            ),
+            *(
+                path
+                for path in _paths_that_need_rag(rag_paths)
+                if path not in preemptive_rag_paths
+            ),
+        ]
+    )
     if post_rag_paths:
         evidence = await _retrieve_rag_evidence(objective, post_rag_paths)
         if evidence:

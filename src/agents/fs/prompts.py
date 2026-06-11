@@ -7,48 +7,38 @@ from dataclasses import dataclass
 from .contracts import PathAnalysis
 
 
-MAX_FS_CONTEXT_FILES = 120
-
-
 FS_SYSTEM_PROMPT = """
-You are a filesystem specialist agent.
+Execute one local filesystem objective with tools.
 
-Handle exactly one local filesystem objective. The orchestrator already decided
-this is a filesystem task, so do not second-guess that routing.
+Key rules:
+- Use the exact Scope, Search path, and paths returned by tools.
+- topic_discovery: call grep_files first, then preview_file on 1-3 strong
+  candidates, then stop. Do not call find_paths, list_files, list_directory,
+  read_file, or read_lines.
+- path_lookup: call find_paths, then inspect the confirmed path.
+- exact_path: use the resolved path directly.
+- create_write: write only to the new write target.
+- Apply the supplied policy before writing under /skills.
 
-Rules:
-  - Use only validator paths under the readable/writable roots in the prompt.
-  - Python preflight has already checked exact path hints. If resolved path hints
-    are present, act on those exact paths first and do not run broad discovery.
-  - Potential new writable path hints are nonexistent paths under writable
-    roots. Use them only when the objective clearly asks to create or write a new
-    file at that exact path. Do not treat them as existing files.
-  - Use the injected file index first for invalid-path recovery; discover
-    uncertain paths only when the index is insufficient.
-  - Prefer find_paths or list_files for filename/path discovery. grep_files
-    searches file contents, not filenames.
-  - If the objective refers indirectly to "the paper", "that file", a title,
-    or an identifier without a resolved exact path, use find_paths/list_files
-    inside the task scope. If path/name lookup is insufficient, use grep_files
-    with the relevant title or identifier terms. Do not select a file merely
-    because it appears in the index.
-  - Paper lookup is local-first. Search both path names and file contents before
-    reporting no usable local paper. The orchestrator may recover to web after
-    that explicit non-useful result.
-  - Never call read_file/read_image/stat on a path unless it came from the file
-    index, resolved path hints, or a prior tool result.
-  - Do not read the same file path twice in one run.
-  - Do not invent paths.
-  - Python handles directories, many files, and large-file RAG before or after
-    this run. Do not read unrelated files to compensate for a truncated read.
-  - For image files, use read_image. Use read_file only for text/code files.
-  - For writes under /skills, follow the injected skill editing policy.
-  - Never modify a replacement candidate unless it was a resolved exact path or
-    a potential new writable path for an explicit create/write task.
-  - Return only the practical user-facing answer as a text string. Lightweight
-    Markdown is allowed. Do not return JSON, XML, field names, or a schema.
-  - Never output internal reasoning, self-review, instruction checks, or lines
-    beginning with "Wait".
+Examples:
+Task:
+Mode: topic_discovery
+Search path: /docs/papers/arxiv
+Objective: check papers related to world models
+Calls:
+1. grep_files(path="/docs/papers/arxiv", queries=["world model", "world models"],
+   match_mode="any", case_sensitive=false, max_matches=12)
+2. preview_file(path="<strong match returned by grep_files>")
+3. Return the candidate assessment. Do not call another discovery tool.
+
+Task:
+Mode: exact_path
+Resolved paths: /docs/notes.md
+Objective: summarize the notes
+Call read_file(path="/docs/notes.md"), then answer.
+
+Return only the practical user-facing answer. Mention uncertainty or a
+replacement path when relevant. Do not return schemas or internal reasoning.
 """
 
 
@@ -66,83 +56,101 @@ beginning with "Wait".
 
 @dataclass
 class FsPromptContext:
-    roots_context: str
     sanitized_objective: str
-    files: list[str]
     analysis: PathAnalysis
     skills_context: str
     skill_policy: str
     task_roots: list[str]
     local_discovery_required: bool = False
+    lexical_triage_required: bool = False
     web_fallback_allowed: bool = False
+    explicit_create_write: bool = False
 
     def render(self) -> str:
-        listed_files = self.files[:MAX_FS_CONTEXT_FILES]
         task_roots = ", ".join(self.task_roots) or "none"
+        search_scope = (
+            ", ".join(self.analysis.resolved_paths)
+            if self.lexical_triage_required and self.analysis.resolved_paths
+            else task_roots
+        )
         skills_context = (
             f"{self.skills_context}\n\n" if self.skills_context.strip() else ""
         )
-        fallback_instruction = (
-            "- If no useful local evidence is found, say so explicitly so the "
-            "orchestrator can recover with web search.\n"
+        miss_instruction = (
+            "If nothing relevant is found, say that clearly; web recovery is allowed."
             if self.web_fallback_allowed
-            else "- If no useful local evidence is found, report that local "
-            "result directly; the user explicitly required local sources.\n"
+            else "If nothing relevant is found, report the local miss."
         )
-        source_instruction = (
-            "- The artifact reference may be local. Try local discovery before "
-            "using any fallback.\n"
-            if self.web_fallback_allowed
-            else "- The user explicitly required local sources. Search only the "
-            "scoped local filesystem.\n"
-        )
-        local_discovery = (
-            "Local-first discovery requirement:\n"
-            f"{source_instruction}"
-            "- Use find_paths for name/title hints and call grep_files for relevant content terms "
-            "before concluding that local evidence is unavailable.\n"
-            "- For multiple terms, pass queries=[...] with match_mode='any' or "
-            "'all'; do not construct a complex regex unless regex behavior is "
-            "specifically needed.\n"
-            f"{fallback_instruction}\n"
-            if self.local_discovery_required
-            else ""
-        )
-        return (
-            f"{self.roots_context}\n\n"
-            f"Task read scope: {task_roots}\n"
-            "Do not read or search outside this task scope.\n\n"
-            f"{skills_context}"
-            f"{self.skill_policy}\n"
-            f"{local_discovery}"
-            "Tool-use policy:\n"
-            "- Python preflight has already checked exact path hints against the validator.\n"
-            "- If Resolved exact path hints are listed, perform the requested read, edit, or write directly on those paths before doing any broad discovery.\n"
-            "- Potential new writable path hints are nonexistent paths under writable roots. Use them only when the objective clearly asks to create or write a new file at that exact path.\n"
-            "- Use the Readable file index below before calling discovery tools.\n"
-            "- For broad discovery, prefer find_paths, list_files, or grep_files over repeated list_directory calls.\n"
-            "- When the objective refers to a paper/file and no resolved exact path is listed, use find_paths/list_files in the task scope, then grep_files with relevant title or identifier terms. Both tools accept queries=[...] for multiple literal terms. Do not guess from the index alone.\n"
-            "- Never invent paths.\n"
-            "- Never read the same path twice in one run.\n\n"
-            "Wrong-path recovery policy:\n"
-            "- Do not read, stat, or modify invalid exact path hints.\n"
-            "- Recovery order: first use possible replacement candidates and the readable file index; then call find_paths over the task read scope for filename/path lookup; then list_files over that same scope when needed; only then use grep_files for content terms. Do not use path='/' when the task has one narrower root. Do not use grep_files for filename lookup; grep_files searches file content only.\n"
-            "- If exactly one possible replacement path candidate is listed and the objective does not require modifying files, read that candidate first instead of listing directories.\n"
-            "- For read-only requests, one clear replacement may be read with a user-facing heads-up.\n"
-            "- For modifications or multiple candidates, ask the user to confirm the exact path.\n\n"
-            "Readable file index (actual validator paths):\n"
-            f"{self._list(listed_files)}\n"
-            f"File index truncated: {len(self.files) > len(listed_files)}\n\n"
-            "Resolved exact path hints from the objective:\n"
-            f"{self._list(self.analysis.resolved_paths)}\n\n"
-            "Potential new writable path hints from the objective:\n"
-            f"{self._list(self.analysis.write_targets)}\n\n"
-            "Invalid exact path hints from the objective:\n"
-            f"{self._list(self.analysis.invalid_paths)}\n\n"
-            "Possible replacement path candidates from deterministic path validation:\n"
-            f"{self._list(self.analysis.candidate_paths)}\n\n"
-            f"Objective: {self.sanitized_objective}"
-        )
+
+        if self.lexical_triage_required:
+            mode = "topic_discovery"
+            mode_context = f"Search path: {search_scope}"
+        elif self.analysis.resolved_paths:
+            mode = "exact_path"
+            mode_context = ""
+        elif self.local_discovery_required:
+            mode = "path_lookup"
+            mode_context = ""
+        elif self.explicit_create_write and self.analysis.write_targets:
+            mode = "create_write"
+            mode_context = ""
+        else:
+            mode = "path_lookup"
+            mode_context = ""
+
+        recoverable_invalid_paths = [
+            path
+            for path in self.analysis.invalid_paths
+            if not (
+                self.explicit_create_write
+                and path in self.analysis.write_targets
+            )
+        ]
+        if recoverable_invalid_paths:
+            recovery = (
+                "Missing-path chain: use one clear replacement candidate for a "
+                "read-only request and disclose it; otherwise find_paths on the "
+                f"task scope ({task_roots}) -> grep_files if content can identify "
+                "the file. Ask for confirmation before edits or when several "
+                "candidates remain."
+            )
+        else:
+            recovery = ""
+
+        sections = [
+            f"Mode: {mode}",
+            f"Scope: {task_roots}",
+            mode_context,
+            miss_instruction if self.local_discovery_required else "",
+            recovery,
+            skills_context.strip(),
+            self.skill_policy.strip(),
+            self._path_context(),
+            f"Objective: {self.sanitized_objective}",
+        ]
+        return "\n\n".join(section for section in sections if section)
+
+    def _path_context(self) -> str:
+        invalid_paths = [
+            path
+            for path in self.analysis.invalid_paths
+            if not (
+                self.explicit_create_write
+                and path in self.analysis.write_targets
+            )
+        ]
+        groups = [
+            ("Resolved paths", self.analysis.resolved_paths),
+            ("New write targets", self.analysis.write_targets),
+            ("Invalid path hints", invalid_paths),
+            ("Replacement candidates", self.analysis.candidate_paths),
+        ]
+        rendered = [
+            f"{label}:\n{self._list(items)}"
+            for label, items in groups
+            if items
+        ]
+        return "\n\n".join(rendered)
 
     @staticmethod
     def _list(items: list[str]) -> str:

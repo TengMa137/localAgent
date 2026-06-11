@@ -12,7 +12,7 @@ The agent handles four routes from a single conversation loop:
 
 - **Direct** — answers immediately from the model's own knowledge (explanations, code, writing, maths).
 - **Filesystem** — runs one focused local file/read/write/search/edit specialist task and forwards its answer.
-- **Web** — runs one focused search, URL crawl, current-docs/facts, or arXiv specialist task and forwards its answer.
+- **Web** — runs one focused search, URL crawl, current-docs/facts, or external paper task and forwards its answer.
 - **Plan** — decomposes complex multi-step work into typed tasks, runs specialists, and synthesizes useful evidence.
 
 The code is intentionally biased toward small local LLMs. Python owns the multi-step workflow,
@@ -55,17 +55,17 @@ Current implementation highlights:
   `/docs/missing.md` remain local and do not silently fall back to the internet.
 - `fs_agent` owns scoped local path discovery/read/write/edit. Python sends
   explicit directories and large files through deterministic RAG before they
-  can fill the model context. Ambiguous paper references stay in the filesystem
-  tool loop for `find_paths`, `list_files`, and `grep_files`.
+  can fill the model context. Topic-based local discovery uses `grep_files`,
+  bounded `preview_file` snippets, and then deterministic RAG over the previewed
+  candidates. Topic runs expose grep first and preview second rather than the
+  full filesystem toolset; grep output is capped by match count, per-file count,
+  and excerpt length.
 - `web_agent` validates its query and tool arguments before network access, uses
   bounded search/crawl budgets, and skips crawling when result previews are enough.
 - Dedicated MCP APIs handle weather through Open-Meteo and definitions through
   Wikipedia. Recent news uses bounded web search directly.
-- arXiv discovery uses web search, metadata fetch remains ID-based, and fetched
-  papers are persisted under `user_docs/papers/arxiv/` as full-text Markdown.
-  The original PDF is saved only when HTML extraction fails or the user explicitly
-  requests the PDF. Saved PDFs are parsed by `pypdf`, ingested into `rag_lib`,
-  and added to the paper-scoped RAG query; PDF uploads use the same RAG path.
+- External paper discovery, including arXiv, uses ordinary web search and URL
+  crawling. There is no dedicated arXiv MCP endpoint or automatic paper download.
 - Planned workers produce typed evidence for synthesis; diagnostics stay in trace events
   and per-turn task logs.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
@@ -98,7 +98,7 @@ Current implementation highlights:
 │   │   └── runtime/              # Model setup, validators, typed specialist/turn context
 │   └── tools/
 │       ├── filesystem/      # Validator-backed read/write/list/grep/edit/image tools
-│       ├── retrieval/       # RAG tools and MCP web/arXiv interceptors
+│       ├── retrieval/       # RAG tools and MCP web interceptors
 │       └── skills/          # build_index, make_skills
 ├── web/                     # Same-origin frontend assets
 ├── skills/                  # Skill markdown files loaded at runtime
@@ -168,7 +168,6 @@ The MCP server provides:
 - `search_web`, `crawl_url`, and `crawl_urls`
 - `weather_forecast` via Open-Meteo
 - `wiki_summary` via Wikipedia
-- `fetch_arxiv` for exact arXiv IDs
 
 Host defaults:
 
@@ -253,16 +252,14 @@ The Compose stack has two agent entry points:
 
 - `agent-app`: backend, frontend, agent runtime, and in-process `rag_lib`
 - `agent-cli`: optional terminal agent, enabled only through the `cli` Compose profile
-- `mcp-server`: internal-only web/search/API/arXiv MCP server
+- `mcp-server`: internal-only web/search/API MCP server
 
 By default the app is published at `127.0.0.1:8088` and the MCP server is not
 published to the host. (inspect: lsof -nP -iTCP:8088 -sTCP:LISTEN)
 
-`user_docs/` is mounted writable into the agent containers because fetched arXiv
-Markdown files and PDF fallbacks are saved beneath
-`/data/docs/papers/arxiv/`. PDFs are indexed locally through `rag_lib` after
-download. The MCP
-container remains read-only and isolated from the document mount.
+`user_docs/` is mounted writable into the agent containers for uploads and
+filesystem tasks. The MCP container remains read-only and isolated from the
+document mount.
 
 Use one of these commands:
 
@@ -559,7 +556,7 @@ tool traces are not replayed as model history.
 |---|---|---|
 | `direct` | orchestrator reply | Answer from reasoning, visible history, or memory |
 | `fs` | `run_fs_task` | One scoped filesystem task; Python assembles metadata and forwards the text answer |
-| `web` | `run_web_task` | One search/URL/current/arXiv specialist task, answer forwarded directly |
+| `web` | `run_web_task` | One search/URL/current/external-paper specialist task, answer forwarded directly |
 | `plan` | `run_plan_workflow` | Planner creates typed tasks; workers run specialists; synthesis sees useful evidence only |
 
 The orchestrator never receives filesystem, web, RAG, or specialist toolsets. Its
@@ -595,8 +592,8 @@ Toolsets are attached to specialists, not to the orchestrator.
 | Toolset | Used by | Contract |
 |---|---|---|
 | Filesystem | `fs_agent` | Validator-backed reads, image reads, grep, listing, stat, edits, writes, copy/move/delete |
-| Web/MCP | `web_agent` | Search, URL crawl, and arXiv through the MCP web server |
-| Skills | `plan_agent` prompt and explicit skill tasks in `fs_agent` | Compact skill catalog for planning; filesystem skill context is loaded only when the objective names skills or `/skills` |
+| Web/MCP | `web_agent` | Search and URL crawl through the MCP web server |
+| Skills | `plan_agent` prompt and explicit skill tasks in `fs_agent` | Compact catalog for loose skill discovery; exact skill targets receive only the editing policy |
 | RAG | fs/web Python helpers; standalone tested tools | Normal routes call deterministic RAG helpers. `rag_toolset` exists for retrieval tooling/tests, not orchestrator use |
 
 All file I/O goes through `FilesystemValidator` and declared mounts. Defaults:
@@ -617,9 +614,10 @@ Long-term memory is separate from skills and chat transcripts. CLI memory lives 
 `entry.md` is injected into first-turn orchestrator context, and the current user message
 always overrides stored memory.
 
-The web toolset ingests crawled pages and arXiv content into `rag_service`; fs/web then use
+The web toolset ingests crawled pages into `rag_service`; fs/web then use
 deterministic RAG over selected local paths or crawled URLs when direct reads/snippets are not
-enough.
+enough. For local topic searches, lexical grep finds candidates, bounded opening-sentence
+previews establish relevance, and the selected preview paths become the RAG document scope.
 
 ---
 
@@ -630,7 +628,7 @@ enough.
 counts. This keeps chunks semantically coherent and reduces noise at boundaries.
 
 The pipeline is fully local. Embeddings and retrieval run on your machine. No data leaves
-the host unless a web route or worker task kind performs search, URL crawl, or arXiv lookup.
+the host unless a web route or worker task kind performs search or URL crawl.
 
 ---
 
@@ -652,7 +650,7 @@ Host development with `uv` remains the simplest path, and the included Compose s
 web app plus the local MCP web server:
 
 - `agent-app`: FastAPI backend, static frontend, agent runtime, and in-process `rag_lib`
-- `mcp-server`: web search, URL crawling, and arXiv lookup inside the Compose network
+- `mcp-server`: web search, URL crawling, and dedicated public APIs inside the Compose network
 - `agent_state`: persistent volume for the web app SQLite database, branch history, uploads, and memory
 
 The app image is built from this repository with `../rag_lib` supplied as a Docker

@@ -43,6 +43,7 @@ from .errors import (
 
 from .types import (
     ReadResult,
+    PreviewResult,
     EditResult,
     WriteResult,
     CopyResult,
@@ -68,6 +69,83 @@ _SUPPORTED_IMAGE_MEDIA_TYPES = {
     "image/png",
     "image/webp",
 }
+
+DEFAULT_MAX_GREP_MATCHES = 12
+DEFAULT_MAX_GREP_MATCHES_PER_FILE = 2
+MAX_GREP_EXCERPT_CHARS = 500
+
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?:[\"')\]]*)\s+")
+_ABSTRACT_LINE_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?abstract\s*:?\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _abstract_or_opening_text(text: str) -> str:
+    """Prefer a paper-style abstract block, otherwise keep the document opening."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = _ABSTRACT_LINE_RE.match(line)
+        if not match:
+            continue
+        abstract_lines = [match.group(1).strip()] if match.group(1).strip() else []
+        for following in lines[index + 1 :]:
+            stripped = following.strip()
+            if abstract_lines and stripped.startswith("#"):
+                break
+            if stripped:
+                abstract_lines.append(stripped)
+        abstract = " ".join(abstract_lines).strip()
+        if abstract:
+            return abstract
+    return text
+
+
+def _opening_sentence_preview(
+    text: str,
+    *,
+    max_sentences: int,
+    max_chars: int,
+) -> tuple[str, int]:
+    """Return a compact opening preview without exposing the full document."""
+    normalized = " ".join(_abstract_or_opening_text(text).split())
+    if not normalized:
+        return "", 0
+
+    segments = [
+        segment.strip()
+        for segment in _SENTENCE_BOUNDARY_RE.split(normalized)
+        if segment.strip()
+    ]
+    selected: list[str] = []
+    for segment in segments:
+        candidate = " ".join([*selected, segment])
+        if selected and len(candidate) > max_chars:
+            break
+        selected.append(segment[:max_chars] if not selected else segment)
+        if len(selected) >= max_sentences or len(" ".join(selected)) >= max_chars:
+            break
+
+    preview = " ".join(selected)[:max_chars].strip()
+    return preview, len(selected)
+
+
+def _grep_excerpt(line: str, match_start: int) -> str:
+    """Return bounded context around a match instead of the full source line."""
+    if len(line) <= MAX_GREP_EXCERPT_CHARS:
+        return line
+
+    before = MAX_GREP_EXCERPT_CHARS // 3
+    start = max(0, match_start - before)
+    end = min(len(line), start + MAX_GREP_EXCERPT_CHARS)
+    if end == len(line):
+        start = max(0, end - MAX_GREP_EXCERPT_CHARS)
+    excerpt = line[start:end]
+    return (
+        ("..." if start else "")
+        + excerpt
+        + ("..." if end < len(line) else "")
+    )
 
 
 def _format_result_path(mount_point: str, rel: str | Path) -> str:
@@ -376,6 +454,43 @@ def make_filesystem_toolset(
             total_chars=total_chars,
             offset=offset,
             chars_read=len(text),
+        )
+
+    @toolset.tool(
+        description=(
+            "Preview only the opening sentences of a text document for relevance "
+            "triage after lexical search. "
+            f"{read_path_hint} "
+            "Use this on candidate files returned by grep_files before selecting "
+            "documents for RAG. It intentionally does not return the full file. "
+            "Do not use this on PDFs, images, or other binary files."
+        )
+    )
+    async def preview_file(
+        ctx: RunContext,
+        path: str,
+        max_sentences: int = 8,
+        max_chars: int = 2400,
+    ) -> PreviewResult:
+        """Return a bounded opening-sentence preview for candidate triage."""
+        if max_sentences < 1 or max_sentences > 20:
+            raise ValueError("max_sentences must be between 1 and 20")
+        if max_chars < 200 or max_chars > 5000:
+            raise ValueError("max_chars must be between 200 and 5000")
+
+        text, _ = read_text_with_policy(filesystem_validator, path)
+        preview, sentences_read = _opening_sentence_preview(
+            text,
+            max_sentences=max_sentences,
+            max_chars=max_chars,
+        )
+        return PreviewResult(
+            path=path,
+            content=preview,
+            sentences_read=sentences_read,
+            total_chars=len(text),
+            chars_read=len(preview),
+            truncated=len(preview) < len(text),
         )
 
     @toolset.tool(
@@ -905,12 +1020,18 @@ def make_filesystem_toolset(
         path: str = "/",
         file_pattern: str = "**/*",
         case_sensitive: bool = True,
-        max_matches: int = 100,
+        max_matches: int = DEFAULT_MAX_GREP_MATCHES,
+        max_matches_per_file: int = DEFAULT_MAX_GREP_MATCHES_PER_FILE,
     ) -> GrepResult:
         """Search text files for one regex or several literal terms."""
         terms, literal_terms = _search_terms(query=query, queries=queries)
         if max_matches < 1:
             raise ValueError(f"max_matches must be >= 1, got {max_matches}")
+        if max_matches_per_file < 1:
+            raise ValueError(
+                "max_matches_per_file must be >= 1, "
+                f"got {max_matches_per_file}"
+            )
 
         flags = 0 if case_sensitive else re.IGNORECASE
         try:
@@ -955,6 +1076,7 @@ def make_filesystem_toolset(
         matches: list[GrepMatch] = []
         files_searched = 0
         files_skipped: list[str] = []
+        matches_omitted = False
 
         for virtual_path in sorted(candidate_files):
             _, resolved, mount = filesystem_validator.get_path_config(virtual_path, op="read")
@@ -980,14 +1102,17 @@ def make_filesystem_toolset(
                     if match is not None:
                         matched_terms[index] = True
                 first_match = min(present, key=lambda match: match.start())
-                file_matches.append(
-                    GrepMatch(
-                        path=virtual_path,
-                        line=line_number,
-                        column=first_match.start() + 1,
-                        text=line,
+                if len(file_matches) < max_matches_per_file:
+                    file_matches.append(
+                        GrepMatch(
+                            path=virtual_path,
+                            line=line_number,
+                            column=first_match.start() + 1,
+                            text=_grep_excerpt(line, first_match.start()),
+                        )
                     )
-                )
+                else:
+                    matches_omitted = True
 
             if match_mode == "all" and not all(matched_terms):
                 continue
@@ -1005,7 +1130,7 @@ def make_filesystem_toolset(
         return GrepResult(
             matches=matches,
             count=len(matches),
-            truncated=False,
+            truncated=matches_omitted,
             files_searched=files_searched,
             files_skipped=files_skipped,
         )

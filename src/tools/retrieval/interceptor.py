@@ -10,11 +10,6 @@ Two-step retrieval pattern:
   1. web_search_tool()   -> returns raw results to LLM (no ingestion)
   2. web_crawl_tool()    -> LLM picks URLs, this crawls + ingests into rag_service
 
-arxiv fetch is ID-based:
-  1. Find paper IDs through normal web search scoped to arxiv.org/abs
-  2. arxiv_fetch_tool() fetches known arxiv_ids and ingests abstracts
-     (HTML/PDF crawl goes through web_crawl_tool)
-
 Adding a new source: implement a converter and
 call _ingest() from a new tool function. Nothing else changes.
 """
@@ -199,92 +194,9 @@ async def web_crawl_and_ingest(
     return await _ingest(rag_service, docs)
 
 
-async def arxiv_fetch_papers(
-    mcp_url: str,
-    arxiv_ids: List[str],
-) -> List[dict]:
-    papers: list[dict] = []
-    async with fastmcp.Client(mcp_url) as client:
-        for arxiv_id in arxiv_ids:
-            result = await client.call_tool("fetch_arxiv", {"arxiv_id": arxiv_id})
-            data = _result_to_dict(result)
-            paper = data.get("paper")
-            if not paper or not data.get("found"):
-                continue
-            paper = dict(paper)
-            paper.setdefault("arxiv_id", arxiv_id)
-            papers.append(paper)
-    return papers
-
-
-def arxiv_papers_to_documents(papers: List[dict]) -> List[Document]:
-    docs = []
-    for paper in papers:
-        arxiv_id = str(paper.get("arxiv_id") or "").strip()
-        if not arxiv_id:
-            continue
-        authors = []
-        for author in paper.get("authors", []):
-            if isinstance(author, dict):
-                name = str(author.get("name") or "").strip()
-            else:
-                name = str(author).strip()
-            if name:
-                authors.append(name)
-        url = str(paper.get("pdf_url") or f"https://arxiv.org/abs/{arxiv_id}")
-        docs.append(
-            Document(
-                doc_id=stable_doc_id(arxiv_id),
-                source=url,
-                title=make_title(
-                    source=url,
-                    raw_title=paper.get("title"),
-                    arxiv_id=arxiv_id,
-                ),
-                text=(
-                    f"{paper.get('title', '')}\n\n"
-                    f"Authors: {', '.join(authors)}\n\n"
-                    f"{paper.get('summary', '')}"
-                ),
-                mime="text/plain",
-                meta={
-                    "tool": "arxiv_fetch",
-                    "arxiv_id": arxiv_id,
-                    "authors": authors,
-                    "published": paper.get("published"),
-                    "categories": paper.get("categories", []),
-                    "ingested_at": _now(),
-                },
-            )
-        )
-    return docs
-
-
-async def arxiv_fetch_documents(
-    mcp_url: str,
-    arxiv_ids: List[str],
-) -> List[Document]:
-    papers = await arxiv_fetch_papers(mcp_url, arxiv_ids)
-    return arxiv_papers_to_documents(papers)
-
-
-async def arxiv_fetch_and_ingest(
-    mcp_url: str,
-    rag_service: RagServiceProtocol,
-    arxiv_ids: List[str],
-) -> str:
-    docs = await arxiv_fetch_documents(mcp_url, arxiv_ids)
-    if not docs:
-        return f"No papers found for ids: {arxiv_ids}"
-
-    return await _ingest(rag_service, docs)
-
-
 def make_web_toolset(
     mcp_url: str,
     rag_service: RagServiceProtocol,
-    *,
-    include_arxiv: bool = True,
 ) -> FunctionToolset:
     """
     Returns a FunctionToolset with:
@@ -292,7 +204,6 @@ def make_web_toolset(
       - weather_forecast_tool() calls the free weather API for forecast questions
       - wiki_summary_tool() calls Wikipedia for definitions/stable overviews
       - web_crawl_tool()    crawls LLM-selected URLs, ingests into rag_service
-      - arxiv_fetch_tool()  fetches known arXiv IDs and ingests abstracts when enabled
 
     The underlying MCP calls go through _mcp, which is a plain FastMCPToolset
     used only internally — the LLM never sees it directly.
@@ -364,27 +275,5 @@ def make_web_toolset(
         Returns a receipt with titles. Skips failed or empty pages.
         """
         return await web_crawl_and_ingest(mcp_url, rag_service, urls)
-
-    if not include_arxiv:
-        return toolset
-
-    @toolset.tool(
-        name="arxiv_fetch_tool",
-        description=(
-            "Fetch specific arXiv papers by ID and store their abstracts in the knowledge base. "
-            "Only fetch papers selected from arXiv-scoped web search results as "
-            "relevant to the objective. "
-            "To also ingest the full PDF text, pass the pdf_url to web_crawl_tool()."
-        ),
-    )
-    async def arxiv_fetch(
-        ctx: RunContext,
-        arxiv_ids: List[str],
-    ) -> str:
-        """
-        Fetches each paper and ingests abstract + metadata into rag_service.
-        Returns receipt with doc_ids.
-        """
-        return await arxiv_fetch_and_ingest(mcp_url, rag_service, arxiv_ids)
 
     return toolset

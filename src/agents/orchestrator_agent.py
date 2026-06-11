@@ -185,7 +185,7 @@ Prefer making progress:
     paper or source relevant to the follow-up, include that exact path in the
     objective so the filesystem specialist can read it directly.
   - Choose web for one narrow current/web task: one search, one URL crawl,
-    one dedicated external API lookup, current docs/facts, or arXiv lookup.
+    one dedicated external API lookup, current docs/facts, or external paper lookup.
     Prefer web when one specialist answer should be directly forwardable.
     Weather forecasts, stable encyclopedia lookups, recent-news discovery, and
     similar requests still use one web route; the web specialist chooses its
@@ -241,7 +241,7 @@ Intent classification:
     produce a direct answer or perform one requested change.
 
   web — use for one current/web task where a web specialist can produce a
-    direct answer from search, a URL, current docs/facts, or arXiv.
+    direct answer from search, a URL, current docs/facts, or external papers.
 
   plan — use for complex agent work: multiple local/web tasks, comparisons,
     audits, investigations, mixed filesystem and web evidence, or any task
@@ -541,7 +541,7 @@ def _should_recover_fs_result_with_web(
     if ambiguously_references_local_artifact(routing_request):
         return True
 
-    external_kinds = {TaskKind.WEB_SEARCH, TaskKind.URL_CRAWL, TaskKind.ARXIV}
+    external_kinds = {TaskKind.WEB_SEARCH, TaskKind.URL_CRAWL}
     return any(
         infer_task_kind(part) in external_kinds
         for part in [routing_request, objective, fs_result.summary]

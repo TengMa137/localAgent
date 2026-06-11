@@ -81,13 +81,13 @@ async def test_web_worker_delegates_to_web_agent(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_arxiv_worker_delegates_to_web_agent(monkeypatch):
+async def test_scholarly_web_worker_delegates_to_web_agent(monkeypatch):
     from agents import worker
 
     calls: list[str] = []
 
     async def fake_run_fs_task(_objective: str) -> str:
-        raise AssertionError("arxiv tasks must not call fs_agent")
+        raise AssertionError("web tasks must not call fs_agent")
 
     async def fake_run_web_task(objective: str) -> str:
         calls.append(objective)
@@ -98,7 +98,7 @@ async def test_arxiv_worker_delegates_to_web_agent(monkeypatch):
 
     result = await _run_worker(
         TaskSpec(
-            kind=TaskKind.ARXIV,
+            kind=TaskKind.WEB_SEARCH,
             objective="Read arXiv 2401.12345",
             query="2401.12345",
         )
@@ -108,7 +108,7 @@ async def test_arxiv_worker_delegates_to_web_agent(monkeypatch):
     assert result["key_findings"] == ["paper result"]
     assert result["answer"] == "paper result"
     assert result["useful"] is True
-    assert "Task kind: arxiv" in calls[0]
+    assert "Task kind: web_search" in calls[0]
 
 
 @pytest.mark.asyncio
