@@ -69,6 +69,8 @@ def format_orchestrator_response(output: WebAgentResult) -> str:
         notes.append("Search queries: " + ", ".join(dedupe(output.search_queries)))
     if output.urls:
         notes.append("Sources: " + ", ".join(dedupe(output.urls)))
+    if output.local_paths:
+        notes.append("Saved local paths: " + ", ".join(dedupe(output.local_paths)))
     if output.findings:
         notes.append(f"Detailed findings: {len(output.findings)} item(s)")
     if output.uncertainties:
@@ -106,7 +108,7 @@ def to_specialist_result(output: WebAgentResult) -> SpecialistResult:
         recoverable_by_web=False,
         answer=(output.answer or output.summary).strip() or "No answer returned.",
         summary=output.summary,
-        sources=dedupe([*output.urls, *output.search_queries]),
+        sources=dedupe([*output.local_paths, *output.urls, *output.search_queries]),
         findings=output.findings,
         uncertainties=output.uncertainties,
         raw=raw,

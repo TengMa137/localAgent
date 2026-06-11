@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 DEFAULT_MAX_READ_CHARS = 20000
@@ -8,6 +10,13 @@ class ReadResult(BaseModel):
     """Result of reading a file."""
 
     content: str = Field(description="The file content read")
+    retrieval_mode: Literal["text", "rag_answer"] = Field(
+        default="text",
+        description=(
+            "text for raw file content, rag_answer when a large document was "
+            "answered through RAG"
+        ),
+    )
     truncated: bool = Field(description="True if more content exists after this chunk")
     total_chars: int = Field(description="Total file size in characters")
     offset: int = Field(description="Starting character position used")

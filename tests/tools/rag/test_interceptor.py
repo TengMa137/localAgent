@@ -233,6 +233,18 @@ class TestCrawlToDoc:
             is None
         )
 
+    def test_arxiv_html_unavailable_notice_returns_none(self):
+        assert (
+            _crawl_to_doc(
+                {
+                    "success": True,
+                    "url": "https://arxiv.org/html/2602.10094",
+                    "markdown": "HTML is not available for the source.",
+                }
+            )
+            is None
+        )
+
     def test_title_falls_back_to_url(self):
         doc = _crawl_to_doc(
             {"success": True, "url": "https://x.com", "markdown": "content"}

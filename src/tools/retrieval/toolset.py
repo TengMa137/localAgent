@@ -3,7 +3,11 @@ from __future__ import annotations
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-from rag import RagServiceProtocol, rag_service as default_rag_service
+from rag import (
+    RagServiceProtocol,
+    get_or_ingest_local_doc_ids,
+    rag_service as default_rag_service,
+)
 
 from tools.filesystem.validator import FilesystemValidator
 from tools.filesystem.text_ops import resolve_for_read
@@ -35,7 +39,9 @@ async def _get_doc_ids(
     if missing:
         resolved_paths = _get_resolved_paths(validator, missing)
         if resolved_paths:
-            doc_ids.extend(await rag_service.ingest_local(resolved_paths))
+            doc_ids.extend(
+                await get_or_ingest_local_doc_ids(rag_service, resolved_paths)
+            )
     return doc_ids
 
 

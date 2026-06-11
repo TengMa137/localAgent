@@ -34,6 +34,7 @@ from typing import List
 
 from pydantic_ai import Agent
 
+from localagent_settings import get_runtime_settings
 from tools.retrieval.interceptor import (
     select_urls_from_search_results,
     weather_forecast_result,
@@ -66,10 +67,18 @@ from .web.contracts import (
 from .web.policy import (
     api_result_urls as _api_result_urls,
     preferred_api_tool as _preferred_api_tool,
+    scholarly_fallback_urls as _scholarly_fallback_urls,
+    scholarly_request_needs_crawl as _scholarly_request_needs_crawl,
+    scholarly_request_prefers_recent as _scholarly_request_prefers_recent,
+    scholarly_request_needs_save as _scholarly_request_needs_save,
+    scholarly_results_for_urls as _scholarly_results_for_urls,
+    scholarly_result_urls as _scholarly_result_urls,
+    scholarly_search_query as _scholarly_search_query,
     source_scoped_web_queries as _source_scoped_web_queries,
     urls_from_results as _urls_from_results,
 )
 from .web.api import StructuredApiRuntime
+from .web.paper_storage import save_arxiv_markdown_documents
 from .web.presentation import (
     format_api_result as _format_api_result,
     format_orchestrator_response,
@@ -121,6 +130,72 @@ WEB_SEARCH_RESULT_LIMIT = 5
 WEB_CRAWL_URL_LIMIT = 2
 
 
+def _save_arxiv_documents(documents: list) -> list[str]:
+    """Persist selected crawled papers under the configured docs directory."""
+    return save_arxiv_markdown_documents(
+        documents,
+        docs_dir=get_runtime_settings().docs_dir,
+    )
+
+
+def _append_saved_paths(answer: str | None, paths: list[str]) -> str | None:
+    if not paths:
+        return answer
+    note = "Saved locally: " + ", ".join(f"`{path}`" for path in _dedupe(paths))
+    text = (answer or "").strip()
+    return f"{text}\n\n{note}" if text else note
+
+
+def _persist_crawled_papers(
+    output: WebAgentResult,
+    documents: list,
+) -> WebAgentResult:
+    """Save captured arXiv documents and attach verified paths to the result."""
+    if not documents:
+        output.uncertainties = _dedupe(
+            [
+                *output.uncertainties,
+                "No crawled arXiv document content was available to save locally.",
+            ]
+        )
+        return output
+    try:
+        saved_paths = _save_arxiv_documents(documents)
+    except Exception as exc:
+        _rt(f"[web_agent] local paper persistence failed: {exc}", "red", 1)
+        output.uncertainties = _dedupe(
+            [*output.uncertainties, f"Local paper persistence failed: {exc}"]
+        )
+        return output
+    if not saved_paths:
+        output.uncertainties = _dedupe(
+            [
+                *output.uncertainties,
+                "The crawled document was not an arXiv paper and was not saved locally.",
+            ]
+        )
+        return output
+
+    output.local_paths = _dedupe([*output.local_paths, *saved_paths])
+    output.answer = _append_saved_paths(output.answer, saved_paths)
+    return output
+
+
+async def _crawl_and_ingest(
+    urls: list[str],
+    *,
+    captured_documents: list | None = None,
+) -> str:
+    if captured_documents is None:
+        return await web_crawl_and_ingest(MCP_URL, rag_service, urls)
+    return await web_crawl_and_ingest(
+        MCP_URL,
+        rag_service,
+        urls,
+        capture_documents=captured_documents,
+    )
+
+
 def _format_orchestrator_response(output: WebAgentResult) -> str:
     """Compatibility wrapper for the historical private formatter."""
     return format_orchestrator_response(output)
@@ -135,6 +210,7 @@ def _query_preflight_text(plan: WebQueryPlan | None) -> str:
         [
             f"query: {plan.query}",
             f"retrieval_target: {plan.retrieval_target or 'None'}",
+            f"source_kind: {plan.source_kind or 'None'}",
             f"preferred_source: {plan.preferred_source}",
             f"preferred_tool: {plan.preferred_tool or 'None'}",
             "source_domains: "
@@ -401,6 +477,7 @@ async def _build_web_query_plan(objective: str) -> WebQueryPlan:
         plan.ready = False
         plan.checks.append("Planner returned an empty query; using objective text.")
     plan.as_of = _now()
+    plan.source_kind = source_decision.kind
     plan.preferred_source = source_decision.method
     plan.preferred_tool = (
         source_decision.method
@@ -408,10 +485,11 @@ async def _build_web_query_plan(objective: str) -> WebQueryPlan:
         in {"weather_forecast", "wiki_summary"}
         else None
     )
-    if source_decision.kind == "scholarly" and (
-        extract_arxiv_ids(objective) or "arxiv" in objective.casefold()
-    ):
+    if source_decision.kind == "scholarly":
+        plan.query = _scholarly_search_query(objective)
         plan.source_domains = _dedupe(["arxiv.org", *plan.source_domains])[:3]
+        if _scholarly_request_needs_crawl(objective):
+            plan.crawl_url_limit = max(1, plan.crawl_url_limit)
     if source_decision.target.strip() and source_decision.method != "web":
         plan.retrieval_target = source_decision.target.strip()
     if plan.preferred_tool:
@@ -560,6 +638,16 @@ async def _synthesize_web_answer(
 
 async def _run_url_crawl_task(objective: str, urls: List[str]) -> WebAgentResult:
     selected_urls = _dedupe(urls)
+    scholarly_urls = _scholarly_result_urls(
+        [
+            {"url": url, "position": position}
+            for position, url in enumerate(selected_urls, start=1)
+        ]
+    )
+    save_requested = (
+        _scholarly_request_needs_save(objective) and bool(scholarly_urls)
+    )
+    crawled_documents: list = []
     _rt(
         "[web_agent] query preflight skipped; user provided URL crawl target(s).",
         "yellow",
@@ -570,14 +658,36 @@ async def _run_url_crawl_task(objective: str, urls: List[str]) -> WebAgentResult
         "yellow",
         1,
     )
-    crawl_receipt = await web_crawl_and_ingest(MCP_URL, rag_service, selected_urls)
+    crawl_receipt = await _crawl_and_ingest(
+        selected_urls,
+        captured_documents=crawled_documents if save_requested else None,
+    )
+    if scholarly_urls and crawl_receipt.startswith("No usable content retrieved"):
+        fallback_urls = _scholarly_fallback_urls(selected_urls)
+        if fallback_urls != selected_urls:
+            _rt(
+                "[web_agent] scholarly HTML unavailable; fallback urls="
+                + ", ".join(fallback_urls),
+                "yellow",
+                1,
+            )
+            crawl_receipt = await _crawl_and_ingest(
+                fallback_urls,
+                captured_documents=crawled_documents if save_requested else None,
+            )
+            selected_urls = fallback_urls
     evidence = await rag_search_documents(question=objective, docs=selected_urls)
-    return await _synthesize_web_answer(
+    output = await _synthesize_web_answer(
         objective=objective,
         query_plan=None,
         urls=selected_urls,
         crawl_receipt=crawl_receipt,
         evidence=evidence,
+    )
+    return (
+        _persist_crawled_papers(output, crawled_documents)
+        if save_requested
+        else output
     )
 
 
@@ -616,6 +726,11 @@ async def _run_web_search_task(
     crawl_receipt = ""
     evidence: list[dict] = []
     uncertainties: list[str] = [*preview_decision.uncertainties]
+    save_requested = (
+        query_plan.source_kind == "scholarly"
+        and _scholarly_request_needs_save(objective)
+    )
+    crawled_documents: list = []
 
     if preview_decision.answer_from_preview:
         crawl_receipt = "Crawl skipped because search result previews were sufficient."
@@ -625,31 +740,81 @@ async def _run_web_search_task(
             max_urls=query_plan.crawl_url_limit,
         )
 
+    if query_plan.source_kind == "scholarly":
+        prefer_recent = _scholarly_request_prefers_recent(objective)
+        paper_urls = _scholarly_result_urls(
+            results,
+            prefer_recent=prefer_recent,
+        )
+        selected_urls = [
+            url
+            for url in _dedupe(selected_urls)
+            if url in paper_urls
+        ]
+        if _scholarly_request_needs_crawl(objective):
+            preview_decision.answer_from_preview = False
+            if prefer_recent:
+                selected_urls = paper_urls[: query_plan.crawl_url_limit]
+            else:
+                selected_urls = selected_urls or paper_urls[: query_plan.crawl_url_limit]
+        elif not preview_decision.answer_from_preview:
+            selected_urls = selected_urls or paper_urls[: query_plan.crawl_url_limit]
+
     if selected_urls:
         _rt(
             "[web_agent] deterministic crawl urls=" + ", ".join(selected_urls),
             "yellow",
             1,
         )
-        crawl_receipt = await web_crawl_and_ingest(MCP_URL, rag_service, selected_urls)
+        crawl_receipt = await _crawl_and_ingest(
+            selected_urls,
+            captured_documents=crawled_documents if save_requested else None,
+        )
+        if (
+            query_plan.source_kind == "scholarly"
+            and crawl_receipt.startswith("No usable content retrieved")
+        ):
+            fallback_urls = _scholarly_fallback_urls(selected_urls)
+            if fallback_urls != selected_urls:
+                _rt(
+                    "[web_agent] scholarly HTML unavailable; fallback urls="
+                    + ", ".join(fallback_urls),
+                    "yellow",
+                    1,
+                )
+                crawl_receipt = await _crawl_and_ingest(
+                    fallback_urls,
+                    captured_documents=(
+                        crawled_documents if save_requested else None
+                    ),
+                )
+                selected_urls = fallback_urls
         evidence = await rag_search_documents(question=objective, docs=selected_urls)
     elif not preview_decision.answer_from_preview:
         uncertainties.append("No URLs were selected from the web search results.")
     if not results:
         uncertainties.append("No web search results returned.")
 
+    synthesis_results = results
+    if query_plan.source_kind == "scholarly" and selected_urls:
+        synthesis_results = _scholarly_results_for_urls(results, selected_urls)
+
     output = await _synthesize_web_answer(
         objective=objective,
         query_plan=query_plan,
         preview_decision=preview_decision,
-        search_results=results,
+        search_results=synthesis_results,
         urls=selected_urls,
         crawl_receipt=crawl_receipt,
         evidence=evidence,
         uncertainties=uncertainties,
     )
     output.search_queries = _dedupe([*search_queries, *output.search_queries])
-    return output
+    return (
+        _persist_crawled_papers(output, crawled_documents)
+        if save_requested
+        else output
+    )
 
 
 async def run_web_task_result(objective: str) -> SpecialistResult:

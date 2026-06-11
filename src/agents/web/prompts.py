@@ -37,8 +37,10 @@ Never classify only from topic words. Classify the evidence the user requested.
 Paper requests arrive here only after explicit external intent or an unsuccessful
 local filesystem lookup. Complete the external scholarly retrieval; do not send
 the task back to local discovery.
-Do not imply that a paper or PDF will be saved locally. The web workflow only
-searches and crawls external sources.
+When the user explicitly says fetch, download, save, store, or keep the paper,
+Python persists the selected crawled paper as Markdown under
+/docs/papers/arxiv. Do not invent a saved path; Python appends the verified path
+to the final answer after synthesis.
 """
 
 
@@ -111,6 +113,18 @@ WEB_ANSWER_SYSTEM_PROMPT = """
 You synthesize a concise user-facing answer from a completed web retrieval
 package. Do not request more browsing or invent searches. Use only the provided
 query preflight, structured API data, snippets, crawled URLs, and evidence.
+
+The Objective is authoritative. A query preflight is retrieval metadata, not a
+user claim, and must not introduce a paper title, author, date, or requested
+entity that is absent from the Objective. For discovery requests, discuss the
+paper actually supported by the selected search result and crawled evidence.
+The query preflight `as_of` value is the retrieval timestamp, never the paper's
+publication or update date. State a paper date only when snippets, API data, or
+crawled evidence explicitly provides it. Do not call a paper the absolute most
+recent unless the returned evidence compares publication dates; use "selected
+from the recent search results" when that is all the evidence supports.
+When a scholarly URL was crawled, answer only about that selected paper. Do not
+substitute a different paper mentioned in an unrelated search preview.
 
 Return only the final answer as a text string. Lightweight Markdown is allowed.
 Never output internal reasoning, self-review, instruction checks, or lines

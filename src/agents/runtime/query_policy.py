@@ -56,6 +56,14 @@ PAPER_LOOKUP_RE = re.compile(
     r"\b(?:paper|papers|article|articles|study|studies|publication|publications)\b",
     re.IGNORECASE,
 )
+SCHOLARLY_ONLINE_SOURCE_RE = re.compile(
+    r"\bonline\b(?=\s*(?:$|[?.!,;:]|\b(?:and|then|to|for|about|regarding)\b))",
+    re.IGNORECASE,
+)
+REFERENTIAL_PAPER_FETCH_RE = re.compile(
+    r"\b(?:download|fetch)\s+(?:one|it|this|that)\b",
+    re.IGNORECASE,
+)
 TOPIC_FILE_DISCOVERY_RE = re.compile(
     r"\b(?:"
     r"files?|documents?|documentation|docs?|notes?|papers?|articles?|"
@@ -149,7 +157,15 @@ def extract_arxiv_ids(text: str) -> list[str]:
 
 def explicitly_requests_web(text: str) -> bool:
     """Return true only for phrases that name web retrieval as the source."""
-    return bool(EXPLICIT_WEB_REQUEST_RE.search(text))
+    if EXPLICIT_WEB_REQUEST_RE.search(text):
+        return True
+    return bool(
+        PAPER_LOOKUP_RE.search(text)
+        and (
+            SCHOLARLY_ONLINE_SOURCE_RE.search(text)
+            or REFERENTIAL_PAPER_FETCH_RE.search(text)
+        )
+    )
 
 
 def requests_file_operation(text: str) -> bool:

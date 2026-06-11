@@ -1,7 +1,9 @@
 # test filessystem tool functionality, e.g. read_file, write_file, edit_file...
 from pydantic_ai.messages import BinaryImage, ToolReturn
 import pytest
+from tools.filesystem.toolset import make_filesystem_toolset
 from tools.filesystem.types import PreviewResult, ReadResult, WriteResult
+from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 from tools.filesystem.errors import EditError, ValidationError
 
 
@@ -106,8 +108,95 @@ async def test_read_truncation(filesystem_toolset, tools_in_toolset, ctx, tmp_pa
     result = await filesystem_toolset.call_tool("read", {"path":"/data/big.txt", "max_chars":3}, ctx, tools_in_toolset["read_file"])
 
     assert result.content == "abc"
+    assert result.retrieval_mode == "text"
     assert result.truncated is True
     assert result.total_chars == 6
+
+
+class _FakeFilesystemRagService:
+    def __init__(self):
+        self.ingested_paths = []
+        self.answer_calls = []
+
+    def get_docs_to_ingest(self, docs):
+        return [], list(docs)
+
+    async def ingest_local(
+        self,
+        paths,
+        *,
+        dir_pattern="**/*",
+        max_files_per_dir=None,
+    ):
+        self.ingested_paths.extend(paths)
+        return ["large-doc"]
+
+    async def answer(self, question, doc_ids=None, exclude_node_ids=None):
+        self.answer_calls.append({"question": question, "doc_ids": doc_ids})
+        return "The document's conclusion is retrieved through RAG."
+
+
+@pytest.mark.asyncio
+async def test_large_default_read_answers_through_rag(
+    rw_validator,
+    ctx,
+    tmp_path,
+):
+    source = "A" * (DEFAULT_MAX_READ_CHARS + 1)
+    (tmp_path / "large.txt").write_text(source)
+    rag_service = _FakeFilesystemRagService()
+    toolset = make_filesystem_toolset(
+        filesystem_validator=rw_validator,
+        rag_service=rag_service,
+    )
+    tools = await toolset.get_tools(ctx)
+    ctx.metadata = {"filesystem_question": "What is the conclusion?"}
+
+    result = await toolset.call_tool(
+        "read",
+        {"path": "/data/large.txt"},
+        ctx,
+        tools["read_file"],
+    )
+
+    assert result.retrieval_mode == "rag_answer"
+    assert result.content == "The document's conclusion is retrieved through RAG."
+    assert result.truncated is False
+    assert result.total_chars == len(source)
+    assert rag_service.ingested_paths == [str(tmp_path / "large.txt")]
+    assert rag_service.answer_calls == [
+        {"question": "What is the conclusion?", "doc_ids": ["large-doc"]}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_large_explicit_chunk_read_bypasses_rag(
+    rw_validator,
+    ctx,
+    tmp_path,
+):
+    (tmp_path / "large.txt").write_text(
+        "A" * (DEFAULT_MAX_READ_CHARS + 1)
+    )
+    rag_service = _FakeFilesystemRagService()
+    toolset = make_filesystem_toolset(
+        filesystem_validator=rw_validator,
+        rag_service=rag_service,
+    )
+    tools = await toolset.get_tools(ctx)
+
+    result = await toolset.call_tool(
+        "read",
+        {"path": "/data/large.txt", "max_chars": 10},
+        ctx,
+        tools["read_file"],
+    )
+
+    assert result.retrieval_mode == "text"
+    assert result.content == "A" * 10
+    assert result.truncated is True
+    assert rag_service.ingested_paths == []
+    assert rag_service.answer_calls == []
 
 
 @pytest.mark.asyncio

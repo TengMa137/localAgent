@@ -42,6 +42,7 @@ class WebQueryPlan(BaseModel):
     retrieval_target: str | None = None
     objective: str | None = None
     as_of: str | None = None
+    source_kind: SourceKind | None = None
     preferred_source: str = "web"
     preferred_tool: str | None = None
     source_domains: List[str] = Field(default_factory=list)
@@ -126,6 +127,7 @@ class WebAgentResult(BaseModel):
     summary: str
     search_queries: List[str] = Field(default_factory=list)
     urls: List[str] = Field(default_factory=list)
+    local_paths: List[str] = Field(default_factory=list)
     findings: List[str] = Field(default_factory=list)
     uncertainties: List[str] = Field(default_factory=list)
 
@@ -133,7 +135,13 @@ class WebAgentResult(BaseModel):
     @classmethod
     def coerce_none_lists(cls, values):
         if isinstance(values, dict):
-            for field in ("search_queries", "urls", "findings", "uncertainties"):
+            for field in (
+                "search_queries",
+                "urls",
+                "local_paths",
+                "findings",
+                "uncertainties",
+            ):
                 if values.get(field) is None:
                     values[field] = []
         return values

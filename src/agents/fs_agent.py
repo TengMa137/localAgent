@@ -13,8 +13,9 @@ run:
   explicit skill requests;
 * use a scoped file index for path preflight and inject only actionable path facts;
 * enforce write approval, duplicate-read guards, and tool-call limits;
-* send explicit directories and large files to RAG before they can expand the
-  model context;
+* send explicit directories, PDFs, and assigned multi-file batches to RAG
+  before they can expand the model context;
+* let read_file answer single large text documents through RAG by default;
 * make topic-based discovery use lexical search and bounded candidate previews,
   then send previewed candidates through RAG even when the files are small;
 * prevent unconfirmed replacement paths from being treated as edit targets;
@@ -61,7 +62,6 @@ from .fs.prompts import (
     FsPromptContext,
 )
 from tools.filesystem.text_ops import read_text_with_policy
-from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 
 MAX_SKILL_EDITING_POLICY_CHARS = 5000
 SKILL_EDITING_POLICY_PATH = "/skills/skill_editing.md"
@@ -193,7 +193,7 @@ def _preemptive_rag_paths(
     analysis: PathAnalysis,
     task_roots: list[str],
 ) -> list[str]:
-    """Select known large local inputs before the model can read them."""
+    """Select known non-text or multi-file inputs before model tool use."""
     if _requires_lexical_triage(objective, analysis):
         return []
 
@@ -227,7 +227,7 @@ def _plan_worker_relevant_files(objective: str) -> list[str]:
 
 
 def _paths_that_need_rag(paths: list[str]) -> list[str]:
-    """Select directories and oversized files for deterministic RAG."""
+    """Select non-text paths that cannot use the read_file RAG branch."""
     selected: list[str] = []
     for path in paths:
         try:
@@ -237,8 +237,6 @@ def _paths_that_need_rag(paths: list[str]) -> list[str]:
         if resolved.is_dir():
             selected.append(path)
         elif resolved.is_file() and resolved.suffix.casefold() == ".pdf":
-            selected.append(path)
-        elif resolved.is_file() and resolved.stat().st_size > DEFAULT_MAX_READ_CHARS:
             selected.append(path)
     return selected
 
@@ -387,6 +385,7 @@ def _requires_lexical_triage(
 async def _run_fs_agent(
     prompt: str,
     *,
+    question: str,
     task_roots: list[str],
     discovery_preview_only: bool = False,
     discovery_search_paths: list[str] | None = None,
@@ -403,6 +402,7 @@ async def _run_fs_agent(
             label="fs_agent",
             indent=1,
             usage_limits=UsageLimits(tool_calls_limit=12),
+            metadata={"filesystem_question": question},
             **answer_model_settings(),
         )
     return clean_text_answer(result.output), run_state.successful_calls
@@ -851,6 +851,7 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
             )
             answer, calls = await _run_fs_agent(
                 prompt,
+                question=objective,
                 task_roots=task_roots,
                 **run_options,
             )

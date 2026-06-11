@@ -34,6 +34,8 @@ from pydantic_ai.messages import BinaryImage, ToolReturn
 from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
+from rag import RagServiceProtocol, answer_local_documents
+
 from .validator import FilesystemValidator
 from .errors import (
     EditError,
@@ -365,6 +367,7 @@ def _directory_entry(
 def make_filesystem_toolset(
     *,
     filesystem_validator: FilesystemValidator,
+    rag_service: RagServiceProtocol | None = None,
     id: Optional[str] = None,
 ) -> FunctionToolset:
     """Create a filesystem toolset with file I/O tools.
@@ -374,6 +377,7 @@ def make_filesystem_toolset(
 
     Args:
         filesystem_validator: Validator for permission checking and path resolution
+        rag_service: Optional RAG service for deterministic large-document answers
         id: Optional toolset ID for durable execution
 
     Returns:
@@ -400,7 +404,11 @@ def make_filesystem_toolset(
 
     @toolset.tool(
         description=(
-            "Read a text file. "
+            "Read a text file. A default read of a document larger than "
+            f"{DEFAULT_MAX_READ_CHARS} characters deterministically returns a "
+            "RAG answer to the current filesystem question instead of raw truncated "
+            "content. Set offset or a non-default max_chars only when an exact raw "
+            "text segment is required. "
             f"{read_path_hint} "
             "Do not use this on binary files (PDFs, images, etc) - "
             "use read_image for supported images or stat_path/list_directory for metadata."
@@ -438,6 +446,36 @@ def make_filesystem_toolset(
                 "or stat_path/list_directory for binary metadata."
             )
         total_chars = len(text)
+
+        use_rag = (
+            rag_service is not None
+            and total_chars > DEFAULT_MAX_READ_CHARS
+            and offset == 0
+            and max_chars == DEFAULT_MAX_READ_CHARS
+        )
+        if use_rag:
+            metadata = ctx.metadata or {}
+            question = str(metadata.get("filesystem_question") or "").strip()
+            if not question and isinstance(ctx.prompt, str):
+                question = ctx.prompt.strip()
+            if not question:
+                raise ValueError(
+                    "A user question is required to answer a large document through RAG."
+                )
+
+            answer = await answer_local_documents(
+                rag_service,
+                question=question,
+                paths=[str(resolved)],
+            )
+            return ReadResult(
+                content=answer,
+                retrieval_mode="rag_answer",
+                truncated=False,
+                total_chars=total_chars,
+                offset=0,
+                chars_read=len(answer),
+            )
 
         # Apply offset
         if offset > 0:

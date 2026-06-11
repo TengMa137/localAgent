@@ -475,9 +475,6 @@ def _guardrail_orchestrator_decision(
             effort="minimal",
         )
 
-    if decision.route == "web":
-        return decision
-
     candidate_text = "\n".join(
         part for part in [routing_request, objective] if part
     )
@@ -486,19 +483,21 @@ def _guardrail_orchestrator_decision(
 
     inferred_kind = infer_task_kind(routing_request)
     if inferred_kind in {TaskKind.WEB_SEARCH, TaskKind.URL_CRAWL}:
-        corrected_objective = objective or prompt.strip()
-        if not corrected_objective:
+        if decision.route == "web" and objective == routing_request:
             return decision
         _rt(
-            "[orchestrator] route guardrail corrected "
-            f"{decision.route}→web for inferred {inferred_kind.value}",
+            "[orchestrator] route guardrail grounded external request "
+            f"from route={decision.route}",
             "yellow",
         )
         return OrchestratorDecision(
             route="web",
-            objective=corrected_objective,
+            objective=routing_request,
             effort="minimal",
         )
+
+    if decision.route == "web":
+        return decision
 
     return decision
 

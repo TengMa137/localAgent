@@ -42,6 +42,28 @@ class RagServiceProtocol(Protocol):
     def list_documents(self) -> list[dict[str, Any]]: ...
 
 
+async def get_or_ingest_local_doc_ids(
+    rag_service: RagServiceProtocol,
+    paths: list[str],
+) -> list[str]:
+    """Return indexed document IDs, ingesting missing validated local paths."""
+    matches, missing = rag_service.get_docs_to_ingest(paths)
+    if missing:
+        matches.extend(await rag_service.ingest_local(missing))
+    return matches
+
+
+async def answer_local_documents(
+    rag_service: RagServiceProtocol,
+    *,
+    question: str,
+    paths: list[str],
+) -> str:
+    """Answer one question using only the supplied local documents."""
+    doc_ids = await get_or_ingest_local_doc_ids(rag_service, paths)
+    return await rag_service.answer(question=question, doc_ids=doc_ids)
+
+
 rag_service: RagServiceProtocol = RagService(
     base_url=get_runtime_settings().model_base_url
 )

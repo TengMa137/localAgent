@@ -53,7 +53,10 @@ config = FilesystemValidatorConfig(
 )
 validator = FilesystemValidator(config)
 
-_fs_toolset_raw = make_filesystem_toolset(filesystem_validator=validator)
+_fs_toolset_raw = make_filesystem_toolset(
+    filesystem_validator=validator,
+    rag_service=rag_service,
+)
 
 FS_WRITE_TOOLS = {
     "write_file",

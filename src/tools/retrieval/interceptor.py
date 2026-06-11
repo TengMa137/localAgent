@@ -93,6 +93,8 @@ def _crawl_to_doc(content: dict) -> Optional[Document]:
     text = content.get("markdown") or content.get("text") or ""
     if not text:
         return None
+    if "HTML is not available for the source." in text:
+        return None
     url = content.get("url", "")
     raw_title = content.get("title") or None
     return Document(
@@ -186,11 +188,15 @@ async def web_crawl_and_ingest(
     mcp_url: str,
     rag_service: RagServiceProtocol,
     urls: List[str],
+    *,
+    capture_documents: List[Document] | None = None,
 ) -> str:
     docs = await web_crawl_documents(mcp_url, urls)
     if not docs:
         return f"No usable content retrieved from: {urls}"
 
+    if capture_documents is not None:
+        capture_documents.extend(docs)
     return await _ingest(rag_service, docs)
 
 

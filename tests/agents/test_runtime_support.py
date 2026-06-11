@@ -750,6 +750,58 @@ def test_web_query_guidance_includes_time_sensitive_semantic_guidance():
     assert "avoid adding a bare year" in guidance
 
 
+def test_scholarly_result_urls_prefers_newest_arxiv_id():
+    from agents.web.policy import scholarly_result_urls
+
+    results = [
+        {
+            "url": "https://arxiv.org/abs/2504.13152",
+            "position": 1,
+        },
+        {
+            "url": "https://arxiv.org/abs/2602.10094",
+            "position": 3,
+        },
+    ]
+
+    assert scholarly_result_urls(results, prefer_recent=True) == [
+        "https://arxiv.org/html/2602.10094",
+        "https://arxiv.org/html/2504.13152",
+    ]
+
+
+def test_save_arxiv_markdown_documents_writes_under_docs(tmp_path):
+    from agents.web.paper_storage import save_arxiv_markdown_documents
+    from rag import Document
+
+    paths = save_arxiv_markdown_documents(
+        [
+            Document(
+                doc_id="paper-1",
+                source="https://arxiv.org/html/2602.10094v2",
+                title=(
+                    "arxiv.org — 4RC: 4D Reconstruction via Conditional Querying"
+                ),
+                text=(
+                    "# 4RC: 4D Reconstruction via Conditional Querying\n\n"
+                    "Full crawled paper content."
+                ),
+                mime="text/markdown",
+                meta={},
+            )
+        ],
+        docs_dir=tmp_path,
+    )
+
+    saved = tmp_path / "papers" / "arxiv" / "2602.10094v2.md"
+    assert paths == ["/docs/papers/arxiv/2602.10094v2.md"]
+    assert saved.exists()
+    content = saved.read_text(encoding="utf-8")
+    assert "# 4RC: 4D Reconstruction via Conditional Querying" in content
+    assert "- arXiv ID: 2602.10094v2" in content
+    assert "Full crawled paper content." in content
+
+
 def test_orchestrator_prompt_explicitly_routes_current_lookup_to_web():
     from agents.orchestrator_agent import _orchestrator_prompt_body
 
@@ -768,7 +820,18 @@ def test_orchestrator_prompt_explicitly_routes_current_lookup_to_web():
     assert "Do not choose plan merely because one web lookup" in prompt
 
 
-def test_orchestrator_guardrail_corrects_recent_research_fs_to_web():
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "cool, now fetch me recent language model research",
+        (
+            "check recent paper about 4d reconstruction online and fetch one "
+            "you think is most valuable"
+        ),
+        "find the recent paper online regarding 4d reconstruction",
+    ],
+)
+def test_orchestrator_guardrail_corrects_recent_research_fs_to_web(prompt):
     from agents.orchestrator_agent import (
         OrchestratorDecision,
         _guardrail_orchestrator_decision,
@@ -783,12 +846,12 @@ def test_orchestrator_guardrail_corrects_recent_research_fs_to_web():
     )
 
     corrected = _guardrail_orchestrator_decision(
-        "cool, now fetch me recent language model research",
+        prompt,
         decision,
     )
 
     assert corrected.route == "web"
-    assert corrected.objective == decision.objective
+    assert corrected.objective == prompt
 
 
 def test_orchestrator_guardrail_keeps_local_docs_paper_followup_on_fs():
@@ -1754,6 +1817,190 @@ async def test_run_web_task_searches_arxiv_through_generic_web_flow(monkeypatch)
     assert ("model", "ArxivSelectionDecision") not in events
 
 
+@pytest.mark.asyncio
+async def test_scholarly_fetch_grounds_query_and_crawls_returned_paper(monkeypatch):
+    from agents import web_agent
+
+    events: list[tuple[str, str]] = []
+    hallucinated = (
+        "Learning to reconstruct 4D volumetric scenes from single RGB-D images "
+        "using a multi-view geometric prior (2023) Zhang et al."
+    )
+
+    async def fake_model_run(_agent, prompt, *, output_name, **_kwargs):
+        events.append(("model", output_name))
+        if output_name == "WebSourceDecision":
+            return SimpleNamespace(
+                output=web_agent.WebSourceDecision(
+                    kind="scholarly",
+                    target=hallucinated,
+                )
+            )
+        if output_name == "WebQueryPlan":
+            return SimpleNamespace(
+                output=web_agent.WebQueryPlan(
+                    query=hallucinated,
+                    search_result_limit=5,
+                    crawl_url_limit=0,
+                )
+            )
+        if output_name == "WebPreviewDecision":
+            return SimpleNamespace(
+                output=web_agent.WebPreviewDecision(
+                    answer_from_preview=True,
+                    selected_urls=["https://arxiv.org/abs/2507.21045"],
+                    reason="A snippet appears sufficient.",
+                )
+            )
+        assert hallucinated not in prompt
+        assert "4RC: 4D Reconstruction via Conditional Querying" in prompt
+        assert "D4RT: Dynamic 4D Reconstruction and Tracking" not in prompt
+        return SimpleNamespace(
+            output="4RC is a recent paper on feed-forward 4D reconstruction."
+        )
+
+    async def fake_web_search(_mcp_url, query, *, max_results=None):
+        events.append(("web_search", query))
+        assert hallucinated not in query
+        assert max_results == 3
+        return [
+            {
+                "title": "4RC: 4D Reconstruction via Conditional Querying",
+                "url": "https://arxiv.org/abs/2602.10094",
+                "snippet": "A unified feed-forward framework for 4D reconstruction.",
+                "position": 2,
+            },
+            {
+                "title": "D4RT: Dynamic 4D Reconstruction and Tracking",
+                "url": "https://arxiv.org/abs/2507.21045",
+                "snippet": "A unified 4D reconstruction and tracking model.",
+                "position": 1,
+            }
+        ]
+
+    async def fake_crawl(
+        _mcp_url,
+        _rag_service,
+        urls,
+        *,
+        capture_documents=None,
+    ):
+        events.append(("crawl", ",".join(urls)))
+        if urls == ["https://arxiv.org/html/2602.10094"]:
+            return "No usable content retrieved from the arXiv HTML page."
+        assert urls == ["https://arxiv.org/abs/2602.10094"]
+        assert capture_documents is not None
+        capture_documents.append(
+            SimpleNamespace(
+                source="https://arxiv.org/abs/2602.10094",
+                title="arxiv.org — 4RC",
+                text="Full paper content.",
+            )
+        )
+        return "Ingested 1 document(s): 4RC."
+
+    async def fake_rag_search(**kwargs):
+        assert kwargs["docs"] == ["https://arxiv.org/abs/2602.10094"]
+        return [
+            {
+                "node_id": "4rc-abstract",
+                "source": "https://arxiv.org/abs/2602.10094",
+                "title": "4RC: 4D Reconstruction via Conditional Querying",
+                "text": "4RC jointly captures dense scene geometry and motion dynamics.",
+            }
+        ]
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_search_results", fake_web_search)
+    monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fake_crawl)
+    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
+    monkeypatch.setattr(
+        web_agent,
+        "_save_arxiv_documents",
+        lambda documents: (
+            ["/docs/papers/arxiv/2602.10094.md"] if documents else []
+        ),
+    )
+
+    result = await web_agent.run_web_task(
+        "search online the recent paper on 4d reconstruction and fetch one for me"
+    )
+
+    assert "4RC is a recent paper" in result
+    assert ("web_search", "recent paper on 4d reconstruction") in events
+    assert (
+        "web_search",
+        "site:arxiv.org recent paper on 4d reconstruction",
+    ) in events
+    assert ("crawl", "https://arxiv.org/html/2602.10094") in events
+    assert ("crawl", "https://arxiv.org/abs/2602.10094") in events
+    assert "Saved locally: `/docs/papers/arxiv/2602.10094.md`" in result
+
+
+@pytest.mark.asyncio
+async def test_direct_arxiv_fetch_falls_back_and_saves_locally(monkeypatch):
+    from agents import web_agent
+
+    crawls: list[str] = []
+
+    async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
+        assert output_name == "web answer text"
+        return SimpleNamespace(output="Fetched the requested arXiv paper.")
+
+    async def fake_crawl(
+        _mcp_url,
+        _rag_service,
+        urls,
+        *,
+        capture_documents=None,
+    ):
+        crawls.extend(urls)
+        if urls == ["https://arxiv.org/html/2602.10094"]:
+            return "No usable content retrieved from the arXiv HTML page."
+        assert urls == ["https://arxiv.org/abs/2602.10094"]
+        capture_documents.append(
+            SimpleNamespace(
+                source="https://arxiv.org/abs/2602.10094",
+                title="arxiv.org — 4RC",
+                text="Paper abstract.",
+            )
+        )
+        return "Ingested 1 document(s): 4RC."
+
+    async def fake_rag_search(**kwargs):
+        assert kwargs["docs"] == ["https://arxiv.org/abs/2602.10094"]
+        return []
+
+    monkeypatch.setattr(
+        web_agent,
+        "observable_run_with_manual_validation_retries",
+        fake_model_run,
+    )
+    monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fake_crawl)
+    monkeypatch.setattr(web_agent, "rag_search_documents", fake_rag_search)
+    monkeypatch.setattr(
+        web_agent,
+        "_save_arxiv_documents",
+        lambda documents: (
+            ["/docs/papers/arxiv/2602.10094.md"] if documents else []
+        ),
+    )
+
+    result = await web_agent.run_web_task(
+        "fetch https://arxiv.org/html/2602.10094 for me"
+    )
+
+    assert crawls == [
+        "https://arxiv.org/html/2602.10094",
+        "https://arxiv.org/abs/2602.10094",
+    ]
+    assert "Saved locally: `/docs/papers/arxiv/2602.10094.md`" in result
+
+
 def test_current_turn_prompt_prioritizes_user_request():
     from run_agents import _current_turn_prompt
 
@@ -2188,7 +2435,7 @@ async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monke
 
     assert result.decision.route == "web"
     assert result.output.reply == "Recent language model research from web."
-    assert calls == ["Provide recent language model research overview"]
+    assert calls == ["cool, now fetch me recent language model research"]
     persisted_history = str(result.all_messages())
     assert "fetch me recent language model research" in persisted_history
     assert "Recent language model research from web." in persisted_history
@@ -3355,11 +3602,15 @@ async def test_fs_ambiguous_local_paper_uses_filesystem_discovery(
     async def fake_fs_tools(
         prompt,
         *,
+        question,
         task_roots,
         discovery_preview_only=False,
         discovery_search_paths=None,
     ):
         prompts.append(prompt)
+        assert question == (
+            "check the papers locally related to world model, and summarize it"
+        )
         assert task_roots == ["/docs"]
         assert discovery_preview_only is True
         assert discovery_search_paths == ["/docs"]
@@ -3433,10 +3684,12 @@ async def test_fs_non_paper_docs_use_filesystem_instead_of_papers_rag(
     async def fake_fs_tools(
         prompt,
         *,
+        question,
         task_roots,
         discovery_preview_only=False,
         discovery_search_paths=None,
     ):
+        assert question == "summarize the local agent system documentation"
         assert task_roots == ["/docs"]
         assert discovery_preview_only is True
         assert discovery_search_paths == ["/docs"]
@@ -3617,6 +3870,26 @@ def test_fs_small_pdf_is_always_selected_for_rag(monkeypatch, tmp_path):
     assert fs_agent._paths_that_need_rag(["/docs/paper.pdf"]) == [
         "/docs/paper.pdf"
     ]
+
+
+def test_fs_large_text_is_left_to_read_file_rag_branch(monkeypatch, tmp_path):
+    from agents import fs_agent
+    from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "large.md").write_text(
+        "A" * (DEFAULT_MAX_READ_CHARS + 1),
+        encoding="utf-8",
+    )
+    validator = FilesystemValidator(
+        FilesystemValidatorConfig(
+            mounts=[Mount(host_path=docs, mount_point="/docs", mode="ro")]
+        )
+    )
+    monkeypatch.setattr(fs_agent, "validator", validator)
+
+    assert fs_agent._paths_that_need_rag(["/docs/large.md"]) == []
 
 
 def test_fs_plan_worker_rag_uses_only_assigned_files(monkeypatch, tmp_path):

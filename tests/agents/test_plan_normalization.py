@@ -67,6 +67,13 @@ def test_query_policy_current_info_signals_are_conservative(text, expected):
         ("look up online examples", True),
         ("verify on the internet", True),
         ("download the paper", True),
+        (
+            "check recent paper about 4d reconstruction online and fetch one "
+            "you think is most valuable",
+            True,
+        ),
+        ("find the recent paper online regarding 4d reconstruction", True),
+        ("find a paper about online learning", False),
         ("run a web app locally", False),
         ("search local files", False),
         ("check agentsystem.md", False),
@@ -172,6 +179,21 @@ def test_query_policy_external_arxiv_lookup_uses_web_search():
         infer_task_kind("search the web for arXiv 2605.00080")
         == TaskKind.WEB_SEARCH
     )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            "check recent paper about 4d reconstruction online and fetch one "
+            "you think is most valuable"
+        ),
+        "find the recent paper online regarding 4d reconstruction",
+    ],
+)
+def test_query_policy_online_scholarly_lookup_uses_web_search(text):
+    assert not requests_local_discovery(text)
+    assert infer_task_kind(text) == TaskKind.WEB_SEARCH
 
 
 def test_query_policy_resolved_local_files_win_over_external_identifiers():

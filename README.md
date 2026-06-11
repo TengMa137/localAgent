@@ -54,8 +54,10 @@ Current implementation highlights:
   original request is externally recoverable. Explicit local paths such as
   `/docs/missing.md` remain local and do not silently fall back to the internet.
 - `fs_agent` owns scoped local path discovery/read/write/edit. Python sends
-  explicit directories and large files through deterministic RAG before they
-  can fill the model context. Topic-based local discovery uses `grep_files`,
+  explicit directories, PDFs, and assigned file batches through deterministic
+  RAG before they can fill the model context. A default `read_file` call on one
+  text document over 20,000 characters returns a RAG answer directly.
+  Topic-based local discovery uses `grep_files`,
   bounded `preview_file` snippets, and then deterministic RAG over the previewed
   candidates. Topic runs expose grep first and preview second rather than the
   full filesystem toolset; grep output is capped by match count, per-file count,
@@ -65,7 +67,9 @@ Current implementation highlights:
 - Dedicated MCP APIs handle weather through Open-Meteo and definitions through
   Wikipedia. Recent news uses bounded web search directly.
 - External paper discovery, including arXiv, uses ordinary web search and URL
-  crawling. There is no dedicated arXiv MCP endpoint or automatic paper download.
+  crawling. There is no dedicated arXiv MCP endpoint. Explicit fetch/download/save
+  requests deterministically persist the selected crawled paper as Markdown under
+  `/docs/papers/arxiv` (`user_docs/papers/arxiv` by default) and report the path.
 - Planned workers produce typed evidence for synthesis; diagnostics stay in trace events
   and per-turn task logs.
 - `TaskSpec` is typed with a task kind so retrieval can be routed by Python.
