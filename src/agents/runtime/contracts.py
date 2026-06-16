@@ -1,4 +1,4 @@
-"""Typed internal handoff returned by filesystem and web specialists."""
+"""Typed contracts exchanged between agent runtime components."""
 
 from __future__ import annotations
 
@@ -28,10 +28,12 @@ class SpecialistResult(BaseModel):
         return self.answer.strip() or self.summary.strip() or "No answer returned."
 
     def to_handoff(self) -> str:
-        notes: list[str] = [f"Summary: {self.summary.strip() or 'No summary returned.'}"]
-        notes.append(f"Status: {self.status}")
-        notes.append(f"Useful: {self.useful}")
-        notes.append(f"Recoverable by web: {self.recoverable_by_web}")
+        notes = [
+            f"Summary: {self.summary.strip() or 'No summary returned.'}",
+            f"Status: {self.status}",
+            f"Useful: {self.useful}",
+            f"Recoverable by web: {self.recoverable_by_web}",
+        ]
         if self.sources:
             notes.append("Sources: " + ", ".join(dict.fromkeys(self.sources)))
         if self.findings:
@@ -41,10 +43,22 @@ class SpecialistResult(BaseModel):
                 "Uncertainties: "
                 + "; ".join(dict.fromkeys(item for item in self.uncertainties if item))
             )
-
         return "\n\n".join(
             [
                 "Forwardable answer:\n" + self.forwardable_answer(),
                 "Orchestrator notes:\n" + "\n".join(f"- {note}" for note in notes),
             ]
         )
+
+
+class EvidenceItem(BaseModel):
+    """Typed specialist output safe to pass into synthesis."""
+
+    task_id: str
+    objective: str
+    agent: str
+    answer: str = ""
+    summary: str = ""
+    useful: bool = False
+    sources: list[str] = Field(default_factory=list)
+    uncertainties: list[str] = Field(default_factory=list)

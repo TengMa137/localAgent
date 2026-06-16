@@ -1,147 +1,150 @@
-"""Conservative structural signals for retrieval task routing."""
+"""Deterministic routing signals; orchestrator use is gated by ``use_regex``."""
 
 from __future__ import annotations
 
 import re
+import string
 from enum import Enum
+from typing import Literal
 
 
 class TaskKind(str, Enum):
-    LOCAL_RAG = "local_rag"
+    LOCAL_FILES = "local_files"
     WEB_SEARCH = "web_search"
     URL_CRAWL = "url_crawl"
 
 
+RouteTrigger = Literal["fs", "web", "plan"]
+
+
 URL_RE = re.compile(r"https?://[^\s<>)\"']+")
 ARXIV_RE = re.compile(r"\b(?:arxiv:)?\d{4}\.\d{4,5}(?:v\d+)?\b", re.IGNORECASE)
-EXPLICIT_WEB_REQUEST_RE = re.compile(
-    r"(?:"
-    r"\b(?:search|browse|check|look\s+up|verify)\s+"
-    r"(?:on\s+)?(?:the\s+)?(?:web|internet|online)\b|"
-    r"\bweb\s+search\b|"
-    r"\bgoogle\b|"
-    r"\bfrom\s+(?:the\s+)?(?:web|internet|online)\b|"
-    r"\b(?:download|fetch)\s+(?:the\s+|a\s+|an\s+)?"
-    r"(?:paper|document|page|url|website|source)\b"
-    r")",
+ROUTE_TRIGGER_RE = re.compile(
+    r"^\s*(?:/(?P<slash>fs|web|plan)\b|(?P<colon>fs|web|plan)\s*:)",
     re.IGNORECASE,
 )
-LOCAL_FILE_ACTION_RE = re.compile(
-    r"\b("
-    r"check|read|open|inspect|review|summari[sz]e|analy[sz]e|explain|"
-    r"edit|update|change|fix|validate|search|find|use|based on|tell me"
-    r")\b",
-    re.IGNORECASE,
-)
-EXPLICIT_LOCAL_SOURCE_RE = re.compile(
-    r"(?:"
-    r"\b(?:local|locally|saved|downloaded|my)\s+"
-    r"(?:[A-Za-z0-9_.-]+\s+){0,2}"
-    r"(?:file|files|document|documents|docs?|notes?|paper|papers|source|sources)\b|"
-    r"\b(?:same|current)\s+(?:folder|directory)\b|"
-    r"(?<!\w)/(?:docs|skills)(?:/|\b)"
-    r")",
-    re.IGNORECASE,
-)
-LOCAL_DIRECTORY_CONTEXT_RE = re.compile(
-    r"\b(?:same|current)\s+(?:folder|directory)\b",
-    re.IGNORECASE,
-)
-REFERENTIAL_LOCAL_ARTIFACT_RE = re.compile(
-    r"\b(?:the|that|this|previous|previously discussed)\s+"
-    r"(?:file|document|doc|notes?|paper|source)\b",
-    re.IGNORECASE,
-)
-PAPER_LOOKUP_RE = re.compile(
-    r"\b(?:paper|papers|article|articles|study|studies|publication|publications)\b",
-    re.IGNORECASE,
-)
-SCHOLARLY_ONLINE_SOURCE_RE = re.compile(
-    r"\bonline\b(?=\s*(?:$|[?.!,;:]|\b(?:and|then|to|for|about|regarding)\b))",
-    re.IGNORECASE,
-)
-REFERENTIAL_PAPER_FETCH_RE = re.compile(
-    r"\b(?:download|fetch)\s+(?:one|it|this|that)\b",
-    re.IGNORECASE,
-)
-TOPIC_FILE_DISCOVERY_RE = re.compile(
-    r"\b(?:"
-    r"files?|documents?|documentation|docs?|notes?|papers?|articles?|"
-    r"studies|publications?|sources?"
-    r")\b",
-    re.IGNORECASE,
-)
-TOPIC_DISCOVERY_ACTION_RE = re.compile(
-    r"\b(?:"
-    r"check|read|open|inspect|review|summari[sz]e|analy[sz]e|explain|"
-    r"search|find|use|tell\s+me"
-    r")\b",
-    re.IGNORECASE,
-)
-COLLECTION_ARTIFACT_RE = re.compile(
-    r"\b(?:papers?|articles?|studies|publications?|files?|documents?|docs?|notes?)\b",
-    re.IGNORECASE,
-)
-COLLECTION_SCOPE_RE = re.compile(
-    r"\b(?:all|every|each)\b",
-    re.IGNORECASE,
-)
-COLLECTION_WORK_RE = re.compile(
-    r"\b(?:check|read|inspect|review|summari[sz]e|analy[sz]e|compare|extract)\b",
-    re.IGNORECASE,
-)
-COLLECTION_DIRECTORY_RE = re.compile(
-    r"\b(?:under|inside|within|from|in)\s+"
-    r"(?:the\s+)?(?:(?:folder|directory)\s+)?"
-    r"(?:\.{0,2}/|/)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+",
-    re.IGNORECASE,
-)
-PARALLEL_COLLECTION_RE = re.compile(
-    r"\b(?:in\s+parallel|parallel(?:ly|ize|ise|ized|ised)?|concurrently)\b",
-    re.IGNORECASE,
-)
-RECENCY_RE = re.compile(
-    r"\b("
-    r"latest|today|tomorrow|yesterday|news|weather|forecast|standings"
-    r")\b",
-    re.IGNORECASE,
-)
-RECENT_SUBJECT_RE = re.compile(
-    r"\brecent(?:ly)?\b.{0,40}\b("
-    r"research|papers?|news|changes?|updates?|releases?|events?|"
-    r"developments?|results?"
-    r")\b",
-    re.IGNORECASE,
-)
-CURRENT_SUBJECT_RE = re.compile(
-    r"\bcurrent\s+("
-    r"price|prices|rate|rates|weather|forecast|score|scores|schedule|"
-    r"standings|version|release|office\s+holder|president|prime\s+minister|"
-    r"ceo|leader|law|regulation|status"
-    r")\b",
-    re.IGNORECASE,
-)
-CURRENT_VERSION_RE = re.compile(
-    r"\bcurrent\s+(?:[A-Za-z0-9_.-]+\s+){0,2}(?:version|release)\b",
-    re.IGNORECASE,
-)
-CURRENT_ROLE_RE = re.compile(
-    r"\bcurrently\s+(?:leads?|serves?|holds?|is\s+(?:the\s+)?)\b",
-    re.IGNORECASE,
-)
-VOLATILE_LOOKUP_RE = re.compile(
-    r"\b(?:what(?:'s|\s+is|\s+are)|check|get|show|find|look\s+up|"
-    r"give\s+me|tell\s+me)\b.{0,50}\b("
-    r"price|prices|pricing|exchange\s+rate|interest\s+rate|score|scores|"
-    r"schedule|standings"
-    r")\b",
-    re.IGNORECASE,
-)
-MARKET_LOOKUP_RE = re.compile(
-    r"\b(?:gold|silver|oil|bitcoin|btc|ethereum|eth|stock|share|forex|"
-    r"currency|exchange|mortgage|interest)\b.{0,30}\b(?:price|prices|rate|rates)\b",
-    re.IGNORECASE,
-)
+
+ARTIFACT_WORDS = {
+    "article",
+    "articles",
+    "doc",
+    "docs",
+    "document",
+    "documents",
+    "file",
+    "files",
+    "note",
+    "notes",
+    "paper",
+    "papers",
+    "publication",
+    "publications",
+    "source",
+    "sources",
+    "studies",
+    "study",
+}
+PAPER_WORDS = {
+    "article",
+    "articles",
+    "paper",
+    "papers",
+    "publication",
+    "publications",
+    "studies",
+    "study",
+}
+COLLECTION_WORK_WORDS = {
+    "analyze",
+    "analyse",
+    "check",
+    "compare",
+    "extract",
+    "inspect",
+    "read",
+    "review",
+    "summarize",
+    "summarise",
+}
+CURRENT_WORDS = {
+    "latest",
+    "news",
+    "standings",
+    "today",
+    "tomorrow",
+    "weather",
+    "yesterday",
+}
+CURRENT_SUBJECTS = {
+    "ceo",
+    "forecast",
+    "law",
+    "leader",
+    "president",
+    "price",
+    "prices",
+    "rate",
+    "rates",
+    "regulation",
+    "release",
+    "schedule",
+    "score",
+    "scores",
+    "status",
+    "version",
+}
+RECENT_SUBJECTS = {
+    "changes",
+    "developments",
+    "events",
+    "news",
+    "papers",
+    "releases",
+    "research",
+    "results",
+    "updates",
+}
+MARKET_WORDS = {
+    "bitcoin",
+    "btc",
+    "currency",
+    "ethereum",
+    "eth",
+    "forex",
+    "gold",
+    "interest",
+    "mortgage",
+    "oil",
+    "share",
+    "silver",
+    "stock",
+}
+
+_PUNCTUATION_TABLE = str.maketrans({char: " " for char in string.punctuation})
+
+
+def _normalized(text: str) -> str:
+    return " ".join(text.casefold().translate(_PUNCTUATION_TABLE).split())
+
+
+def _words(text: str) -> set[str]:
+    return set(_normalized(text).split())
+
+
+def explicit_route_trigger(text: str) -> RouteTrigger | None:
+    """Return an explicit route prefix such as /web or plan:."""
+    match = ROUTE_TRIGGER_RE.match(text)
+    if not match:
+        return None
+    value = match.group("slash") or match.group("colon")
+    if value is None:
+        return None
+    return value.casefold()  # type: ignore[return-value]
+
+
+def strip_route_trigger(text: str) -> str:
+    """Remove a leading explicit route prefix from user-facing objective text."""
+    return ROUTE_TRIGGER_RE.sub("", text, count=1).strip()
 
 
 def extract_urls(text: str) -> list[str]:
@@ -149,115 +152,116 @@ def extract_urls(text: str) -> list[str]:
 
 
 def extract_arxiv_ids(text: str) -> list[str]:
-    ids = []
-    for match in ARXIV_RE.findall(text):
-        ids.append(match.removeprefix("arXiv:").removeprefix("arxiv:"))
+    ids: list[str] = []
+    for match in ARXIV_RE.finditer(text):
+        value = match.group(0)
+        ids.append(value.split(":", 1)[-1])
     return ids
 
 
 def explicitly_requests_web(text: str) -> bool:
-    """Return true only for phrases that name web retrieval as the source."""
-    if EXPLICIT_WEB_REQUEST_RE.search(text):
+    """Return true only when the request names external retrieval."""
+    trigger = explicit_route_trigger(text)
+    if trigger == "web":
         return True
-    return bool(
-        PAPER_LOOKUP_RE.search(text)
-        and (
-            SCHOLARLY_ONLINE_SOURCE_RE.search(text)
-            or REFERENTIAL_PAPER_FETCH_RE.search(text)
+    if trigger == "fs":
+        return False
+    if extract_urls(text):
+        return True
+    normalized = _normalized(text)
+    words = set(normalized.split())
+    explicit_phrases = (
+        "search the web",
+        "browse the web",
+        "search the internet",
+        "browse the internet",
+        "look up online",
+        "verify online",
+        "verify on the internet",
+        "verify on internet",
+        "web search",
+    )
+    if any(phrase in normalized for phrase in explicit_phrases):
+        return True
+    online_source = bool(
+        normalized.endswith(" online")
+        or any(
+            marker in normalized
+            for marker in (
+                " online and ",
+                " online for ",
+                " online regarding ",
+                " online to ",
+            )
         )
     )
-
-
-def requests_file_operation(text: str) -> bool:
-    """Return true for an action that can sensibly target a named local file."""
-    return bool(LOCAL_FILE_ACTION_RE.search(text))
+    if "google" in words or online_source:
+        return True
+    return bool(words & {"download", "fetch"} and words & ARTIFACT_WORDS)
 
 
 def explicitly_requests_local_source(text: str) -> bool:
-    """Return true when the user names local storage as the required source."""
-    return bool(
-        not explicitly_requests_web(text)
-        and EXPLICIT_LOCAL_SOURCE_RE.search(text)
-        and (
-            requests_file_operation(text)
-            or LOCAL_DIRECTORY_CONTEXT_RE.search(text)
+    """Return true only when local storage is named as the source."""
+    trigger = explicit_route_trigger(text)
+    if trigger == "fs":
+        return True
+    if trigger == "web":
+        return False
+    if explicitly_requests_web(text):
+        return False
+    normalized = _normalized(text)
+    if any(
+        phrase in normalized
+        for phrase in (
+            "same folder",
+            "same directory",
+            "current folder",
+            "current directory",
         )
-    )
-
-
-def ambiguously_references_local_artifact(text: str) -> bool:
-    """Return true for a referential artifact that may or may not exist locally."""
-    return bool(
-        not explicitly_requests_web(text)
-        and requests_file_operation(text)
-        and REFERENTIAL_LOCAL_ARTIFACT_RE.search(text)
-        and not likely_requires_current_info(text)
-    )
-
-
-def requests_paper_lookup(text: str) -> bool:
-    """Return true when a paper request should try local discovery before web."""
-    return bool(
-        not explicitly_requests_web(text)
-        and requests_file_operation(text)
-        and PAPER_LOOKUP_RE.search(text)
-    )
-
-
-def requests_topic_file_discovery(text: str) -> bool:
-    """Return true for read-only topic discovery over general local artifacts."""
-    return bool(
-        not explicitly_requests_web(text)
-        and TOPIC_DISCOVERY_ACTION_RE.search(text)
-        and TOPIC_FILE_DISCOVERY_RE.search(text)
-    )
+    ):
+        return True
+    return False
 
 
 def references_papers(text: str) -> bool:
-    """Return true when the request names scholarly artifacts."""
-    return bool(PAPER_LOOKUP_RE.search(text))
+    return bool(_words(text) & PAPER_WORDS)
 
 
 def requests_collection_plan(text: str) -> bool:
-    """Return true for collection-wide work that benefits from worker batches."""
-    if not COLLECTION_ARTIFACT_RE.search(text):
+    """Return true for explicit collection-wide processing."""
+    words = _words(text)
+    artifacts = words & ARTIFACT_WORDS
+    if not artifacts:
         return False
-    has_work = bool(COLLECTION_WORK_RE.search(text))
-    all_scoped = bool(COLLECTION_SCOPE_RE.search(text))
-    directory_scoped = bool(COLLECTION_DIRECTORY_RE.search(text))
-    parallel = bool(PARALLEL_COLLECTION_RE.search(text))
-    return bool(
-        (all_scoped and (has_work or directory_scoped))
-        or (parallel and has_work)
+    quantifier = bool(words & {"all", "each", "every"})
+    parallel = bool(words & {"concurrently", "parallel", "parallelize", "parallelise"})
+    work = bool(words & COLLECTION_WORK_WORDS)
+    scoped_papers = bool(
+        quantifier
+        and artifacts & PAPER_WORDS
+        and words & {"from", "in", "inside", "under", "within"}
     )
-
-
-def requests_local_discovery(text: str) -> bool:
-    """Return true when an artifact reference should be tried locally first."""
-    return bool(
-        explicitly_requests_local_source(text)
-        or ambiguously_references_local_artifact(text)
-        or requests_paper_lookup(text)
-    )
+    return bool((quantifier or parallel) and work) or scoped_papers
 
 
 def likely_requires_current_info(text: str) -> bool:
-    """Return true for high-confidence time-sensitive language.
-
-    Standalone ``now`` and ``current`` are intentionally excluded because they
-    are common discourse or local-context words ("now read file.md", "current
-    implementation"). Specific ``current <changing subject>`` phrases remain
-    web signals.
-    """
-    return bool(
-        RECENCY_RE.search(text)
-        or RECENT_SUBJECT_RE.search(text)
-        or CURRENT_SUBJECT_RE.search(text)
-        or CURRENT_VERSION_RE.search(text)
-        or CURRENT_ROLE_RE.search(text)
-        or VOLATILE_LOOKUP_RE.search(text)
-        or MARKET_LOOKUP_RE.search(text)
-    )
+    """Return true for explicit changing-fact language."""
+    words = _words(text)
+    if words & CURRENT_WORDS:
+        return True
+    if "current" in words and words & CURRENT_SUBJECTS:
+        return True
+    if words & {"recent", "recently"} and words & RECENT_SUBJECTS:
+        return True
+    normalized = _normalized(text)
+    if any(
+        phrase in normalized
+        for phrase in ("currently leads", "currently serves", "currently holds")
+    ):
+        return True
+    if words & MARKET_WORDS and words & {"price", "prices", "rate", "rates"}:
+        return True
+    return "exchange rate" in normalized
 
 
 def infer_task_kind(
@@ -265,13 +269,19 @@ def infer_task_kind(
     *,
     matched_files: list[str] | None = None,
 ) -> TaskKind | None:
+    """Infer only routes supported by explicit structural evidence."""
     if matched_files:
-        return TaskKind.LOCAL_RAG
+        return TaskKind.LOCAL_FILES
+    trigger = explicit_route_trigger(text)
+    if trigger == "fs":
+        return TaskKind.LOCAL_FILES
+    if trigger == "web":
+        return TaskKind.WEB_SEARCH
     if extract_urls(text):
         return TaskKind.URL_CRAWL
-    if requests_local_discovery(text):
-        return TaskKind.LOCAL_RAG
-    if extract_arxiv_ids(text) or "arxiv" in text.lower():
+    if explicitly_requests_local_source(text):
+        return TaskKind.LOCAL_FILES
+    if extract_arxiv_ids(text):
         return TaskKind.WEB_SEARCH
     if explicitly_requests_web(text) or likely_requires_current_info(text):
         return TaskKind.WEB_SEARCH

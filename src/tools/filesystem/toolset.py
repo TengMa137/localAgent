@@ -23,6 +23,7 @@ Example:
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import mimetypes
 import re
 import shutil
@@ -45,7 +46,6 @@ from .errors import (
 
 from .types import (
     ReadResult,
-    PreviewResult,
     EditResult,
     WriteResult,
     CopyResult,
@@ -55,8 +55,7 @@ from .types import (
     GrepMatch,
     GrepResult,
     StatResult,
-    DirectoryEntry,
-    ListDirectoryResult,
+    FileTreeNode,
     MakeDirectoryResult,
     TextLine,
     ReadLinesResult,
@@ -81,6 +80,28 @@ _ABSTRACT_LINE_RE = re.compile(
     r"^\s*(?:#{1,6}\s*)?abstract\s*:?\s*(.*)$",
     re.IGNORECASE,
 )
+
+
+def _rag_question(ctx: RunContext) -> str:
+    metadata = ctx.metadata or {}
+    question = str(metadata.get("filesystem_question") or "").strip()
+    if not question and isinstance(ctx.prompt, str):
+        question = ctx.prompt.strip()
+    return question
+
+
+def _indexed_doc_ids_for_read(
+    rag_service: RagServiceProtocol,
+    *,
+    virtual_path: str,
+    resolved_path: Path,
+) -> list[str]:
+    """Return already-indexed doc IDs for this path without ingesting."""
+    doc_ids: list[str] = []
+    for candidate in dict.fromkeys([str(resolved_path), virtual_path]):
+        matches, _missing = rag_service.get_docs_to_ingest([candidate])
+        doc_ids.extend(matches)
+    return list(dict.fromkeys(doc_ids))
 
 
 def _abstract_or_opening_text(text: str) -> str:
@@ -211,6 +232,33 @@ def _image_media_type(path: str, resolved: Path, data: bytes) -> str:
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "image/webp"
     return media_type or "application/octet-stream"
+
+
+def _stat_result(
+    validator: FilesystemValidator,
+    path: str,
+    resolved: Path,
+) -> StatResult:
+    """Build read metadata without requiring a second model tool call."""
+    exists = resolved.exists()
+    path_type = _path_type(resolved)
+    stat = resolved.stat() if exists else None
+    return StatResult(
+        path=path,
+        exists=exists,
+        type=path_type,
+        size_bytes=stat.st_size if stat is not None and path_type == "file" else None,
+        modified_time=stat.st_mtime if stat is not None else None,
+        readable=validator.can_read(path),
+        writable=validator.can_write(path),
+    )
+
+
+@dataclass
+class _TreeState:
+    count: int = 0
+    truncated: bool = False
+    visited: set[Path] = field(default_factory=set)
 
 
 def _collect_matching_files(
@@ -347,21 +395,73 @@ def _collect_path_matches_for_term(
     return matches
 
 
-def _directory_entry(
-    path: Path,
+def _file_tree(
+    resolved: Path,
     *,
+    virtual_path: str,
     mount_point: str,
     mount_root: Path,
-) -> DirectoryEntry:
-    rel = path.relative_to(mount_root)
-    path_type = _path_type(path)
-    stat = path.stat() if path.exists() else None
-    return DirectoryEntry(
-        name=path.name,
-        path=_format_result_path(mount_point, rel),
+    validator: FilesystemValidator,
+    include_hidden: bool,
+    max_depth: int | None,
+    max_results: int | None,
+    depth: int = 0,
+    state: _TreeState | None = None,
+) -> FileTreeNode:
+    """Build a bounded recursive tree while preserving validator paths."""
+    state = state or _TreeState()
+    path_type = _path_type(resolved)
+    stat = resolved.stat() if resolved.exists() else None
+    node = FileTreeNode(
+        name=virtual_path.rstrip("/").rsplit("/", 1)[-1] or "/",
+        path=virtual_path,
         type=path_type,
         size_bytes=stat.st_size if stat is not None and path_type == "file" else None,
     )
+    if path_type != "directory":
+        return node
+    canonical = resolved.resolve()
+    if canonical in state.visited:
+        state.truncated = True
+        return node
+    state.visited.add(canonical)
+    if max_depth is not None and depth >= max_depth:
+        try:
+            if any(resolved.iterdir()):
+                state.truncated = True
+        except OSError:
+            pass
+        return node
+
+    for child in sorted(resolved.iterdir(), key=lambda item: item.name.casefold()):
+        try:
+            rel = child.relative_to(mount_root)
+        except ValueError:
+            continue
+        if not include_hidden and _is_hidden_path(rel):
+            continue
+        child_virtual = _format_result_path(mount_point, rel)
+        if not validator.can_read(child_virtual):
+            continue
+        if max_results is not None and state.count >= max_results:
+            state.truncated = True
+            break
+        state.count += 1
+        node.children.append(
+            _file_tree(
+                child,
+                virtual_path=child_virtual,
+                mount_point=mount_point,
+                mount_root=mount_root,
+                validator=validator,
+                include_hidden=include_hidden,
+                max_depth=max_depth,
+                max_results=max_results,
+                depth=depth + 1,
+                state=state,
+            )
+        )
+    return node
 
 
 def make_filesystem_toolset(
@@ -395,7 +495,8 @@ def make_filesystem_toolset(
     writable = ", ".join(filesystem_validator.writable_roots) or "none"
     read_path_hint = (
         f"Use only validator paths under readable roots: {readable}. "
-        "Call list_directory('/') to discover roots. Do not invent placeholder roots."
+        "Use grep_files when the path is unknown. Use list_files only for a "
+        "specific directory from the request or system prompt."
     )
     write_path_hint = (
         f"Use only validator paths under writable roots: {writable}. "
@@ -404,14 +505,18 @@ def make_filesystem_toolset(
 
     @toolset.tool(
         description=(
-            "Read a text file. A default read of a document larger than "
+            "Inspect and read one path. Every result includes stat metadata. "
+            "Readable text includes a bounded preview and normally returns content; "
+            "set preview_only=true for candidate triage. Supported PNG, JPEG, GIF, "
+            "and WebP files are returned as multimodal image bytes automatically. "
+            "Unsupported binary files return metadata without content. "
+            "A default read of a document larger than "
             f"{DEFAULT_MAX_READ_CHARS} characters deterministically returns a "
             "RAG answer to the current filesystem question instead of raw truncated "
-            "content. Set offset or a non-default max_chars only when an exact raw "
-            "text segment is required. "
-            f"{read_path_hint} "
-            "Do not use this on binary files (PDFs, images, etc) - "
-            "use read_image for supported images or stat_path/list_directory for metadata."
+            "content. A default read of a text file that is already indexed in "
+            "RAG also returns a RAG answer. Set offset or a non-default max_chars "
+            "only when an exact raw text segment is required. "
+            f"{read_path_hint}"
         )
     )
     async def read_file(
@@ -419,48 +524,159 @@ def make_filesystem_toolset(
         path: str,
         max_chars: int = DEFAULT_MAX_READ_CHARS,
         offset: int = 0,
-    ) -> ReadResult:
-        """Read a text file."""
+        preview_only: bool = False,
+        max_preview_sentences: int = 8,
+        max_preview_chars: int = 2400,
+        detail: Literal["auto", "low", "high"] = "auto",
+    ) -> ReadResult | ToolReturn:
+        """Inspect a path and automatically return text, preview, or image bytes."""
         if offset < 0:
             raise ValueError(f"offset must be >= 0, got {offset}")
         if max_chars < 0:
             raise ValueError(f"max_chars must be >= 0, got {max_chars}")
+        if max_preview_sentences < 1 or max_preview_sentences > 20:
+            raise ValueError("max_preview_sentences must be between 1 and 20")
+        if max_preview_chars < 200 or max_preview_chars > 5000:
+            raise ValueError("max_preview_chars must be between 200 and 5000")
 
         _, resolved, mount = filesystem_validator.get_path_config(path, op="read")
+        stat_result = _stat_result(filesystem_validator, path, resolved)
 
         if not resolved.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-
+            return ReadResult(
+                path=path,
+                stat=stat_result,
+                message=f"Path not found: {path}",
+            )
         if not resolved.is_file():
-            raise IsADirectoryError(f"Not a file: {path}")
+            return ReadResult(
+                path=path,
+                stat=stat_result,
+                message=f"Path is not a file: {path}",
+            )
 
-        filesystem_validator.check_suffix(resolved, mount, virtual_path=path)
-        filesystem_validator.check_size(resolved, mount, virtual_path=path)
+        default_read = offset == 0 and max_chars == DEFAULT_MAX_READ_CHARS
+        existing_doc_ids = (
+            _indexed_doc_ids_for_read(
+                rag_service,
+                virtual_path=path,
+                resolved_path=resolved,
+            )
+            if rag_service is not None and default_read and not preview_only
+            else []
+        )
+        if existing_doc_ids:
+            question = _rag_question(ctx)
+            if question:
+                answer = await rag_service.answer(
+                    question=question,
+                    doc_ids=existing_doc_ids,
+                )
+                return ReadResult(
+                    path=path,
+                    stat=stat_result,
+                    content=answer,
+                    media_type=_image_media_type(path, resolved, b""),
+                    retrieval_mode="rag_answer",
+                    offset=0,
+                    chars_read=len(answer),
+                )
 
         try:
-            text = resolved.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            raise ValidationError(
-                f"Cannot read '{path}': file appears to be binary or not UTF-8 encoded.\n"
-                "This tool only reads text files. Use read_image for supported images "
-                "or stat_path/list_directory for binary metadata."
+            filesystem_validator.check_suffix(resolved, mount, virtual_path=path)
+            filesystem_validator.check_size(resolved, mount, virtual_path=path)
+        except ValidationError as exc:
+            return ReadResult(
+                path=path,
+                stat=stat_result,
+                media_type=_image_media_type(path, resolved, b""),
+                message=f"Content was not read: {exc}",
             )
+
+        data = resolved.read_bytes()
+        media_type = _image_media_type(path, resolved, data)
+        if media_type in _SUPPORTED_IMAGE_MEDIA_TYPES:
+            return ToolReturn(
+                return_value={
+                    "path": path,
+                    "stat": stat_result.model_dump(),
+                    "media_type": media_type,
+                    "message": f"Image loaded for model inspection: {path}",
+                },
+                content=[
+                    f"Image loaded from {path} ({media_type}, {len(data)} bytes):",
+                    BinaryImage(
+                        data=data,
+                        media_type=media_type,
+                        identifier=path,
+                        vendor_metadata={"detail": detail},
+                    ),
+                ],
+                metadata={
+                    "path": path,
+                    "media_type": media_type,
+                    "size_bytes": len(data),
+                    "detail": detail,
+                },
+            )
+        if media_type.startswith("image/") and media_type != "image/svg+xml":
+            return ReadResult(
+                path=path,
+                stat=stat_result,
+                media_type=media_type,
+                message=(
+                    f"Unsupported image type {media_type}; metadata returned "
+                    "without image bytes."
+                ),
+            )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return ReadResult(
+                path=path,
+                stat=stat_result,
+                media_type=media_type,
+                message=(
+                    f"{path} is not readable as UTF-8 text; metadata returned "
+                    "without content."
+                ),
+            )
+
         total_chars = len(text)
+        preview, preview_sentences = _opening_sentence_preview(
+            text,
+            max_sentences=max_preview_sentences,
+            max_chars=max_preview_chars,
+        )
+        text_media_type = (
+            "text/plain"
+            if media_type == "application/octet-stream"
+            else media_type
+        )
+        preview_truncated = len(preview) < len(text)
+        if preview_only:
+            return ReadResult(
+                path=path,
+                stat=stat_result,
+                preview=preview,
+                preview_sentences=preview_sentences,
+                preview_truncated=preview_truncated,
+                media_type=text_media_type,
+                total_chars=total_chars,
+                retrieval_mode="preview",
+                message=f"Returned a bounded text preview for {path}.",
+            )
 
         use_rag = (
             rag_service is not None
+            and default_read
             and total_chars > DEFAULT_MAX_READ_CHARS
-            and offset == 0
-            and max_chars == DEFAULT_MAX_READ_CHARS
         )
         if use_rag:
-            metadata = ctx.metadata or {}
-            question = str(metadata.get("filesystem_question") or "").strip()
-            if not question and isinstance(ctx.prompt, str):
-                question = ctx.prompt.strip()
+            question = _rag_question(ctx)
             if not question:
                 raise ValueError(
-                    "A user question is required to answer a large document through RAG."
+                    "A user question is required to answer a document through RAG."
                 )
 
             answer = await answer_local_documents(
@@ -469,9 +685,14 @@ def make_filesystem_toolset(
                 paths=[str(resolved)],
             )
             return ReadResult(
+                path=path,
+                stat=stat_result,
                 content=answer,
+                preview=preview,
+                preview_sentences=preview_sentences,
+                preview_truncated=preview_truncated,
+                media_type=text_media_type,
                 retrieval_mode="rag_answer",
-                truncated=False,
                 total_chars=total_chars,
                 offset=0,
                 chars_read=len(answer),
@@ -487,107 +708,18 @@ def make_filesystem_toolset(
             text = text[:max_chars]
 
         return ReadResult(
+            path=path,
+            stat=stat_result,
             content=text,
+            preview=preview,
+            preview_sentences=preview_sentences,
+            preview_truncated=preview_truncated,
+            media_type=text_media_type,
+            retrieval_mode="text",
             truncated=truncated,
             total_chars=total_chars,
             offset=offset,
             chars_read=len(text),
-        )
-
-    @toolset.tool(
-        description=(
-            "Preview only the opening sentences of a text document for relevance "
-            "triage after lexical search. "
-            f"{read_path_hint} "
-            "Use this on candidate files returned by grep_files before selecting "
-            "documents for RAG. It intentionally does not return the full file. "
-            "Do not use this on PDFs, images, or other binary files."
-        )
-    )
-    async def preview_file(
-        ctx: RunContext,
-        path: str,
-        max_sentences: int = 8,
-        max_chars: int = 2400,
-    ) -> PreviewResult:
-        """Return a bounded opening-sentence preview for candidate triage."""
-        if max_sentences < 1 or max_sentences > 20:
-            raise ValueError("max_sentences must be between 1 and 20")
-        if max_chars < 200 or max_chars > 5000:
-            raise ValueError("max_chars must be between 200 and 5000")
-
-        text, _ = read_text_with_policy(filesystem_validator, path)
-        preview, sentences_read = _opening_sentence_preview(
-            text,
-            max_sentences=max_sentences,
-            max_chars=max_chars,
-        )
-        return PreviewResult(
-            path=path,
-            content=preview,
-            sentences_read=sentences_read,
-            total_chars=len(text),
-            chars_read=len(preview),
-            truncated=len(preview) < len(text),
-        )
-
-    @toolset.tool(
-        description=(
-            "Read an image file and send the visual content to the model. "
-            "Use this for PNG, JPEG, GIF, or WebP files when the user asks about visual content. "
-            f"{read_path_hint} "
-            "Do not use this for PDFs, audio, videos, or text/code files."
-        )
-    )
-    async def read_image(
-        ctx: RunContext,
-        path: str,
-        detail: Literal["auto", "low", "high"] = "auto",
-    ) -> ToolReturn:
-        """Read a supported image file as multimodal model input."""
-        _, resolved, mount = filesystem_validator.get_path_config(path, op="read")
-
-        if not resolved.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-        if not resolved.is_file():
-            raise IsADirectoryError(f"Not a file: {path}")
-
-        filesystem_validator.check_suffix(resolved, mount, virtual_path=path)
-        filesystem_validator.check_size(resolved, mount, virtual_path=path)
-
-        data = resolved.read_bytes()
-        media_type = _image_media_type(path, resolved, data)
-        if media_type == "image/svg+xml":
-            raise ValidationError(f"Cannot read '{path}' with read_image: SVG is text; use read_file instead.")
-        if media_type not in _SUPPORTED_IMAGE_MEDIA_TYPES:
-            supported = ", ".join(sorted(_SUPPORTED_IMAGE_MEDIA_TYPES))
-            raise ValidationError(
-                f"Cannot read '{path}' with read_image: unsupported image media type '{media_type}'.\n"
-                f"Supported image media types: {supported}"
-            )
-
-        return ToolReturn(
-            return_value={
-                "path": path,
-                "media_type": media_type,
-                "size_bytes": len(data),
-                "message": f"Image loaded for model inspection: {path}",
-            },
-            content=[
-                f"Image loaded from {path} ({media_type}, {len(data)} bytes):",
-                BinaryImage(
-                    data=data,
-                    media_type=media_type,
-                    identifier=path,
-                    vendor_metadata={"detail": detail},
-                ),
-            ],
-            metadata={
-                "path": path,
-                "media_type": media_type,
-                "size_bytes": len(data),
-                "detail": detail,
-            },
         )
 
     @toolset.tool(
@@ -723,8 +855,7 @@ def make_filesystem_toolset(
         except UnicodeDecodeError:
             raise ValidationError(
                 f"Cannot edit '{path}': file appears to be binary or not UTF-8 encoded.\n"
-                "This tool only edits text files. Use read_image for supported images "
-                "or stat_path/list_directory for binary metadata."
+                "This tool only edits text files. Use read_file to inspect the path."
             )
 
         # Count occurrences
@@ -818,236 +949,101 @@ def make_filesystem_toolset(
 
     @toolset.tool(
         description=(
-            "Inspect a path. "
-            "Returns existence, type, size, modified time, and validator permissions. "
-            f"{read_path_hint}"
-        )
-    )
-    async def stat_path(
-        ctx: RunContext,
-        path: str,
-    ) -> StatResult:
-        """Inspect a path without reading file contents."""
-        _, resolved, _ = filesystem_validator.get_path_config(path, op="read")
-        exists = resolved.exists()
-        path_type = _path_type(resolved)
-        stat = resolved.stat() if exists else None
-
-        return StatResult(
-            path=path,
-            exists=exists,
-            type=path_type,
-            size_bytes=stat.st_size if stat is not None and path_type == "file" else None,
-            modified_time=stat.st_mtime if stat is not None else None,
-            readable=filesystem_validator.can_read(path),
-            writable=filesystem_validator.can_write(path),
-        )
-
-    @toolset.tool(
-        description=(
-            "List immediate children of a directory without recursion. "
-            f"{read_path_hint}"
-        )
-    )
-    async def list_directory(
-        ctx: RunContext,
-        path: str = "/",
-        include_hidden: bool = True,
-        max_entries: int = 200,
-    ) -> ListDirectoryResult:
-        """List a directory non-recursively."""
-        if max_entries < 1:
-            raise ValueError(f"max_entries must be >= 1, got {max_entries}")
-
-        if path in ("/", ".", ""):
-            entries = []
-            for root_virtual in filesystem_validator.readable_roots[:max_entries]:
-                mount_point, resolved, _ = filesystem_validator.get_path_config(
-                    root_virtual, op="read"
-                )
-                entries.append(
-                    DirectoryEntry(
-                        name=mount_point.strip("/") or "/",
-                        path=mount_point,
-                        type="directory" if resolved.is_dir() else _path_type(resolved),
-                        size_bytes=None,
-                    )
-                )
-            return ListDirectoryResult(
-                path="/",
-                entries=entries,
-                count=len(entries),
-                truncated=len(filesystem_validator.readable_roots) > max_entries,
-            )
-
-        mount_point, resolved, _ = filesystem_validator.get_path_config(path, op="read")
-        if not resolved.exists():
-            raise FileNotFoundError(f"Directory not found: {path}")
-        if not resolved.is_dir():
-            raise NotADirectoryError(f"Not a directory: {path}")
-
-        mount_root = filesystem_validator.get_mount_root(mount_point)
-        entries: list[DirectoryEntry] = []
-        truncated = False
-
-        for child in sorted(resolved.iterdir(), key=lambda p: p.name):
-            try:
-                rel = child.relative_to(mount_root)
-            except ValueError:
-                continue
-            if not include_hidden and _is_hidden_path(rel):
-                continue
-            child_path = _format_result_path(mount_point, rel)
-            if not filesystem_validator.can_read(child_path):
-                continue
-            if len(entries) >= max_entries:
-                truncated = True
-                break
-            entries.append(
-                _directory_entry(child, mount_point=mount_point, mount_root=mount_root)
-            )
-
-        return ListDirectoryResult(
-            path=path,
-            entries=entries,
-            count=len(entries),
-            truncated=truncated,
-        )
-
-    @toolset.tool(
-        description=(
-            "List files matching a glob pattern. "
+            "List every readable file and directory under one explicit path as a "
+            "recursive tree. Use this only when the user supplied the path or the "
+            "system prompt supplied a known path such as /docs or /skills. Do not "
+            "use listing to discover an unknown filename; use grep_files instead. "
             f"{read_path_hint} "
-            "Use '/' to list all readable roots. Use this or find_paths for "
-            "filename/path discovery; grep_files searches file contents, not filenames."
+            "Use '/' only when the system prompt explicitly calls for all readable roots."
         )
     )
     async def list_files(
         ctx: RunContext,
-        path: str = "/",
-        pattern: str = "**/*",
-        include_directories: bool = False,
+        path: str,
         include_hidden: bool = True,
         max_depth: int | None = None,
         max_results: int | None = None,
     ) -> ListFilesResult:
-        """List files or directories matching pattern."""
-        pattern = _validate_glob_pattern(pattern)
+        """Return a recursive tree rooted at one explicit validator path."""
         if max_depth is not None and max_depth < 1:
             raise ValueError("max_depth must be >= 1")
         if max_results is not None and max_results < 1:
             raise ValueError("max_results must be >= 1")
 
-        matching_files: set[str] = set()
-
-        # If path is "/" or "." or empty, list all mounts
         if path in ("/", ".", ""):
+            state = _TreeState()
+            root = FileTreeNode(
+                name="/",
+                path="/",
+                type="directory",
+                size_bytes=None,
+            )
             for root_virtual in filesystem_validator.readable_roots:
+                if max_results is not None and state.count >= max_results:
+                    state.truncated = True
+                    break
                 mount_point, resolved, _ = filesystem_validator.get_path_config(
                     root_virtual, op="read"
                 )
                 mount_root = filesystem_validator.get_mount_root(mount_point)
                 if not resolved.exists():
                     continue
-
-                _collect_matching_files(
-                    resolved,
-                    pattern,
-                    mount_point,
-                    mount_root,
-                    matching_files,
-                    filesystem_validator,
-                    include_directories=include_directories,
-                    include_hidden=include_hidden,
-                    max_depth=max_depth,
-                    max_results=max_results,
+                state.count += 1
+                root.children.append(
+                    _file_tree(
+                        resolved,
+                        virtual_path=mount_point,
+                        mount_point=mount_point,
+                        mount_root=mount_root,
+                        validator=filesystem_validator,
+                        include_hidden=include_hidden,
+                        max_depth=max_depth,
+                        max_results=max_results,
+                        depth=1,
+                        state=state,
+                    )
                 )
-                if max_results is not None and len(matching_files) >= max_results:
-                    break
-            files = sorted(matching_files)
-            if max_results is not None:
-                files = files[:max_results]
-            return ListFilesResult(files=files, count=len(files))
+            return ListFilesResult(
+                path="/",
+                tree=root,
+                count=state.count,
+                truncated=state.truncated,
+            )
 
-        # Get the resolved path and mount point
         mount_point, resolved, _ = filesystem_validator.get_path_config(path, op="read")
-
-        # Get mount root for relative path calculation
-        root = filesystem_validator.get_mount_root(mount_point)
-
-        _collect_matching_files(
+        if not resolved.exists():
+            raise FileNotFoundError(f"Path not found: {path}")
+        mount_root = filesystem_validator.get_mount_root(mount_point)
+        state = _TreeState()
+        tree = _file_tree(
             resolved,
-            pattern,
-            mount_point,
-            root,
-            matching_files,
-            filesystem_validator,
-            include_directories=include_directories,
+            virtual_path=path,
+            mount_point=mount_point,
+            mount_root=mount_root,
+            validator=filesystem_validator,
             include_hidden=include_hidden,
             max_depth=max_depth,
             max_results=max_results,
+            state=state,
         )
-        files = sorted(matching_files)
-        if max_results is not None:
-            files = files[:max_results]
-        return ListFilesResult(files=files, count=len(files))
+        return ListFilesResult(
+            path=path,
+            tree=tree,
+            count=state.count,
+            truncated=state.truncated,
+        )
 
     @toolset.tool(
         description=(
-            "Find readable files by filename or virtual path substring. "
+            "Search for files when the exact path is unknown. By default this "
+            "matches filename and virtual-path substrings. Set full_text=true to "
+            "search readable UTF-8 file contents. "
             f"{read_path_hint} "
-            "Use query for one literal substring, or queries for several "
-            "literal terms with match_mode='any' or 'all'. Use this for "
-            "path/name lookup such as 'agentsystem.md'. This does not search "
-            "file contents; use grep_files for content search."
-        )
-    )
-    async def find_paths(
-        ctx: RunContext,
-        query: str | None = None,
-        queries: list[str] | None = None,
-        match_mode: Literal["any", "all"] = "any",
-        path: str = "/",
-        include_directories: bool = False,
-        include_hidden: bool = True,
-        max_results: int | None = 50,
-    ) -> ListFilesResult:
-        """Find files or directories by one or more virtual path/name substrings."""
-        terms, _multiple = _search_terms(query=query, queries=queries)
-        if max_results is not None and max_results < 1:
-            raise ValueError("max_results must be >= 1")
-
-        term_matches = [
-            _collect_path_matches_for_term(
-                term=term,
-                path=path,
-                include_directories=include_directories,
-                include_hidden=include_hidden,
-                filesystem_validator=filesystem_validator,
-            )
-            for term in terms
-        ]
-        if match_mode == "all":
-            matching_paths = (
-                set.intersection(*term_matches) if term_matches else set()
-            )
-        else:
-            matching_paths = set().union(*term_matches)
-
-        files = sorted(matching_paths)
-        if max_results is not None:
-            files = files[:max_results]
-        return ListFilesResult(files=files, count=len(files))
-
-    @toolset.tool(
-        description=(
-            "Search readable text files for a regular expression. "
-            f"{read_path_hint} "
-            "Use query for one regex, or queries for several literal terms "
+            "Use query for one name substring or full-text regex, or queries for "
+            "several literal terms "
             "with match_mode='any' or 'all'. For match_mode='all', every term "
-            "must occur somewhere in the same file. Use file_pattern to limit "
-            "files, e.g. '**/*.py'. This searches file contents only, not "
-            "filenames; use find_paths or list_files for path/name lookup."
+            "must match the same path or occur somewhere in the same file. "
+            "file_pattern and max_matches_per_file apply to full-text search."
         )
     )
     async def grep_files(
@@ -1056,12 +1052,13 @@ def make_filesystem_toolset(
         queries: list[str] | None = None,
         match_mode: Literal["any", "all"] = "any",
         path: str = "/",
+        full_text: bool = False,
         file_pattern: str = "**/*",
-        case_sensitive: bool = True,
+        case_sensitive: bool = False,
         max_matches: int = DEFAULT_MAX_GREP_MATCHES,
         max_matches_per_file: int = DEFAULT_MAX_GREP_MATCHES_PER_FILE,
     ) -> GrepResult:
-        """Search text files for one regex or several literal terms."""
+        """Search names/paths by default or file contents when requested."""
         terms, literal_terms = _search_terms(query=query, queries=queries)
         if max_matches < 1:
             raise ValueError(f"max_matches must be >= 1, got {max_matches}")
@@ -1069,6 +1066,43 @@ def make_filesystem_toolset(
             raise ValueError(
                 "max_matches_per_file must be >= 1, "
                 f"got {max_matches_per_file}"
+            )
+
+        if not full_text:
+            term_matches = [
+                _collect_path_matches_for_term(
+                    term=term,
+                    path=path,
+                    include_directories=False,
+                    include_hidden=True,
+                    filesystem_validator=filesystem_validator,
+                )
+                for term in terms
+            ]
+            if match_mode == "all":
+                matching_paths = (
+                    set.intersection(*term_matches) if term_matches else set()
+                )
+            else:
+                matching_paths = set().union(*term_matches)
+            paths = sorted(matching_paths)
+            truncated = len(paths) > max_matches
+            paths = paths[:max_matches]
+            return GrepResult(
+                matches=[
+                    GrepMatch(
+                        path=matched_path,
+                        line=None,
+                        column=None,
+                        text=matched_path,
+                    )
+                    for matched_path in paths
+                ],
+                count=len(paths),
+                truncated=truncated,
+                search_mode="name",
+                files_searched=0,
+                files_skipped=[],
             )
 
         flags = 0 if case_sensitive else re.IGNORECASE
@@ -1154,13 +1188,14 @@ def make_filesystem_toolset(
 
             if match_mode == "all" and not all(matched_terms):
                 continue
-            for match in file_matches:
-                matches.append(match)
+            for grep_match in file_matches:
+                matches.append(grep_match)
                 if len(matches) >= max_matches:
                     return GrepResult(
                         matches=matches,
                         count=len(matches),
                         truncated=True,
+                        search_mode="content",
                         files_searched=files_searched,
                         files_skipped=files_skipped,
                     )
@@ -1169,6 +1204,7 @@ def make_filesystem_toolset(
             matches=matches,
             count=len(matches),
             truncated=matches_omitted,
+            search_mode="content",
             files_searched=files_searched,
             files_skipped=files_skipped,
         )

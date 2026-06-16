@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import List
 
-from agents.runtime.specialist_result import SpecialistResult
+from agents.runtime.contracts import SpecialistResult
 
 from .contracts import WebAgentResult, WebPreviewDecision, dedupe
 

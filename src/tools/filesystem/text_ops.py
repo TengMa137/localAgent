@@ -79,8 +79,7 @@ def read_text_with_policy(
     except UnicodeDecodeError as e:
         raise ValidationError(
             f"Cannot read '{virtual_path}': file appears to be binary or not {encoding} encoded.\n"
-            "This tool only reads text files. Use read_image for supported images "
-            "or stat_path/list_directory for binary metadata."
+            "Use read_file to inspect metadata or supported image content."
         ) from e
 
     return text, target
@@ -139,8 +138,7 @@ def edit_unique_replace_with_policy(
     except UnicodeDecodeError as e:
         raise ValidationError(
             f"Cannot edit '{virtual_path}': file appears to be binary or not {encoding} encoded.\n"
-            "This tool only edits text files. Use read_image for supported images "
-            "or stat_path/list_directory for binary metadata."
+            "This tool only edits text files. Use read_file to inspect the path."
         ) from e
 
     count = content.count(old_text)

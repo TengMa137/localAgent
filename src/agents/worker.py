@@ -11,7 +11,7 @@ from pydantic_ai.usage import UsageLimits
 
 from .runtime.context import model, _now
 from .runtime.query_policy import TaskKind
-from .runtime.turn_context import EvidenceItem
+from .runtime.contracts import EvidenceItem
 from .fs_agent import run_fs_task
 from .web_agent import run_web_task
 
@@ -113,7 +113,7 @@ def _build_specialist_objective(task: TaskSpec) -> str:
 
 
 def _task_sources(task: TaskSpec) -> list[str]:
-    if task.kind == TaskKind.LOCAL_RAG:
+    if task.kind == TaskKind.LOCAL_FILES:
         return task.relevant_files
     return task.urls
 
@@ -123,7 +123,7 @@ async def _run_specialist_task(task: TaskSpec) -> tuple[str, str]:
         raise ValueError("TaskSpec.kind is required before worker execution")
 
     objective = _build_specialist_objective(task)
-    if task.kind == TaskKind.LOCAL_RAG:
+    if task.kind == TaskKind.LOCAL_FILES:
         return "fs_agent", await run_fs_task(objective)
     return "web_agent", await run_web_task(objective)
 
@@ -170,7 +170,7 @@ def _handoff_note_value(result: str, label: str) -> str:
 
 
 def _handoff_sources(result: str, fallback: list[str]) -> list[str]:
-    sources = []
+    sources: list[str] = []
     for value in _handoff_note_values(result, "Sources"):
         sources.extend(part.strip() for part in value.split(",") if part.strip())
     return list(dict.fromkeys([*sources, *fallback]))

@@ -28,7 +28,7 @@ async def test_local_worker_delegates_to_fs_agent(monkeypatch):
 
     result = await _run_worker(
         TaskSpec(
-            kind=TaskKind.LOCAL_RAG,
+            kind=TaskKind.LOCAL_FILES,
             objective="Read the config",
             query="config setting",
             relevant_files=["/repo/config.md"],
@@ -41,7 +41,7 @@ async def test_local_worker_delegates_to_fs_agent(monkeypatch):
     assert result["answer"] == "fs result"
     assert result["useful"] is True
     assert result["cited_node_ids"] == ["/repo/config.md"]
-    assert "Task kind: local_rag" in calls[0]
+    assert "Task kind: local_files" in calls[0]
     assert "/repo/config.md" in calls[0]
 
 
@@ -162,7 +162,7 @@ async def test_worker_drops_file_not_found_from_synthesis_findings(monkeypatch):
 
     result = await _run_worker(
         TaskSpec(
-            kind=TaskKind.LOCAL_RAG,
+            kind=TaskKind.LOCAL_FILES,
             objective="Read missing file",
             relevant_files=["/docs/missing.md"],
         )

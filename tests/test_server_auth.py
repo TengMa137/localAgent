@@ -701,7 +701,7 @@ def test_voice_input_uses_provider_language_when_client_omits_field(
     assert captured["language"] == "Swedish"
 
 
-def test_image_upload_context_tells_agent_to_use_read_image(monkeypatch, tmp_path):
+def test_image_upload_context_tells_agent_to_use_read_file(monkeypatch, tmp_path):
     server = _load_server(monkeypatch, tmp_path)
     captured = {}
 
@@ -755,12 +755,12 @@ def test_image_upload_context_tells_agent_to_use_read_image(monkeypatch, tmp_pat
         assert response.status_code == 200
 
     assert "screenshot.png [image, image/png" in captured["prompt"]
-    assert "(image; use read_image to inspect visual content)" in captured["prompt"]
+    assert "(image; use read_file to inspect visual content)" in captured["prompt"]
     assert (
-        "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_image."
+        "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_file."
         in captured["prompt"]
     )
-    assert "call read_image for supported image paths" in captured["prompt"]
+    assert "call read_file for supported image paths" in captured["prompt"]
 
 
 def test_pdf_upload_context_tells_agent_to_use_rag(monkeypatch, tmp_path):
@@ -889,7 +889,7 @@ def test_web_agent_session_uses_per_user_memory_dir(monkeypatch, tmp_path):
     assert agent_session.memory_dir == server.STATE_DIR / "memory" / "1"
 
 
-def test_unsupported_image_upload_context_is_not_routed_to_read_image(
+def test_unsupported_image_upload_context_uses_metadata_only_read(
     monkeypatch, tmp_path
 ):
     server = _load_server(monkeypatch, tmp_path)
@@ -945,7 +945,7 @@ def test_unsupported_image_upload_context_is_not_routed_to_read_image(
         assert response.status_code == 200
 
     assert "photo.heic [binary, image/heic" in captured["prompt"]
-    assert "(unsupported image for read_image; stored binary)" in captured["prompt"]
+    assert "(unsupported image; read_file returns metadata only)" in captured["prompt"]
     assert "photo.heic [image, image/heic" not in captured["prompt"]
 
 

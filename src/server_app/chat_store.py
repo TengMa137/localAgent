@@ -338,10 +338,10 @@ def prompt_with_session_context(user_text: str, uploads: list[str]) -> str:
         f"{upload_lines}\n"
         "Text/code uploads can be read with filesystem and RAG tools. "
         "PDF uploads are document files and must be inspected through RAG, not read_file. "
-        "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_image. "
-        "Other binary uploads are stored files only. "
-        "Do not call read_file, read_lines, or grep_files on image or binary paths; "
-        "call read_image for supported image paths, or use stat_path/list_directory for metadata."
+        "Supported PNG/JPEG/GIF/WebP uploads can be inspected with read_file. "
+        "Other binary uploads return metadata only from read_file. "
+        "Do not call read_lines or grep_files on image or binary paths; "
+        "call read_file for supported image paths or binary metadata."
     )
 
 
@@ -358,10 +358,10 @@ def _format_upload_context(row: sqlite3.Row) -> str:
             "not read_file/read_lines/grep_files)"
         )
     if kind == "image":
-        return f"{details} (image; use read_image to inspect visual content)"
+        return f"{details} (image; use read_file to inspect visual content)"
     if content_type.startswith("image/"):
-        return f"{details} (unsupported image for read_image; stored binary)"
-    return f"{details} (stored binary; do not read with read_file/read_lines/grep_files)"
+        return f"{details} (unsupported image; read_file returns metadata only)"
+    return f"{details} (stored binary; read_file returns metadata only)"
 
 
 def _normalized_upload_content_type(filename: str, content_type: str | None) -> str:

@@ -31,37 +31,49 @@ See [AGENT_SYSTEM.md](AGENT_SYSTEM.md) for the prompt chain and agent-system dia
 
 Current implementation highlights:
 
-- Validator-backed filesystem tools now cover text reads, image reads, line reads, grep, stat,
-  shallow/deep listing, directory creation, copy/move/delete, and single-file search/replace.
+- Validator-backed filesystem tools expose unified reads, recursive tree
+  listing, name/content grep, line reads, directory creation, copy/move/delete,
+  and single-file search/replace.
 - Filesystem writes can use local CLI approval via PydanticAI deferred-tool approval.
 - The orchestrator cannot call specialist agents as tools; it returns one typed
   semantic route decision, and Python executes the selected runner.
 - The orchestrator performs semantic routing only and never scans validator
-  roots. Ambiguous local references are delegated to `fs_agent`, which owns
-  filename/path listing and content grep.
-- Python applies narrow structural checks after the route decision. Current
-  facts and URLs use `web`; an unsuccessful local-first arXiv identifier lookup
-  can recover to web once.
-- Collection-wide requests such as summarizing all papers or processing files
-  in parallel bypass the route model and go directly to `plan`. Python resolves the collection, groups
-  same-stem Markdown/PDF companions, and distributes every artifact across
-  bounded parallel worker batches. Collection summaries forward grounded
-  worker answers directly without a second synthesis call.
+  roots. Filesystem-routed unknown paths are delegated to `fs_agent`, which
+  owns filename/path and content grep.
+- With the default `LOCALAGENT_USE_REGEX=true`, Python applies narrow structural
+  checks after the route decision. Start a request with `/fs`, `/web`, or
+  `/plan` (or `fs:`, `web:`, `plan:`) to force a route. Current facts, URLs,
+  and bare arXiv identifiers use `web`; concrete local paths and known local
+  filenames use `fs`.
+- Set `LOCALAGENT_USE_REGEX=false` to A/B test model-owned orchestrator routing.
+  This disables query-policy prompt hints, preflight routes, route corrections,
+  and approval-gated web fallback plans without changing validator safety or
+  planner normalization.
+- With deterministic routing enabled, collection-wide requests such as
+  summarizing all papers or processing files in parallel bypass the route model
+  and go directly to `plan`. Python resolves the collection, groups same-stem
+  Markdown/PDF companions, and distributes every artifact across bounded
+  parallel worker batches. Collection summaries forward grounded worker answers
+  directly without a second synthesis call.
 - Filesystem and web specialists return a shared typed internal result with status,
   usefulness, sources, uncertainties, and recovery metadata. String handoffs remain
   available for plan/worker compatibility.
-- A failed local reference lookup can recover to the web exactly once when the
-  original request is externally recoverable. Explicit local paths such as
-  `/docs/missing.md` remain local and do not silently fall back to the internet.
+- When deterministic routing is enabled, a failed vague filesystem lookup does
+  not silently substitute internet evidence. Python returns a proposed fallback
+  plan and waits for `/approve-web-plan`; `/deny-web-plan` stops it. Concrete
+  local misses such as `/docs/missing.md` stay local-only.
 - `fs_agent` owns scoped local path discovery/read/write/edit. Python sends
-  explicit directories, PDFs, and assigned file batches through deterministic
-  RAG before they can fill the model context. A default `read_file` call on one
-  text document over 20,000 characters returns a RAG answer directly.
-  Topic-based local discovery uses `grep_files`,
-  bounded `preview_file` snippets, and then deterministic RAG over the previewed
-  candidates. Topic runs expose grep first and preview second rather than the
-  full filesystem toolset; grep output is capped by match count, per-file count,
-  and excerpt length.
+  PDFs and assigned file batches through deterministic RAG before they can fill
+  the model context. A default `read_file` call on one
+  text document over 20,000 characters returns a RAG answer directly. `read_file`
+  also returns path metadata and a bounded text preview, and automatically emits
+  multimodal bytes for supported PNG, JPEG, GIF, and WebP images. `list_files`
+  returns a recursive tree for an explicit path. `grep_files` searches names and
+  paths by default, accepts multiple keywords, and switches to content search
+  with `full_text=true`. The filesystem prompt directs unknown-path requests
+  through grep first and reserves listing for user- or system-supplied
+  directories. Python enforces task scope and rejects duplicate reads, including
+  repeated `list_files` calls for the same path.
 - `web_agent` validates its query and tool arguments before network access, uses
   bounded search/crawl budgets, and skips crawling when result previews are enough.
 - Dedicated MCP APIs handle weather through Open-Meteo and definitions through
@@ -180,6 +192,7 @@ LOCALAGENT_MODEL_BASE_URL=http://localhost:8080/v1
 LOCALAGENT_MCP_URL=http://localhost:8000/sse
 LOCALAGENT_DOCS_DIR=./user_docs
 LOCALAGENT_SKILLS_DIR=skills
+LOCALAGENT_USE_REGEX=true
 ```
 
 ### 4. Run
@@ -189,6 +202,19 @@ uv run python src/run_agents.py
 ```
 
 Type anything to begin. Enter `exit`, `quit`, or press `Ctrl-C` to quit.
+
+Routing is normally inferred, but you can force a route at the start of a
+message:
+
+```text
+/fs summarize agentsystem.md
+/web recent progress in the Russia-Ukraine war
+/plan compare local notes with current web sources
+```
+
+The `fs:`, `web:`, and `plan:` prefixes are equivalent. If a vague filesystem
+lookup finds nothing useful, the agent proposes a web fallback plan and waits
+for `/approve-web-plan` or `/deny-web-plan`.
 
 ### 5. Run the web app
 
@@ -223,9 +249,9 @@ Admin users can list/create/disable users and view all users' chat history.
 Normal users can only access their own chat sessions.
 
 Web uploads are stored under `LOCALAGENT_DOCS_DIR/web_uploads/`. Text-like files are
-previewed in the chat context. PNG, JPEG, GIF, and WebP uploads are routed to `read_image`;
-other binary or unsupported image formats are described as binary attachments instead of
-being sent to image inspection.
+previewed in the chat context. PNG, JPEG, GIF, and WebP uploads are routed through
+`read_file`, which supplies image bytes to the model automatically. Other binary or
+unsupported image formats return metadata without being sent to image inspection.
 
 For Docker Compose:
 
@@ -541,8 +567,8 @@ runner and performs deterministic RAG handoffs when content is large, multi-file
 or fetched from the web. The current user request is placed before supporting
 context, orchestrator history is bounded, and filesystem read/discovery tools
 reject identical repeat calls in the same run. The orchestrator and planner own
-route selection; Python applies narrow structural checks only for execution
-scope and explicit current/URL requests.
+route selection; Python applies narrow structural checks for explicit route
+triggers, collection work, concrete local targets, and current/URL requests.
 
 ---
 
@@ -566,6 +592,14 @@ tool traces are not replayed as model history.
 The orchestrator never receives filesystem, web, RAG, or specialist toolsets. Its
 model-facing schema contains only `route` and `content`. Python maps `content` to either a
 direct reply or a specialist objective, assigns the route budget, and executes the route.
+
+Explicit route triggers are start-anchored and stripped before execution:
+`/fs` or `fs:` for filesystem, `/web` or `web:` for web, and `/plan` or
+`plan:` for the planner. Without an explicit web trigger, concrete local
+targets take filesystem priority. If an fs route has no useful result and the
+user did not name a concrete local target, Python returns a pending web fallback
+plan instead of running web silently. Reply `/approve-web-plan` to execute that
+plan or `/deny-web-plan` to stop.
 
 For `plan`, the flow is:
 
@@ -595,7 +629,7 @@ Toolsets are attached to specialists, not to the orchestrator.
 
 | Toolset | Used by | Contract |
 |---|---|---|
-| Filesystem | `fs_agent` | Validator-backed reads, image reads, grep, listing, stat, edits, writes, copy/move/delete |
+| Filesystem | `fs_agent` | Unified reads, name/content grep, recursive tree listing, edits, writes, copy/move/delete |
 | Web/MCP | `web_agent` | Search and URL crawl through the MCP web server |
 | Skills | `plan_agent` prompt and explicit skill tasks in `fs_agent` | Compact catalog for loose skill discovery; exact skill targets receive only the editing policy |
 | RAG | fs/web Python helpers; standalone tested tools | Normal routes call deterministic RAG helpers. `rag_toolset` exists for retrieval tooling/tests, not orchestrator use |
@@ -619,9 +653,10 @@ Long-term memory is separate from skills and chat transcripts. CLI memory lives 
 always overrides stored memory.
 
 The web toolset ingests crawled pages into `rag_service`; fs/web then use
-deterministic RAG over selected local paths or crawled URLs when direct reads/snippets are not
-enough. For local topic searches, lexical grep finds candidates, bounded opening-sentence
-previews establish relevance, and the selected preview paths become the RAG document scope.
+deterministic RAG over selected local paths or crawled URLs when direct
+reads/snippets are not enough. For local topic searches, `grep_files` finds
+candidates and `read_file` inspects the strongest matches. Python can promote
+selected candidates into deterministic RAG when deeper retrieval is needed.
 
 ---
 

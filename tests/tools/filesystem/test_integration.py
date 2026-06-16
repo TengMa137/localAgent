@@ -40,7 +40,7 @@ class TestFilesystemToolsetIntegration:
 
     @pytest.mark.asyncio
     async def test_agent_can_call_list_files(self, tmp_path):
-        """Agent can successfully invoke filesystem.list_files."""
+        """Agent can successfully invoke the recursive filesystem tree."""
         root = tmp_path / "files"
         root.mkdir()
         (root / "a.txt").write_text("hello")
@@ -57,12 +57,18 @@ class TestFilesystemToolsetIntegration:
         validator = FilesystemValidator(config)
         toolset = make_filesystem_toolset(filesystem_validator=validator)
 
+        class ListFilesTestModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "list_files":
+                    return {"path": "/files"}
+                return super().gen_tool_args(tool_def)
+
         agent = Agent(
-            model=TestModel(call_tools=["list_files"]),
+            model=ListFilesTestModel(call_tools=["list_files"]),
             toolsets=[toolset],
         )
 
-        result = await agent.run("List all files")
+        result = await agent.run("List all files under /files")
 
         # TestModel returns structured tool output
         assert result is not None

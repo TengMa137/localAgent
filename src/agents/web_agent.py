@@ -56,7 +56,7 @@ from .runtime.context import (
 )
 from .runtime.query_policy import extract_arxiv_ids, extract_urls
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
-from .runtime.specialist_result import SpecialistResult
+from .runtime.contracts import SpecialistResult
 from .web.contracts import (
     WebAgentResult,
     WebPreviewDecision,

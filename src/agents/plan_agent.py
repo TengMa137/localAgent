@@ -26,7 +26,7 @@ from .runtime.query_policy import (
 
 from .observability import _rt
 from .structured_retry import observable_run_with_manual_validation_retries
-from .runtime.turn_context import EvidenceItem
+from .runtime.contracts import EvidenceItem
 from tools.filesystem.text_ops import read_text_with_policy
 
 MAX_TASKS_PER_PLAN = 5
@@ -86,7 +86,7 @@ Rule 2 — File objectives: preview first, then decide honestly.
   Python has already resolved exact readable paths where possible. Do not infer
   local-file intent from keywords; use the orchestrator objective and resolved
   paths. If the objective explicitly asks filesystem work but no path resolved,
-  create one local_rag task with empty relevant_files so fs_agent can validate,
+  create one local_files task with empty relevant_files so fs_agent can validate,
   grep, and list accessible roots.
   Set initial_answer ONLY if ALL of these are true:
     a) The preview contains a complete, direct answer (not just related content)
@@ -107,7 +107,7 @@ Each task must be:
   - Self-contained: worker has everything it needs in the task spec
   - Specific: include exact search terms, date ranges, URLs, or file paths
   - Scoped: one clear information need per task, not "research X generally"
-  - Routed: set kind to one of local_rag, web_search, url_crawl
+  - Routed: set kind to one of local_files, web_search, url_crawl
 
 Good task examples:
   ✓ "Find the abstract and contributions of arXiv paper 2401.12345"
@@ -125,7 +125,7 @@ Bad task examples:
 - If the user prompt includes a stricter execution budget, obey the stricter
   task and iteration budget.
 - Assign relevant_files per task using the resolved paths provided
-- Use kind=local_rag for local file tasks
+- Use kind=local_files for local file tasks
 - Use kind=web_search for current or web lookup tasks
 - Use kind=url_crawl for user-provided URLs
 - Use kind=web_search for external arXiv paper lookup
@@ -485,7 +485,7 @@ class PlanNormalizer:
         kind = self._task_kind(raw_task, files)
         if kind is None:
             return None
-        if kind == TaskKind.LOCAL_RAG and not files:
+        if kind == TaskKind.LOCAL_FILES and not files:
             files = _dedupe([*self.matched_files, *self.objective_files])
         urls = raw_task.urls
         if kind == TaskKind.URL_CRAWL and not urls:
@@ -506,7 +506,7 @@ class PlanNormalizer:
     def _task_kind(self, raw_task: TaskSpec, files: list[str]) -> TaskKind | None:
         """Choose the retrieval route after file resolution."""
         if files:
-            return TaskKind.LOCAL_RAG
+            return TaskKind.LOCAL_FILES
         return raw_task.kind or infer_task_kind(raw_task.objective, matched_files=files)
 
     def _required_tasks(self, tasks: list[TaskSpec]) -> list[TaskSpec]:
@@ -516,10 +516,10 @@ class PlanNormalizer:
         if requests_collection_plan(self.objective) and local_files:
             return self._collection_tasks(local_files)
 
-        if local_files and not self._has_kind(tasks, TaskKind.LOCAL_RAG):
+        if local_files and not self._has_kind(tasks, TaskKind.LOCAL_FILES):
             required.append(
                 TaskSpec(
-                    kind=TaskKind.LOCAL_RAG,
+                    kind=TaskKind.LOCAL_FILES,
                     objective=(
                         "Search the provided local files for evidence relevant to: "
                         f"{self.objective}"
@@ -581,7 +581,7 @@ class PlanNormalizer:
 
         return [
             TaskSpec(
-                kind=TaskKind.LOCAL_RAG,
+                kind=TaskKind.LOCAL_FILES,
                 objective=(
                     f"Process collection batch {index + 1} of {len(batches)}. "
                     "Read every assigned file and return a "

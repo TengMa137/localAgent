@@ -10,7 +10,7 @@ from tools.filesystem import FilesystemValidator, FilesystemValidatorConfig, Mou
 
 
 def test_filesystem_write_approval_follows_mount_policy(monkeypatch, tmp_path):
-    from agents.runtime import context
+    from agents.fs.toolset import _needs_write_approval
 
     validator = FilesystemValidator(
         FilesystemValidatorConfig(
@@ -30,14 +30,14 @@ def test_filesystem_write_approval_follows_mount_policy(monkeypatch, tmp_path):
             ]
         )
     )
-    monkeypatch.setattr(context, "validator", validator)
+    needs_approval = _needs_write_approval(validator)
 
-    assert context._fs_needs_approval(
+    assert needs_approval(
         None,
         SimpleNamespace(name="write_file"),
         {"path": "/approved/a.txt"},
     )
-    assert not context._fs_needs_approval(
+    assert not needs_approval(
         None,
         SimpleNamespace(name="write_file"),
         {"path": "/quiet/a.txt"},
@@ -45,7 +45,7 @@ def test_filesystem_write_approval_follows_mount_policy(monkeypatch, tmp_path):
 
 
 def test_filesystem_approval_uses_copy_destination(monkeypatch, tmp_path):
-    from agents.runtime import context
+    from agents.fs.toolset import _needs_write_approval
 
     validator = FilesystemValidator(
         FilesystemValidatorConfig(
@@ -65,9 +65,9 @@ def test_filesystem_approval_uses_copy_destination(monkeypatch, tmp_path):
             ]
         )
     )
-    monkeypatch.setattr(context, "validator", validator)
+    needs_approval = _needs_write_approval(validator)
 
-    assert context._fs_needs_approval(
+    assert needs_approval(
         None,
         SimpleNamespace(name="copy_file"),
         {"source": "/src/a.txt", "destination": "/dst/a.txt"},
@@ -76,9 +76,7 @@ def test_filesystem_approval_uses_copy_destination(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_filesystem_duplicate_read_guard_rejects_same_call():
-    from pydantic_ai.exceptions import ModelRetry
-
-    from agents.runtime.context import DuplicateFilesystemReadGuardToolset
+    from agents.fs.toolset import DuplicateFilesystemRead, FilesystemToolGuard
 
     calls: list[tuple[str, dict]] = []
 
@@ -87,43 +85,43 @@ async def test_filesystem_duplicate_read_guard_rejects_same_call():
             calls.append((name, tool_args))
             return "ok"
 
-    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    guard = FilesystemToolGuard(Wrapped())
     ctx = SimpleNamespace(run_id="run-1", messages=[])
-    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_directory"))
+    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_files"))
 
     assert (
         await guard.call_tool(
-            "list_directory",
+            "list_files",
             {"path": "/skills"},
             ctx,
             list_tool,
         )
         == "ok"
     )
-    with pytest.raises(ModelRetry):
+    with pytest.raises(DuplicateFilesystemRead):
         await guard.call_tool(
-            "list_directory",
+            "list_files",
             {"path": "/skills"},
             ctx,
             list_tool,
         )
-    assert calls == [("list_directory", {"path": "/skills"})]
+    assert calls == [("list_files", {"path": "/skills"})]
 
 
 @pytest.mark.asyncio
 async def test_filesystem_duplicate_read_guard_clears_after_write():
-    from agents.runtime.context import DuplicateFilesystemReadGuardToolset
+    from agents.fs.toolset import FilesystemToolGuard
 
     class Wrapped:
         async def call_tool(self, _name, _tool_args, _ctx, _tool):
             return "ok"
 
-    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    guard = FilesystemToolGuard(Wrapped())
     ctx = SimpleNamespace(run_id="run-1", messages=[])
-    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_directory"))
+    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_files"))
     write_tool = SimpleNamespace(tool_def=SimpleNamespace(name="write_file"))
 
-    await guard.call_tool("list_directory", {"path": "/skills"}, ctx, list_tool)
+    await guard.call_tool("list_files", {"path": "/skills"}, ctx, list_tool)
     await guard.call_tool(
         "write_file",
         {"path": "/skills/a.md", "content": "x"},
@@ -133,7 +131,7 @@ async def test_filesystem_duplicate_read_guard_clears_after_write():
 
     assert (
         await guard.call_tool(
-            "list_directory",
+            "list_files",
             {"path": "/skills"},
             ctx,
             list_tool,
@@ -143,73 +141,206 @@ async def test_filesystem_duplicate_read_guard_clears_after_write():
 
 
 @pytest.mark.asyncio
+async def test_filesystem_guard_exposes_read_file_as_path_only():
+    from pydantic_ai.tools import ToolDefinition
+    from pydantic_ai.toolsets import ToolsetTool
+
+    from agents.fs.toolset import FilesystemToolGuard
+
+    class Wrapped:
+        async def get_tools(self, _ctx):
+            return {
+                "read_file": ToolsetTool(
+                    toolset=self,
+                    tool_def=ToolDefinition(
+                        name="read_file",
+                        description="full read schema",
+                        parameters_json_schema={
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "max_chars": {"type": "integer"},
+                                "detail": {"type": "string"},
+                            },
+                            "required": ["path"],
+                        },
+                    ),
+                    max_retries=1,
+                    args_validator=SimpleNamespace(),
+                )
+            }
+
+    guard = FilesystemToolGuard(Wrapped())
+    tools = await guard.get_tools(SimpleNamespace())
+    schema = tools["read_file"].tool_def.parameters_json_schema
+
+    assert set(schema["properties"]) == {"path"}
+    assert schema["required"] == ["path"]
+    assert schema["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_filesystem_guard_strips_hidden_read_file_args():
+    from agents.fs.toolset import FilesystemToolGuard
+
+    calls: list[dict] = []
+
+    class Wrapped:
+        async def call_tool(self, _name, tool_args, _ctx, _tool):
+            calls.append(dict(tool_args))
+            return "ok"
+
+    guard = FilesystemToolGuard(Wrapped())
+    ctx = SimpleNamespace(run_id="run-read-file-strip", messages=[])
+    read_tool = SimpleNamespace(tool_def=SimpleNamespace(name="read_file"))
+
+    assert (
+        await guard.call_tool(
+            "read_file",
+            {"path": "/docs/a.md", "max_chars": 10, "detail": "high"},
+            ctx,
+            read_tool,
+        )
+        == "ok"
+    )
+
+    assert calls == [{"path": "/docs/a.md"}]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_duplicate_read_guard_keys_read_file_by_path():
+    from agents.fs.toolset import DuplicateFilesystemRead, FilesystemToolGuard
+
+    calls: list[dict] = []
+
+    class Wrapped:
+        async def call_tool(self, _name, tool_args, _ctx, _tool):
+            calls.append(dict(tool_args))
+            return "ok"
+
+    guard = FilesystemToolGuard(Wrapped())
+    ctx = SimpleNamespace(run_id="run-read-file-once", messages=[])
+    read_tool = SimpleNamespace(tool_def=SimpleNamespace(name="read_file"))
+
+    await guard.call_tool(
+        "read_file",
+        {"path": "/docs/a.md", "max_chars": 10},
+        ctx,
+        read_tool,
+    )
+    with pytest.raises(DuplicateFilesystemRead, match="Repeated read_file"):
+        await guard.call_tool(
+            "read_file",
+            {"path": "/docs/a.md", "max_chars": 20},
+            ctx,
+            read_tool,
+        )
+
+    assert calls == [{"path": "/docs/a.md"}]
+
+
+@pytest.mark.asyncio
 async def test_filesystem_guard_converts_read_discovery_error_to_model_retry():
     from pydantic_ai.exceptions import ModelRetry
 
-    from agents.runtime.context import DuplicateFilesystemReadGuardToolset
+    from agents.fs.toolset import FilesystemToolGuard
 
     class Wrapped:
         async def call_tool(self, _name, _tool_args, _ctx, _tool):
             raise ValueError("outside validator boundaries")
 
-    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    guard = FilesystemToolGuard(Wrapped())
     ctx = SimpleNamespace(run_id="run-1", messages=[])
-    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_directory"))
+    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_files"))
 
-    with pytest.raises(ModelRetry, match="stop tool use"):
-        await guard.call_tool("list_directory", {"path": ".skills"}, ctx, list_tool)
+    with pytest.raises(ModelRetry, match="local file was not found"):
+        await guard.call_tool("list_files", {"path": ".skills"}, ctx, list_tool)
 
 
 @pytest.mark.asyncio
-async def test_filesystem_guard_stops_repeated_empty_discovery():
-    from pydantic_ai.exceptions import ModelRetry
+async def test_fs_agent_restarts_fresh_after_duplicate_tool_call(monkeypatch):
+    from agents import fs_agent
+    from agents.fs import toolset as fs_toolset
+    from agents.fs.toolset import DuplicateFilesystemRead
 
-    from agents.runtime.context import (
-        DuplicateFilesystemReadGuardToolset,
-        MAX_EMPTY_DISCOVERY_CALLS,
+    prompts: list[str] = []
+
+    async def fake_observable_run(_agent, prompt, **kwargs):
+        prompts.append(prompt)
+        assert kwargs.get("message_history") is None
+        if len(prompts) == 1:
+            state = fs_toolset._run_state.get()
+            assert state is not None
+            state.successful_calls.append(("read_file", {"path": "/docs/a.md"}))
+            state.tool_results.append(
+                (
+                    "read_file",
+                    {"path": "/docs/a.md"},
+                    '{"content":"The file says hello."}',
+                )
+            )
+            raise DuplicateFilesystemRead("read_file", {"path": "/docs/a.md"})
+        return SimpleNamespace(output="Answered from compact prior evidence.")
+
+    monkeypatch.setattr(fs_agent, "observable_run", fake_observable_run)
+
+    answer, calls = await fs_agent._run_fs_agent(
+        "Mode: discovery\n\nObjective: read a.md",
+        question="read a.md",
+        task_roots=["/docs"],
     )
 
+    assert answer == "Answered from compact prior evidence."
+    assert calls == [("read_file", {"path": "/docs/a.md"})]
+    assert len(prompts) == 2
+    assert "Fresh retry after repeated filesystem tool call" in prompts[1]
+    assert "The file says hello." in prompts[1]
+    assert "Do not repeat the same tool call" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_duplicate_guard_lists_each_path_once():
+    from agents.fs.toolset import DuplicateFilesystemRead, FilesystemToolGuard
+
+    calls: list[dict] = []
+
     class Wrapped:
-        async def call_tool(self, _name, _tool_args, _ctx, _tool):
+        async def call_tool(self, _name, tool_args, _ctx, _tool):
+            calls.append(dict(tool_args))
             return SimpleNamespace(count=0)
 
-    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
-    ctx = SimpleNamespace(run_id="run-1", messages=[])
-    grep_tool = SimpleNamespace(tool_def=SimpleNamespace(name="grep_files"))
+    guard = FilesystemToolGuard(Wrapped())
+    ctx = SimpleNamespace(run_id="run-list-once", messages=[])
+    list_tool = SimpleNamespace(tool_def=SimpleNamespace(name="list_files"))
 
-    for idx in range(MAX_EMPTY_DISCOVERY_CALLS - 1):
-        assert (
-            await guard.call_tool(
-                "grep_files",
-                {"path": "/docs", "query": f"missing-{idx}"},
-                ctx,
-                grep_tool,
-            )
-        ).count == 0
-
-    with pytest.raises(ModelRetry, match="Multiple discovery searches"):
+    await guard.call_tool(
+        "list_files",
+        {"path": "/docs", "max_depth": 1},
+        ctx,
+        list_tool,
+    )
+    with pytest.raises(DuplicateFilesystemRead, match="Repeated list_files"):
         await guard.call_tool(
-            "grep_files",
-            {"path": "/docs", "query": "missing-final"},
+            "list_files",
+            {"path": "/docs", "max_depth": 4},
             ctx,
-            grep_tool,
+            list_tool,
         )
+
+    assert calls == [{"path": "/docs", "max_depth": 1}]
 
 
 @pytest.mark.asyncio
 async def test_filesystem_task_scope_rejects_unrelated_mount_reads():
     from pydantic_ai.exceptions import ModelRetry
 
-    from agents.runtime.context import (
-        DuplicateFilesystemReadGuardToolset,
-        filesystem_run_scope,
-    )
+    from agents.fs.toolset import FilesystemToolGuard, filesystem_run_scope
 
     class Wrapped:
         async def call_tool(self, _name, _tool_args, _ctx, _tool):
             raise AssertionError("out-of-scope call must not reach filesystem")
 
-    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    guard = FilesystemToolGuard(Wrapped())
     ctx = SimpleNamespace(run_id="run-scoped-read", messages=[])
     read_tool = SimpleNamespace(tool_def=SimpleNamespace(name="read_file"))
 
@@ -224,38 +355,31 @@ async def test_filesystem_task_scope_rejects_unrelated_mount_reads():
 
 
 @pytest.mark.asyncio
-async def test_filesystem_discovery_scope_rejects_full_candidate_reads():
-    from pydantic_ai.exceptions import ModelRetry
-
-    from agents.runtime.context import (
-        DuplicateFilesystemReadGuardToolset,
-        filesystem_run_scope,
-    )
+async def test_filesystem_grep_defaults_to_single_task_scope():
+    from agents.fs.toolset import FilesystemToolGuard, filesystem_run_scope
 
     class Wrapped:
-        async def call_tool(self, _name, _tool_args, _ctx, _tool):
-            raise AssertionError("full candidate read must not reach filesystem")
+        async def call_tool(self, _name, tool_args, _ctx, _tool):
+            return dict(tool_args)
 
-    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
-    ctx = SimpleNamespace(run_id="run-preview-only", messages=[])
-    read_tool = SimpleNamespace(tool_def=SimpleNamespace(name="read_file"))
+    guard = FilesystemToolGuard(Wrapped())
+    ctx = SimpleNamespace(run_id="run-scoped-grep", messages=[])
+    grep_tool = SimpleNamespace(tool_def=SimpleNamespace(name="grep_files"))
 
-    with filesystem_run_scope(["/docs"], discovery_preview_only=True):
-        with pytest.raises(ModelRetry, match="preview_file"):
-            await guard.call_tool(
-                "read_file",
-                {"path": "/docs/papers/world-model.md"},
-                ctx,
-                read_tool,
-            )
+    with filesystem_run_scope(["/docs"]):
+        result = await guard.call_tool(
+            "grep_files",
+            {"query": "architecture"},
+            ctx,
+            grep_tool,
+        )
+
+    assert result["path"] == "/docs"
 
 
 @pytest.mark.asyncio
-async def test_filesystem_topic_discovery_exposes_only_grep_and_preview():
-    from agents.runtime.context import (
-        DuplicateFilesystemReadGuardToolset,
-        filesystem_run_scope,
-    )
+async def test_filesystem_guard_does_not_filter_available_tools():
+    from agents.fs.toolset import FilesystemToolGuard, filesystem_run_scope
 
     class Wrapped:
         async def get_tools(self, _ctx):
@@ -263,50 +387,22 @@ async def test_filesystem_topic_discovery_exposes_only_grep_and_preview():
                 name: SimpleNamespace(tool_def=SimpleNamespace(name=name))
                 for name in (
                     "grep_files",
-                    "preview_file",
-                    "find_paths",
-                    "list_directory",
+                    "list_files",
                     "read_file",
+                    "read_lines",
                 )
             }
 
         async def call_tool(self, _name, tool_args, _ctx, _tool):
             return dict(tool_args)
 
-    guard = DuplicateFilesystemReadGuardToolset(Wrapped())
+    guard = FilesystemToolGuard(Wrapped())
     ctx = SimpleNamespace(run_id="run-topic-tools", messages=[])
-    grep_tool = SimpleNamespace(tool_def=SimpleNamespace(name="grep_files"))
 
-    with filesystem_run_scope(
-        ["/docs"],
-        discovery_preview_only=True,
-        discovery_search_paths=["/docs/papers/arxiv"],
-    ) as run_state:
-        initial_tools = await guard.get_tools(ctx)
-        result = await guard.call_tool(
-            "grep_files",
-            {"query": "world model", "max_matches": 100},
-            ctx,
-            grep_tool,
-        )
-        next_tools = await guard.get_tools(ctx)
+    with filesystem_run_scope(["/docs"]):
+        tools = await guard.get_tools(ctx)
 
-    assert set(initial_tools) == {"grep_files"}
-    assert set(next_tools) == {"preview_file"}
-    assert run_state.successful_calls == [
-        (
-            "grep_files",
-            {
-                "query": "world model",
-                "max_matches": 12,
-                "path": "/docs/papers/arxiv",
-                "case_sensitive": False,
-            },
-        )
-    ]
-    assert result["path"] == "/docs/papers/arxiv"
-    assert result["case_sensitive"] is False
-    assert result["max_matches"] == 12
+    assert set(tools) == {"grep_files", "list_files", "read_file", "read_lines"}
 
 
 @pytest.mark.asyncio
@@ -337,11 +433,15 @@ async def test_filesystem_task_scope_rejects_copy_from_unrelated_mount(
         async def call_tool(self, _name, _tool_args, _ctx, _tool):
             raise AssertionError("out-of-scope copy must not reach filesystem")
 
-    guard = context.DuplicateFilesystemReadGuardToolset(Wrapped())
+    from agents.fs.toolset import FilesystemToolGuard
+
+    guard = FilesystemToolGuard(Wrapped(), validator=context.validator)
     ctx = SimpleNamespace(run_id="run-scoped-copy", messages=[])
     copy_tool = SimpleNamespace(tool_def=SimpleNamespace(name="copy_file"))
 
-    with context.filesystem_run_scope(["/skills"]):
+    from agents.fs.toolset import filesystem_run_scope
+
+    with filesystem_run_scope(["/skills"]):
         with pytest.raises(ModelRetry, match="outside this task's read scope"):
             await guard.call_tool(
                 "copy_file",
@@ -355,10 +455,11 @@ async def test_filesystem_task_scope_rejects_copy_from_unrelated_mount(
 
 
 def test_default_skills_mount_is_writable_with_approval():
+    from agents.fs.toolset import _needs_write_approval
     from agents.runtime import context
 
     assert context.validator.can_write("/skills/new-skill.md")
-    assert context._fs_needs_approval(
+    assert _needs_write_approval(context.validator)(
         None,
         SimpleNamespace(name="write_file"),
         {"path": "/skills/new-skill.md"},
@@ -427,9 +528,10 @@ def test_fs_system_prompt_keeps_only_model_owned_instructions():
     from agents.fs.prompts import FS_SYSTEM_PROMPT
 
     assert len(FS_SYSTEM_PROMPT) < 1800
-    assert "topic_discovery" in FS_SYSTEM_PROMPT
-    assert "grep_files first, then preview_file" in FS_SYSTEM_PROMPT
-    assert "Do not call find_paths" in FS_SYSTEM_PROMPT
+    assert "discovery: call grep_files first" in FS_SYSTEM_PROMPT
+    assert "full_text=true for a subject" in FS_SYSTEM_PROMPT
+    assert "preview_only=true" not in FS_SYSTEM_PROMPT
+    assert "Use list_files only" in FS_SYSTEM_PROMPT
     assert "Return only the practical user-facing answer" in FS_SYSTEM_PROMPT
     assert "Python preflight" not in FS_SYSTEM_PROMPT
     assert "validator" not in FS_SYSTEM_PROMPT
@@ -456,7 +558,7 @@ def test_fs_task_prompt_includes_path_facts_and_write_targets(monkeypatch):
     assert analysis.write_targets == []
     assert "Invalid path hints" in prompt
     assert "Missing-path chain:" in prompt
-    assert "find_paths on the task scope (/skills)" in prompt
+    assert "grep_files on the task scope (/skills)" in prompt
     assert "Readable file index" not in prompt
 
     prompt, analysis = fs_agent._fs_task_prompt(
@@ -484,7 +586,7 @@ def test_fs_task_prompt_excludes_skills_for_ordinary_docs(monkeypatch):
     )
     monkeypatch.setattr(
         fs_agent,
-        "scan_skills_context",
+        "_scan_skills_context",
         lambda: (_ for _ in ()).throw(
             AssertionError("ordinary docs task must not scan skills")
         ),
@@ -498,16 +600,14 @@ def test_fs_task_prompt_excludes_skills_for_ordinary_docs(monkeypatch):
     assert "Scope: /docs" in prompt
     assert "/skills" not in prompt
     assert "strategy.md" not in prompt
-    task_roots = fs_agent._task_read_roots(
-        "check the local papers related to world models",
-        analysis,
+    assert (
+        fs_agent._preemptive_rag_paths(
+            "check the local papers related to world models",
+            analysis,
+        )
+        == []
     )
-    assert fs_agent._preemptive_rag_paths(
-        "check the local papers related to world models",
-        analysis,
-        task_roots,
-    ) == []
-    assert "Mode: topic_discovery" in prompt
+    assert "Mode: discovery" in prompt
     assert "Search path: /docs" in prompt
 
 
@@ -527,12 +627,11 @@ def test_fs_task_prompt_requires_model_tool_discovery_for_ambiguous_artifact(
     )
 
     assert analysis.all_path_hints() == []
-    assert "Mode: topic_discovery" in prompt
+    assert "Mode: discovery" in prompt
     assert "Search path: /docs" in prompt
-    assert "web recovery is allowed" in prompt
 
 
-def test_fs_task_prompt_allows_web_recovery_for_local_paper_lookup(monkeypatch):
+def test_fs_task_prompt_uses_discovery_for_local_paper_lookup(monkeypatch):
     from agents import fs_agent
 
     monkeypatch.setattr(
@@ -545,12 +644,11 @@ def test_fs_task_prompt_allows_web_recovery_for_local_paper_lookup(monkeypatch):
         "check local papers regarding recent world model research"
     )
 
-    assert "Mode: topic_discovery" in prompt
+    assert "Mode: discovery" in prompt
     assert "Search path: /docs" in prompt
-    assert "web recovery is allowed" in prompt
 
 
-def test_fs_topic_lookup_inside_explicit_directory_still_uses_lexical_triage(
+def test_fs_lookup_inside_explicit_directory_uses_exact_path_mode(
     monkeypatch,
     tmp_path,
 ):
@@ -572,18 +670,16 @@ def test_fs_topic_lookup_inside_explicit_directory_still_uses_lexical_triage(
 
     objective = "check papers related to world models under /docs/arxiv"
     prompt, analysis = fs_agent._fs_task_prompt(objective)
-    task_roots = fs_agent._task_read_roots(objective, analysis)
-
     assert analysis.resolved_paths == ["/docs/papers/arxiv"]
     assert analysis.invalid_paths == []
-    assert "Mode: topic_discovery" in prompt
-    assert "Search path: /docs/papers/arxiv" in prompt
-    assert fs_agent._requires_lexical_triage(objective, analysis) is True
-    assert fs_agent._preemptive_rag_paths(
-        objective,
-        analysis,
-        task_roots,
-    ) == []
+    assert "Mode: exact_path" in prompt
+    assert (
+        fs_agent._preemptive_rag_paths(
+            objective,
+            analysis,
+        )
+        == []
+    )
 
 
 def test_fs_non_paper_prompt_keeps_all_docs_in_scope(monkeypatch, tmp_path):
@@ -611,14 +707,16 @@ def test_fs_non_paper_prompt_keeps_all_docs_in_scope(monkeypatch, tmp_path):
     )
 
     assert task_roots == ["/docs"]
-    assert "Mode: topic_discovery" in prompt
+    assert "Mode: discovery" in prompt
     assert "Search path: /docs" in prompt
     assert "Readable file index" not in prompt
-    assert fs_agent._preemptive_rag_paths(
-        "find the local authentication documentation and summarize it",
-        analysis,
-        task_roots,
-    ) == []
+    assert (
+        fs_agent._preemptive_rag_paths(
+            "find the local authentication documentation and summarize it",
+            analysis,
+        )
+        == []
+    )
 
 
 def test_fs_task_prompt_includes_skill_policy_for_loose_skill_write():
@@ -725,7 +823,9 @@ def test_web_response_keeps_full_findings_out_of_tool_return():
         summary="Short web summary.",
         search_queries=["example query"],
         urls=["https://example.com"],
-        findings=["large crawled/RAG finding that should stay out of the compact handoff"],
+        findings=[
+            "large crawled/RAG finding that should stay out of the compact handoff"
+        ],
     )
 
     formatted = _format_orchestrator_response(result)
@@ -734,7 +834,10 @@ def test_web_response_keeps_full_findings_out_of_tool_return():
     assert "Current answer for the user." in formatted
     assert "Summary: Short web summary." in formatted
     assert "Detailed findings: 1 item(s)" in formatted
-    assert "large crawled/RAG finding that should stay out of the compact handoff" not in formatted
+    assert (
+        "large crawled/RAG finding that should stay out of the compact handoff"
+        not in formatted
+    )
 
 
 def test_web_query_guidance_includes_time_sensitive_semantic_guidance():
@@ -743,10 +846,7 @@ def test_web_query_guidance_includes_time_sensitive_semantic_guidance():
     guidance = _web_query_guidance("What's today's gold price?")
 
     assert "Current date/time:" in guidance
-    assert (
-        "Choose the web search query semantically from the objective"
-        in guidance
-    )
+    assert "Choose the web search query semantically from the objective" in guidance
     assert "avoid adding a bare year" in guidance
 
 
@@ -779,9 +879,7 @@ def test_save_arxiv_markdown_documents_writes_under_docs(tmp_path):
             Document(
                 doc_id="paper-1",
                 source="https://arxiv.org/html/2602.10094v2",
-                title=(
-                    "arxiv.org — 4RC: 4D Reconstruction via Conditional Querying"
-                ),
+                title=("arxiv.org — 4RC: 4D Reconstruction via Conditional Querying"),
                 text=(
                     "# 4RC: 4D Reconstruction via Conditional Querying\n\n"
                     "Full crawled paper content."
@@ -806,18 +904,88 @@ def test_orchestrator_prompt_explicitly_routes_current_lookup_to_web():
     from agents.orchestrator_agent import _orchestrator_prompt_body
 
     prompt = _orchestrator_prompt_body()
+    normalized = " ".join(prompt.split())
 
-    assert "If the user explicitly asks you to search" in prompt
-    assert "Live market prices" in prompt
-    assert "changing facts are web tasks" in prompt
-    assert "paper discovery" in prompt
-    assert "assistant message explicitly saved under" in prompt
-    assert "/docs path" in prompt
-    assert "fetch/download/save the paper locally" in prompt
-    assert "source-ownership test" in prompt
-    assert "one dedicated external API lookup" in prompt
-    assert "web specialist chooses its" in prompt
-    assert "Do not choose plan merely because one web lookup" in prompt
+    assert "Decision procedure:" in prompt
+    assert "Identify the required source of truth" in prompt
+    assert "current or externally verified information" in normalized
+    assert "A URL or bare arXiv identifier is external" in prompt
+    assert "Resolve references from visible history" in prompt
+    assert "Do not infer a source from topic words alone" in normalized
+    assert "Use plan only when" in prompt
+
+
+def test_orchestrator_use_regex_false_disables_policy_overrides(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import (
+        OrchestratorDecision,
+        _guardrail_orchestrator_decision,
+        _orchestrator_model_prompt,
+        _preflight_orchestrator_decision,
+    )
+
+    monkeypatch.setattr(orchestrator_agent, "_use_regex", lambda: False)
+    recent_prompt = "fetch me recent language model research"
+    decision = OrchestratorDecision(
+        route="fs",
+        objective="Check local notes for language model research",
+    )
+
+    assert _orchestrator_model_prompt(recent_prompt) == recent_prompt
+    assert _guardrail_orchestrator_decision(recent_prompt, decision) == decision
+    assert (
+        _preflight_orchestrator_decision("summarize all papers under /docs/papers")
+        is None
+    )
+
+
+def test_orchestrator_use_regex_false_disables_fs_web_recovery(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import _should_recover_fs_result_with_web
+    from agents.runtime.contracts import SpecialistResult
+
+    monkeypatch.setattr(orchestrator_agent, "_use_regex", lambda: False)
+
+    assert not _should_recover_fs_result_with_web(
+        original_prompt="fetch recent language model research",
+        objective="Check local notes first",
+        fs_result=SpecialistResult(
+            agent="fs_agent",
+            status="not_found",
+            useful=False,
+            recoverable_by_web=True,
+            answer="No local notes found.",
+            summary="Recent external research may be needed.",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "route", "objective"),
+    [
+        ("/fs summarize the paper", "fs", "summarize the paper"),
+        (
+            "web: recent progress in the Russia-Ukraine war",
+            "web",
+            "recent progress in the Russia-Ukraine war",
+        ),
+        (
+            "plan: compare local notes with current web sources",
+            "plan",
+            "compare local notes with current web sources",
+        ),
+    ],
+)
+def test_orchestrator_preflight_honors_explicit_route_triggers(
+    prompt, route, objective
+):
+    from agents.orchestrator_agent import _preflight_orchestrator_decision
+
+    decision = _preflight_orchestrator_decision(prompt)
+
+    assert decision is not None
+    assert decision.route == route
+    assert decision.objective == objective
 
 
 @pytest.mark.parametrize(
@@ -906,8 +1074,7 @@ def test_orchestrator_guardrail_prefers_explicit_filename_over_discourse_now():
     )
 
     prompt = (
-        "ok, now check agentsystem.md and tell me how to build a robust "
-        "agent system"
+        "ok, now check agentsystem.md and tell me how to build a robust agent system"
     )
     corrected = _guardrail_orchestrator_decision(
         prompt,
@@ -944,7 +1111,7 @@ def test_orchestrator_guardrail_does_not_turn_discourse_now_into_web():
     )
 
 
-def test_orchestrator_guardrail_routes_ambiguous_artifact_local_first():
+def test_orchestrator_guardrail_leaves_ambiguous_artifact_to_model():
     from agents.orchestrator_agent import (
         OrchestratorDecision,
         _guardrail_orchestrator_decision,
@@ -960,9 +1127,9 @@ def test_orchestrator_guardrail_routes_ambiguous_artifact_local_first():
         ),
     )
 
-    assert corrected.route == "fs"
-    assert corrected.objective == prompt
-    assert "Try fs discovery first" in _orchestrator_model_prompt(prompt)
+    assert corrected.route == "web"
+    assert corrected.objective == "Search online for the paper"
+    assert _orchestrator_model_prompt(prompt) == prompt
 
 
 @pytest.mark.parametrize(
@@ -1017,14 +1184,14 @@ def test_orchestrator_guardrail_preserves_exact_collection_request():
     assert corrected.objective == prompt
 
 
-def test_orchestrator_guardrail_routes_local_paper_lookup_fs_first():
+def test_orchestrator_guardrail_routes_fs_trigger_first():
     from agents.orchestrator_agent import (
         OrchestratorDecision,
         _guardrail_orchestrator_decision,
         _orchestrator_model_prompt,
     )
 
-    prompt = "check local papers regarding recent world model research"
+    prompt = "/fs check local papers regarding recent world model research"
     corrected = _guardrail_orchestrator_decision(
         prompt,
         OrchestratorDecision(
@@ -1034,9 +1201,11 @@ def test_orchestrator_guardrail_routes_local_paper_lookup_fs_first():
     )
 
     assert corrected.route == "fs"
-    assert corrected.objective == prompt
-    assert "Search local files first" in _orchestrator_model_prompt(prompt)
-    assert "recover with web search" in _orchestrator_model_prompt(prompt)
+    assert (
+        corrected.objective
+        == "check local papers regarding recent world model research"
+    )
+    assert _orchestrator_model_prompt(prompt) == prompt
 
 
 def test_orchestrator_explicit_web_intent_overrides_filename_hint():
@@ -1180,9 +1349,7 @@ async def test_run_web_task_preflights_query_before_search(monkeypatch):
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
         if output_name == "WebSourceDecision":
-            return SimpleNamespace(
-                output=web_agent.WebSourceDecision(kind="open_web")
-            )
+            return SimpleNamespace(output=web_agent.WebSourceDecision(kind="open_web"))
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -1270,9 +1437,7 @@ async def test_run_web_task_skips_crawl_when_preview_is_enough(monkeypatch):
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
         if output_name == "WebSourceDecision":
-            return SimpleNamespace(
-                output=web_agent.WebSourceDecision(kind="open_web")
-            )
+            return SimpleNamespace(output=web_agent.WebSourceDecision(kind="open_web"))
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -1280,9 +1445,7 @@ async def test_run_web_task_skips_crawl_when_preview_is_enough(monkeypatch):
                     as_of="Thursday, 04 June 2026, 21:40 UTC",
                     search_result_limit=3,
                     crawl_url_limit=0,
-                    checks=[
-                        "Tomorrow means Friday, 05 June 2026 for Lund, Sweden."
-                    ],
+                    checks=["Tomorrow means Friday, 05 June 2026 for Lund, Sweden."],
                 )
             )
         if output_name == "WebPreviewDecision":
@@ -1303,9 +1466,7 @@ async def test_run_web_task_skips_crawl_when_preview_is_enough(monkeypatch):
             {
                 "title": "Lund weather forecast",
                 "url": "https://weather.example/lund",
-                "snippet": (
-                    "Friday, June 5: passing showers with breaks of sun late."
-                ),
+                "snippet": ("Friday, June 5: passing showers with breaks of sun late."),
                 "position": 1,
             }
         ]
@@ -1348,9 +1509,7 @@ async def test_run_web_task_uses_source_domain_queries(monkeypatch):
     async def fake_model_run(_agent, _prompt, *, output_name, **_kwargs):
         events.append(("model", output_name))
         if output_name == "WebSourceDecision":
-            return SimpleNamespace(
-                output=web_agent.WebSourceDecision(kind="open_web")
-            )
+            return SimpleNamespace(output=web_agent.WebSourceDecision(kind="open_web"))
         if output_name == "WebQueryPlan":
             return SimpleNamespace(
                 output=web_agent.WebQueryPlan(
@@ -1698,7 +1857,9 @@ async def test_recent_news_uses_web_search_directly(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_web_task_normalizes_weather_location_without_model_retry(monkeypatch):
+async def test_run_web_task_normalizes_weather_location_without_model_retry(
+    monkeypatch,
+):
     from agents import web_agent
 
     events: list[tuple[str, str]] = []
@@ -1750,7 +1911,6 @@ async def test_run_web_task_normalizes_weather_location_without_model_retry(monk
 
     assert "lookup succeeded" in result
     assert ("weather", "Lund, Sweden:2026-06-06") in events
-
 
 
 @pytest.mark.asyncio
@@ -1808,9 +1968,7 @@ async def test_run_web_task_searches_arxiv_through_generic_web_flow(monkeypatch)
     monkeypatch.setattr(web_agent, "web_search_results", fake_web_search)
     monkeypatch.setattr(web_agent, "web_crawl_and_ingest", fail_crawl)
 
-    result = await web_agent.run_web_task(
-        "search arXiv for diffusion language models"
-    )
+    result = await web_agent.run_web_task("search arXiv for diffusion language models")
 
     assert "Large Language Diffusion Models is relevant." in result
     assert ("web_search", "site:arxiv.org diffusion language models") in events
@@ -1875,7 +2033,7 @@ async def test_scholarly_fetch_grounds_query_and_crawls_returned_paper(monkeypat
                 "url": "https://arxiv.org/abs/2507.21045",
                 "snippet": "A unified 4D reconstruction and tracking model.",
                 "position": 1,
-            }
+            },
         ]
 
     async def fake_crawl(
@@ -1921,9 +2079,7 @@ async def test_scholarly_fetch_grounds_query_and_crawls_returned_paper(monkeypat
     monkeypatch.setattr(
         web_agent,
         "_save_arxiv_documents",
-        lambda documents: (
-            ["/docs/papers/arxiv/2602.10094.md"] if documents else []
-        ),
+        lambda documents: (["/docs/papers/arxiv/2602.10094.md"] if documents else []),
     )
 
     result = await web_agent.run_web_task(
@@ -1985,9 +2141,7 @@ async def test_direct_arxiv_fetch_falls_back_and_saves_locally(monkeypatch):
     monkeypatch.setattr(
         web_agent,
         "_save_arxiv_documents",
-        lambda documents: (
-            ["/docs/papers/arxiv/2602.10094.md"] if documents else []
-        ),
+        lambda documents: (["/docs/papers/arxiv/2602.10094.md"] if documents else []),
     )
 
     result = await web_agent.run_web_task(
@@ -2013,16 +2167,20 @@ def test_current_turn_prompt_prioritizes_user_request():
 
 
 def test_recent_orchestrator_history_is_bounded():
-    from run_agents import MAX_ORCHESTRATOR_HISTORY_MESSAGES, _recent_orchestrator_history
+    from run_agents import (
+        MAX_ORCHESTRATOR_HISTORY_MESSAGES,
+        _recent_orchestrator_history,
+    )
 
     messages = [
         ModelRequest.user_text_prompt(f"message {idx}")
         for idx in range(MAX_ORCHESTRATOR_HISTORY_MESSAGES + 3)
     ]
 
-    assert _recent_orchestrator_history(messages) == messages[
-        -MAX_ORCHESTRATOR_HISTORY_MESSAGES:
-    ]
+    assert (
+        _recent_orchestrator_history(messages)
+        == messages[-MAX_ORCHESTRATOR_HISTORY_MESSAGES:]
+    )
 
 
 def test_clean_text_answer_trims_small_model_self_review():
@@ -2124,11 +2282,7 @@ def test_recent_orchestrator_history_is_compact_by_characters():
                     wrapper + f"user {index} " + ("u" * 2500)
                 ),
                 ModelResponse(
-                    parts=[
-                        TextPart(
-                            content=f"assistant {index} " + ("a" * 3500)
-                        )
-                    ]
+                    parts=[TextPart(content=f"assistant {index} " + ("a" * 3500))]
                 ),
             ]
         )
@@ -2234,9 +2388,7 @@ def test_orchestrator_drops_invented_fs_mount_path():
         prompt,
         OrchestratorChoice(
             route="fs",
-            content=(
-                "I will read local papers under /skills and summarize them."
-            ),
+            content=("I will read local papers under /skills and summarize them."),
         ),
     )
 
@@ -2249,12 +2401,14 @@ def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LOCALAGENT_MEMORY_ENABLED", raising=False)
     monkeypatch.delenv("LOCALAGENT_SKILLS_MODE", raising=False)
+    monkeypatch.delenv("LOCALAGENT_USE_REGEX", raising=False)
 
     (tmp_path / ".env").write_text(
         "\n".join(
             [
                 "LOCALAGENT_MEMORY_ENABLED=false",
                 "LOCALAGENT_SKILLS_MODE=RO",
+                "LOCALAGENT_USE_REGEX=false",
             ]
         ),
         encoding="utf-8",
@@ -2265,6 +2419,7 @@ def test_agent_runtime_settings_read_dotenv(monkeypatch, tmp_path):
 
     assert settings.memory_enabled is False
     assert settings.skills_mode == "ro"
+    assert settings.use_regex is False
     get_runtime_settings.cache_clear()
 
 
@@ -2331,16 +2486,15 @@ def test_orchestrator_prompt_declares_fast_specialist_routes():
     prompt = _orchestrator_prompt_body()
     normalized = " ".join(prompt.split())
 
-    assert "Prefer making progress:" in prompt
-    assert "Choose direct when" in prompt
-    assert "Choose fs for one narrow filesystem task" in prompt
-    assert "Choose web for one narrow current/web task" in prompt
-    assert "Choose plan when" in prompt
+    assert "Decision procedure:" in prompt
+    assert "Use direct when" in prompt
+    assert "Use fs when" in prompt
+    assert "Use web when" in prompt
+    assert "Use plan only when" in prompt
     assert "There is no clarify route" in prompt
-    assert "Classify by the information source and missing user intent" in prompt
-    assert "Stable conceptual" in prompt
-    assert "not by topic keywords" in normalized
-    assert "not executing the route" in prompt
+    assert "required source of truth" in prompt
+    assert "Do not infer a source from topic words alone" in normalized
+    assert "routing capabilities" in prompt
     assert "Return only route and content." in prompt
     assert "machine learning" not in prompt.lower()
     assert "direct|clarify" not in prompt
@@ -2363,7 +2517,7 @@ async def test_orchestrator_direct_decision_returns_reply():
 async def test_orchestrator_fs_decision_forwards_specialist_answer(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[str] = []
 
@@ -2395,7 +2549,7 @@ async def test_orchestrator_fs_decision_forwards_specialist_answer(monkeypatch):
 async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorChoice, run_orchestrator_turn
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[str] = []
 
@@ -2448,7 +2602,7 @@ async def test_orchestrator_turn_guardrail_prevents_recent_research_fs_run(monke
 async def test_orchestrator_turn_keeps_paper_followup_on_fs(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorChoice, run_orchestrator_turn
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     events: list[str] = []
 
@@ -2500,7 +2654,7 @@ async def test_orchestrator_turn_keeps_paper_followup_on_fs(monkeypatch):
 async def test_orchestrator_turn_keeps_relative_docs_request_on_fs(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorChoice, run_orchestrator_turn
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[str] = []
 
@@ -2543,12 +2697,12 @@ async def test_orchestrator_turn_keeps_relative_docs_request_on_fs(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_recovers_fs_not_found_with_web_for_recent_research(
+async def test_orchestrator_offers_web_plan_after_fs_not_found(
     monkeypatch,
 ):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[tuple[str, str]] = []
 
@@ -2564,17 +2718,7 @@ async def test_orchestrator_recovers_fs_not_found_with_web_for_recent_research(
             uncertainties=["No matching local docs were found."],
         )
 
-    async def fake_web_task(objective: str) -> SpecialistResult:
-        calls.append(("web", objective))
-        return SpecialistResult(
-            agent="web_agent",
-            answer="Recent language model research recovered from web.",
-            summary="Recovered externally.",
-            sources=["https://arxiv.org/abs/2605.06548"],
-        )
-
     monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
-    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
 
     response, messages = await _response_and_messages(
         OrchestratorDecision(
@@ -2585,18 +2729,84 @@ async def test_orchestrator_recovers_fs_not_found_with_web_for_recent_research(
         original_prompt="fetch me recent language model research",
     )
 
-    assert response.reply == "Recent language model research recovered from web."
+    assert "Proposed fallback plan" in response.reply
+    assert "Reply `/approve-web-plan`" in response.reply
+    assert "localagent:pending-web-plan" in response.reply
     assert messages == []
-    assert calls[0] == ("fs", "Provide recent language model research overview")
-    assert calls[1][0] == "web"
-    assert "Local filesystem lookup failed" in calls[1][1]
+    assert calls == [("fs", "Provide recent language model research overview")]
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_recovers_ambiguous_local_lookup_with_web(monkeypatch):
+async def test_orchestrator_executes_approved_pending_web_plan(monkeypatch):
+    from pydantic_ai.messages import ModelResponse, TextPart
+
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import (
+        _format_web_plan_approval_request,
+        run_orchestrator_turn,
+    )
+    from agents.runtime.contracts import SpecialistResult
+
+    pending_reply = _format_web_plan_approval_request(
+        original_prompt="summarize the paper",
+        objective="summarize the paper",
+        fs_result=SpecialistResult(
+            agent="fs_agent",
+            status="not_found",
+            useful=False,
+            recoverable_by_web=True,
+            answer="I could not find a relevant local paper.",
+            summary="No useful local paper matched.",
+        ),
+    )
+    calls: list[str] = []
+
+    async def fake_plan_workflow(objective: str, **_kwargs):
+        calls.append(objective)
+        return (
+            "Forwardable answer:\n"
+            "Approved web plan answer.\n\n"
+            "Orchestrator notes:\n"
+            "- internal"
+        )
+
+    monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fake_plan_workflow)
+
+    result = await run_orchestrator_turn(
+        "/approve-web-plan",
+        message_history=[ModelResponse(parts=[TextPart(content=pending_reply)])],
+    )
+
+    assert result.decision.route == "plan"
+    assert result.output.reply == "Approved web plan answer."
+    assert len(calls) == 1
+    assert "Run exactly one web_search task" in calls[0]
+    assert "summarize the paper" in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_denies_pending_web_plan_without_execution(monkeypatch):
+    from agents import orchestrator_agent
+    from agents.orchestrator_agent import run_orchestrator_turn
+
+    async def fail_plan_workflow(*_args, **_kwargs):
+        raise AssertionError("denied web plan must not execute")
+
+    monkeypatch.setattr(orchestrator_agent, "_run_plan_workflow", fail_plan_workflow)
+
+    result = await run_orchestrator_turn("/deny-web-plan")
+
+    assert result.decision.route == "direct"
+    assert result.output.reply == "Stopped. No web fallback plan was executed."
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_offers_web_plan_after_ambiguous_local_miss(
+    monkeypatch,
+):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[tuple[str, str]] = []
 
@@ -2611,16 +2821,7 @@ async def test_orchestrator_recovers_ambiguous_local_lookup_with_web(monkeypatch
             summary="No useful local paper matched.",
         )
 
-    async def fake_web_task(objective: str) -> SpecialistResult:
-        calls.append(("web", objective))
-        return SpecialistResult(
-            agent="web_agent",
-            answer="The paper was recovered from the web.",
-            summary="Found external source.",
-        )
-
     monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
-    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
 
     response, _messages = await _response_and_messages(
         OrchestratorDecision(
@@ -2631,17 +2832,19 @@ async def test_orchestrator_recovers_ambiguous_local_lookup_with_web(monkeypatch
         original_prompt="summarize the paper and explain its architecture",
     )
 
-    assert response.reply == "The paper was recovered from the web."
-    assert [kind for kind, _objective in calls] == ["fs", "web"]
+    assert "I could not find a relevant local paper." in response.reply
+    assert "Proposed fallback plan" in response.reply
+    assert "Reply `/approve-web-plan`" in response.reply
+    assert [kind for kind, _objective in calls] == ["fs"]
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_recovers_local_paper_search_with_web(
+async def test_orchestrator_offers_web_plan_after_natural_local_language_miss(
     monkeypatch,
 ):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[tuple[str, str]] = []
 
@@ -2656,16 +2859,7 @@ async def test_orchestrator_recovers_local_paper_search_with_web(
             summary="No matching local papers.",
         )
 
-    async def fake_web_task(objective: str) -> SpecialistResult:
-        calls.append(("web", objective))
-        return SpecialistResult(
-            agent="web_agent",
-            answer="Recovered matching papers from the web.",
-            summary="External paper recovery completed.",
-        )
-
     monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
-    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
 
     response, _messages = await _response_and_messages(
         OrchestratorDecision(
@@ -2676,15 +2870,16 @@ async def test_orchestrator_recovers_local_paper_search_with_web(
         original_prompt="check local papers regarding recent world model research",
     )
 
-    assert response.reply == "Recovered matching papers from the web."
-    assert [kind for kind, _objective in calls] == ["fs", "web"]
+    assert "I could not find matching local papers." in response.reply
+    assert "Proposed fallback plan" in response.reply
+    assert [kind for kind, _objective in calls] == ["fs"]
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_does_not_recover_explicit_docs_miss_with_web(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[str] = []
 
@@ -2718,10 +2913,10 @@ async def test_orchestrator_does_not_recover_explicit_docs_miss_with_web(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_recovers_inferred_local_match_with_web(monkeypatch):
+async def test_orchestrator_offers_plan_for_inferred_local_match_miss(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[tuple[str, str]] = []
 
@@ -2736,16 +2931,7 @@ async def test_orchestrator_recovers_inferred_local_match_with_web(monkeypatch):
             summary="Local arXiv paper not found.",
         )
 
-    async def fake_web_task(objective: str) -> SpecialistResult:
-        calls.append(("web", objective))
-        return SpecialistResult(
-            agent="web_agent",
-            answer="Recovered the paper from arXiv.",
-            summary="Fetched external paper.",
-        )
-
     monkeypatch.setattr(orchestrator_agent, "_run_fs_task_result", fake_fs_task)
-    monkeypatch.setattr(orchestrator_agent, "_run_web_task_result", fake_web_task)
 
     response, _messages = await _response_and_messages(
         OrchestratorDecision(
@@ -2756,15 +2942,16 @@ async def test_orchestrator_recovers_inferred_local_match_with_web(monkeypatch):
         original_prompt="what about 2605.00080v1?",
     )
 
-    assert response.reply == "Recovered the paper from arXiv."
-    assert [kind for kind, _objective in calls] == ["fs", "web"]
+    assert "The inferred local paper path was unavailable." in response.reply
+    assert "Proposed fallback plan" in response.reply
+    assert [kind for kind, _objective in calls] == ["fs"]
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_web_decision_forwards_specialist_answer(monkeypatch):
     from agents import orchestrator_agent
     from agents.orchestrator_agent import OrchestratorDecision, _response_and_messages
-    from agents.runtime.specialist_result import SpecialistResult
+    from agents.runtime.contracts import SpecialistResult
 
     calls: list[str] = []
 
@@ -3339,9 +3526,9 @@ def test_new_session_uses_unique_history_stem(monkeypatch, tmp_path):
 
 
 def test_skills_context_includes_current_skill_paths():
-    from agents.runtime.skills_context import scan_skills_context
+    from agents.fs_agent import _scan_skills_context
 
-    context = scan_skills_context()
+    context = _scan_skills_context()
 
     assert "Current /skills catalog" in context
     assert "fitness/diet.md" in context
@@ -3365,12 +3552,14 @@ def test_fs_task_prompt_routes_missing_file_to_recovery(monkeypatch, tmp_path):
 
     assert analysis.invalid_paths == ["/docs/not-present.md"]
     assert "Missing-path chain:" in prompt
-    assert "find_paths on the task scope (/docs)" in prompt
-    assert "-> grep_files if content can identify the file" in prompt
+    assert "grep_files on the task scope (/docs)" in prompt
+    assert "with full_text=true if content must identify the file" in prompt
     assert "Ask for confirmation before edits" in prompt
 
 
-def test_fs_task_prompt_includes_candidate_paths_for_confirmation(monkeypatch, tmp_path):
+def test_fs_task_prompt_includes_candidate_paths_for_confirmation(
+    monkeypatch, tmp_path
+):
     from agents import fs_agent
 
     docs = tmp_path / "docs"
@@ -3441,7 +3630,7 @@ def test_fs_task_prompt_tells_agent_to_use_resolved_paths_first(monkeypatch, tmp
 
     assert analysis.resolved_paths == ["/docs/actual.md"]
     assert "Mode: exact_path" in prompt
-    assert "find_paths" not in prompt
+    assert "Missing-path chain:" not in prompt
 
 
 def test_fs_path_recovery_guard_allows_read_only_candidate_answer(
@@ -3604,16 +3793,12 @@ async def test_fs_ambiguous_local_paper_uses_filesystem_discovery(
         *,
         question,
         task_roots,
-        discovery_preview_only=False,
-        discovery_search_paths=None,
     ):
         prompts.append(prompt)
         assert question == (
             "check the papers locally related to world model, and summarize it"
         )
         assert task_roots == ["/docs"]
-        assert discovery_preview_only is True
-        assert discovery_search_paths == ["/docs"]
         return (
             "The World Model Survey is the strongest lexical candidate.",
             [
@@ -3622,7 +3807,7 @@ async def test_fs_ambiguous_local_paper_uses_filesystem_discovery(
                     {"query": "world model", "path": "/docs"},
                 ),
                 (
-                    "preview_file",
+                    "read_file",
                     {"path": "/docs/papers/arxiv/world-model.md"},
                 ),
             ],
@@ -3641,7 +3826,7 @@ async def test_fs_ambiguous_local_paper_uses_filesystem_discovery(
     assert "/docs/papers/arxiv/world-model.md" in result.sources
     assert retrieved_paths == ["/docs/papers/arxiv/world-model.md"]
     assert len(prompts) == 1
-    assert "Mode: topic_discovery" in prompts[0]
+    assert "Mode: discovery" in prompts[0]
     assert "Search path: /docs" in prompts[0]
 
 
@@ -3686,14 +3871,10 @@ async def test_fs_non_paper_docs_use_filesystem_instead_of_papers_rag(
         *,
         question,
         task_roots,
-        discovery_preview_only=False,
-        discovery_search_paths=None,
     ):
         assert question == "summarize the local agent system documentation"
         assert task_roots == ["/docs"]
-        assert discovery_preview_only is True
-        assert discovery_search_paths == ["/docs"]
-        assert "Mode: topic_discovery" in prompt
+        assert "Mode: discovery" in prompt
         assert "Search path: /docs" in prompt
         assert "Readable file index" not in prompt
         return (
@@ -3704,7 +3885,7 @@ async def test_fs_non_paper_docs_use_filesystem_instead_of_papers_rag(
                     {"query": "agent system", "path": "/docs"},
                 ),
                 (
-                    "preview_file",
+                    "read_file",
                     {"path": "/docs/agentsystem.md"},
                 ),
             ],
@@ -3737,9 +3918,7 @@ def test_fs_result_metadata_is_assembled_from_tool_calls():
     )
 
     assert output.paths == ["/skills/research/strategy.md"]
-    assert output.changes_made == [
-        "edit_file: /skills/research/strategy.md"
-    ]
+    assert output.changes_made == ["edit_file: /skills/research/strategy.md"]
 
 
 def test_fs_path_recovery_guard_requires_confirmation_without_candidate_read():
@@ -3838,6 +4017,22 @@ def test_fs_usage_limit_error_is_not_reported_as_file_access_problem():
     assert "file access problem" not in message
 
 
+def test_fs_tool_retry_exhaustion_is_reported_as_tool_loop_guard():
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    from agents.fs_agent import _format_exception_report, _fs_exception_result
+
+    exc = UnexpectedModelBehavior("Tool 'read_file' exceeded max retries count of 1")
+    message = _format_exception_report("read local files", exc)
+    result = _fs_exception_result("read local files", exc)
+
+    assert "retry budget was exhausted" in message
+    assert "tool-loop guardrail" in message
+    assert "file permission diagnosis" in message
+    assert result.status == "tool_error"
+    assert result.recoverable_by_web is True
+
+
 def test_fs_context_limit_error_is_not_reported_as_path_problem():
     from agents.fs_agent import _format_exception_report
 
@@ -3867,9 +4062,7 @@ def test_fs_small_pdf_is_always_selected_for_rag(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(fs_agent, "validator", validator)
 
-    assert fs_agent._paths_that_need_rag(["/docs/paper.pdf"]) == [
-        "/docs/paper.pdf"
-    ]
+    assert fs_agent._paths_that_need_rag(["/docs/paper.pdf"]) == ["/docs/paper.pdf"]
 
 
 def test_fs_large_text_is_left_to_read_file_rag_branch(monkeypatch, tmp_path):
@@ -3912,7 +4105,7 @@ def test_fs_plan_worker_rag_uses_only_assigned_files(monkeypatch, tmp_path):
             "Plan worker task:",
             "Original user prompt: Summarize all assigned local papers.",
             "Task objective: Process collection batch 1 of 2.",
-            "Task kind: local_rag",
+            "Task kind: local_files",
             "Query: Summarize every assigned local paper.",
             "Relevant local files:",
             "- /docs/papers/arxiv/a.md",
@@ -3928,7 +4121,7 @@ def test_fs_plan_worker_rag_uses_only_assigned_files(monkeypatch, tmp_path):
         ]
     )
 
-    assert fs_agent._preemptive_rag_paths(objective, analysis, ["/docs"]) == [
+    assert fs_agent._preemptive_rag_paths(objective, analysis) == [
         "/docs/papers/arxiv/a.md",
         "/docs/papers/arxiv/b.md",
     ]

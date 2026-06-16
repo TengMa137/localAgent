@@ -27,6 +27,7 @@ class AgentRuntimeSettings(LocalAgentSettings):
     mcp_url: str = "http://localhost:8000/sse"
     memory_dir: Path = Path(".memory")
     memory_enabled: bool = True
+    use_regex: bool = True
     structured_output_attempts: int = 3
     structured_output_max_tokens: int = 2048
     answer_output_max_tokens: int = 4096

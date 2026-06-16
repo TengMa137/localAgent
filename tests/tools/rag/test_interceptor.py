@@ -326,6 +326,8 @@ class TestIngest:
         receipt = await _ingest(mock_rag, docs)
         assert "Ingested 2 document(s)" in receipt
         assert receipt.count('"') >= 2  # titles are quoted
+        assert "https://a.com" in receipt
+        assert "https://b.com" in receipt
         assert "runtime's retrieval step" in receipt
 
     @pytest.mark.asyncio

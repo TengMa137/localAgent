@@ -13,11 +13,10 @@ run:
   explicit skill requests;
 * use a scoped file index for path preflight and inject only actionable path facts;
 * enforce write approval, duplicate-read guards, and tool-call limits;
-* send explicit directories, PDFs, and assigned multi-file batches to RAG
-  before they can expand the model context;
+* send PDFs and assigned multi-file batches to RAG before they can expand the
+  model context;
 * let read_file answer single large text documents through RAG by default;
-* make topic-based discovery use lexical search and bounded candidate previews,
-  then send previewed candidates through RAG even when the files are small;
+* guide unknown-path discovery through grep and read_file;
 * prevent unconfirmed replacement paths from being treated as edit targets;
 * derive executed paths and changes from successful Python tool calls;
 * normalize failures and the text answer into one ``SpecialistResult``.
@@ -33,26 +32,20 @@ import re
 from typing import Any
 
 from pydantic_ai import Agent
-from pydantic_ai.exceptions import UsageLimitExceeded
+from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import UsageLimits
 
 from .observability import _rt, observable_run
 from .runtime.context import (
-    filesystem_run_scope,
     fs_toolset,
     model,
+    refresh_skills,
     validator,
 )
+from .fs.toolset import DuplicateFilesystemRead, filesystem_run_scope
 from .runtime.rag_helpers import format_rag_evidence, rag_search_documents
-from .runtime.query_policy import (
-    ambiguously_references_local_artifact,
-    requests_local_discovery,
-    requests_paper_lookup,
-    requests_topic_file_discovery,
-)
-from .runtime.specialist_result import SpecialistResult
-from .runtime.skills_context import scan_skills_context
+from .runtime.contracts import SpecialistResult
 from .structured_retry import answer_model_settings, clean_text_answer
 from .fs.contracts import FsAgentResult, PathAnalysis
 from .fs.path_policy import PathPreflight as ValidatorPathPreflight
@@ -191,12 +184,8 @@ def _task_read_roots(objective: str, analysis: PathAnalysis) -> list[str]:
 def _preemptive_rag_paths(
     objective: str,
     analysis: PathAnalysis,
-    task_roots: list[str],
 ) -> list[str]:
     """Select known non-text or multi-file inputs before model tool use."""
-    if _requires_lexical_triage(objective, analysis):
-        return []
-
     assigned_paths = _plan_worker_relevant_files(objective)
     if assigned_paths:
         resolved = set(analysis.resolved_paths)
@@ -234,9 +223,7 @@ def _paths_that_need_rag(paths: list[str]) -> list[str]:
             _, resolved, _ = validator.get_path_config(path, op="read")
         except Exception:
             continue
-        if resolved.is_dir():
-            selected.append(path)
-        elif resolved.is_file() and resolved.suffix.casefold() == ".pdf":
+        if resolved.is_file() and resolved.suffix.casefold() == ".pdf":
             selected.append(path)
     return selected
 
@@ -274,15 +261,27 @@ def _skill_editing_policy_context(analysis: PathAnalysis) -> str:
     )
 
 
+def _scan_skills_context() -> str:
+    """Return the current deterministic skill catalog for filesystem prompts."""
+    skills = refresh_skills().strip()
+    if not skills or skills == "No skills available.":
+        return "No skills found under /skills."
+    return (
+        "Current /skills catalog from deterministic scan:\n"
+        f"{skills}\n\n"
+        "Use these exact skill paths when a request mentions skills."
+    )
+
+
 def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
     """Build the fs_agent prompt and path preflight analysis."""
     files = _readable_file_index()
     sanitized_objective, analysis = PathPreflight(files).analyze(objective)
-    _promote_topic_directory_candidate(objective, analysis)
+    _promote_directory_candidate(analysis)
     task_roots = _task_read_roots(objective, analysis)
     explicit_create_write = bool(EXPLICIT_CREATE_WRITE_RE.search(objective))
     skills_context = (
-        scan_skills_context()
+        _scan_skills_context()
         if (
             _objective_uses_skills(objective, analysis)
             and not analysis.resolved_paths
@@ -296,27 +295,13 @@ def _fs_task_prompt(objective: str) -> tuple[str, PathAnalysis]:
         skills_context=skills_context,
         skill_policy=_skill_editing_policy_context(analysis),
         task_roots=task_roots,
-        local_discovery_required=requests_local_discovery(objective),
-        lexical_triage_required=_requires_lexical_triage(objective, analysis),
-        web_fallback_allowed=(
-            ambiguously_references_local_artifact(objective)
-            or requests_paper_lookup(objective)
-        ),
         explicit_create_write=explicit_create_write,
     )
     return context.render(), analysis
 
 
-def _promote_topic_directory_candidate(
-    objective: str,
-    analysis: PathAnalysis,
-) -> None:
-    """Resolve one fuzzy directory hint before topic-discovery tool use."""
-    if not (
-        requests_local_discovery(objective)
-        or requests_topic_file_discovery(objective)
-    ):
-        return
+def _promote_directory_candidate(analysis: PathAnalysis) -> None:
+    """Promote one exact-name directory correction before tool use."""
     if analysis.resolved_paths or analysis.write_targets:
         return
     if len(analysis.invalid_paths) != 1:
@@ -341,71 +326,91 @@ def _promote_topic_directory_candidate(
     analysis.candidate_paths = []
 
 
-def _lexical_search_paths(
-    analysis: PathAnalysis,
-    task_roots: list[str],
-) -> list[str]:
-    """Return the narrowest validated directories for lexical discovery."""
-    directories: list[str] = []
-    for path in analysis.resolved_paths:
-        try:
-            _, resolved, _ = validator.get_path_config(path, op="read")
-        except Exception:
-            continue
-        if resolved.is_dir():
-            directories.append(path)
-    return _dedupe(directories) or task_roots
-
-
-def _requires_lexical_triage(
-    objective: str,
-    analysis: PathAnalysis,
-) -> bool:
-    """Use search/preview/RAG when relevance must be discovered without a path."""
-    if not (
-        requests_local_discovery(objective)
-        or requests_topic_file_discovery(objective)
-    ):
-        return False
-    if not analysis.all_path_hints():
-        return True
-    if not analysis.resolved_paths or analysis.invalid_paths or analysis.write_targets:
-        return False
-
-    for path in analysis.resolved_paths:
-        try:
-            _, resolved, _ = validator.get_path_config(path, op="read")
-        except Exception:
-            return False
-        if not resolved.is_dir():
-            return False
-    return True
-
-
 async def _run_fs_agent(
     prompt: str,
     *,
     question: str,
     task_roots: list[str],
-    discovery_preview_only: bool = False,
-    discovery_search_paths: list[str] | None = None,
 ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
     """Run one scoped filesystem tool loop with an unstructured text result."""
-    with filesystem_run_scope(
-        task_roots,
-        discovery_preview_only=discovery_preview_only,
-        discovery_search_paths=discovery_search_paths or [],
-    ) as run_state:
-        result = await observable_run(
-            fs_agent,
-            prompt,
-            label="fs_agent",
-            indent=1,
-            usage_limits=UsageLimits(tool_calls_limit=12),
-            metadata={"filesystem_question": question},
-            **answer_model_settings(),
+    attempt_prompt = prompt
+    prior_calls: list[tuple[str, dict[str, Any]]] = []
+    for attempt in range(2):
+        with filesystem_run_scope(task_roots) as run_state:
+            try:
+                result = await observable_run(
+                    fs_agent,
+                    attempt_prompt,
+                    label="fs_agent",
+                    indent=1,
+                    usage_limits=UsageLimits(tool_calls_limit=12),
+                    metadata={"filesystem_question": question},
+                    **answer_model_settings(),
+                )
+            except DuplicateFilesystemRead as exc:
+                prior_calls.extend(run_state.successful_calls)
+                if attempt == 0 and run_state.tool_results:
+                    _rt(
+                        "[fs_agent] repeated filesystem read; restarting "
+                        "with compact prior tool evidence",
+                        "yellow",
+                        1,
+                    )
+                    attempt_prompt = _fresh_fs_retry_prompt(
+                        original_prompt=prompt,
+                        tool_results=run_state.tool_results,
+                        duplicate=exc,
+                    )
+                    continue
+                raise
+        return (
+            clean_text_answer(result.output),
+            [*prior_calls, *run_state.successful_calls],
         )
-    return clean_text_answer(result.output), run_state.successful_calls
+    raise RuntimeError("filesystem agent fresh retry loop exhausted")
+
+
+def _fresh_fs_retry_prompt(
+    *,
+    original_prompt: str,
+    tool_results: list[tuple[str, dict[str, Any], str]],
+    duplicate: DuplicateFilesystemRead,
+) -> str:
+    """Build a clean fs-agent prompt after a repeated tool call abort."""
+    evidence = []
+    for index, (tool_name, args, preview) in enumerate(tool_results, start=1):
+        evidence.append(
+            "\n".join(
+                [
+                    f"TOOL EVIDENCE {index}",
+                    f"tool: {tool_name}",
+                    "args: " + json_dumps(args),
+                    "result:",
+                    preview,
+                ]
+            )
+        )
+    return "\n\n".join(
+        [
+            original_prompt,
+            "Fresh retry after repeated filesystem tool call:",
+            (
+                f"The previous tool loop stopped because {duplicate.tool_name} "
+                "was called again with the same target. Use the compact prior "
+                "tool evidence below. Do not repeat the same tool call with the "
+                "same arguments; answer from this evidence when it is sufficient, "
+                "or use a different path/query only if needed."
+            ),
+            "\n\n".join(evidence),
+        ]
+    )
+
+
+def json_dumps(value: Any) -> str:
+    """Small local JSON helper for prompt-safe diagnostic snippets."""
+    import json
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 async def _retrieve_rag_evidence(
@@ -462,9 +467,7 @@ def _executed_paths(
     paths: list[str] = []
     for tool_name, args in calls:
         if tool_name in {
-            "find_paths",
             "grep_files",
-            "list_directory",
             "list_files",
         }:
             continue
@@ -485,8 +488,29 @@ def _previewed_paths(
     return _dedupe(
         str(args.get("path") or "").strip()
         for tool_name, args in calls
-        if tool_name == "preview_file"
+        if tool_name == "read_file" and args.get("preview_only") is True
     )
+
+
+def _read_file_paths(
+    calls: list[tuple[str, dict[str, Any]]],
+) -> list[str]:
+    """Return files selected by the model with read_file."""
+    return _dedupe(
+        str(args.get("path") or "").strip()
+        for tool_name, args in calls
+        if tool_name == "read_file"
+    )
+
+
+def _post_tool_candidate_rag_paths(
+    calls: list[tuple[str, dict[str, Any]]],
+    analysis: PathAnalysis,
+) -> list[str]:
+    """Return post-tool candidates that should use deterministic RAG."""
+    if analysis.resolved_paths or analysis.write_targets:
+        return _previewed_paths(calls)
+    return _read_file_paths(calls)
 
 
 def _executed_changes(
@@ -720,6 +744,16 @@ def _format_exception_report(objective: str, exc: Exception) -> str:
             "Try a narrower request or provide exact paths, or adjust the filesystem prompt/tool budget."
         )
 
+    if _is_tool_loop_guard(exc):
+        return (
+            "I stopped the filesystem task because the model repeated an invalid "
+            "or rejected filesystem tool call after the retry budget was exhausted.\n\n"
+            f"Error: {exc}\n\n"
+            "This is a tool-loop guardrail, not a file permission diagnosis. "
+            "The request should be retried with the previous tool result reused "
+            "or with a narrower exact path."
+        )
+
     error = str(exc)
     lowered = error.casefold()
     if (
@@ -744,9 +778,25 @@ def _format_exception_report(objective: str, exc: Exception) -> str:
     )
 
 
+def _is_tool_retry_exhausted(exc: Exception) -> bool:
+    """Return True for pydantic-ai tool retry exhaustion."""
+    if not isinstance(exc, UnexpectedModelBehavior):
+        return False
+    message = str(exc).casefold()
+    return "tool " in message and "exceeded max retries count" in message
+
+
+def _is_tool_loop_guard(exc: Exception) -> bool:
+    return isinstance(exc, DuplicateFilesystemRead) or _is_tool_retry_exhausted(exc)
+
+
 def _fs_exception_result(objective: str, exc: Exception) -> SpecialistResult:
     answer = _format_exception_report(objective, exc)
-    status = "tool_error" if isinstance(exc, UsageLimitExceeded) else "blocked"
+    status = (
+        "tool_error"
+        if isinstance(exc, UsageLimitExceeded) or _is_tool_loop_guard(exc)
+        else "blocked"
+    )
     return SpecialistResult(
         agent="fs_agent",
         status=status,
@@ -810,14 +860,9 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
 
     try:
         calls: list[tuple[str, dict[str, Any]]] = []
-        discovery_preview_only = _requires_lexical_triage(
-            objective,
-            path_analysis,
-        )
         preemptive_rag_paths = _preemptive_rag_paths(
             objective,
             path_analysis,
-            task_roots,
         )
         evidence: list[dict] = []
         if preemptive_rag_paths:
@@ -838,22 +883,10 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
                 evidence=evidence,
             )
         else:
-            run_options = (
-                {
-                    "discovery_preview_only": True,
-                    "discovery_search_paths": _lexical_search_paths(
-                        path_analysis,
-                        task_roots,
-                    ),
-                }
-                if discovery_preview_only
-                else {}
-            )
             answer, calls = await _run_fs_agent(
                 prompt,
                 question=objective,
                 task_roots=task_roots,
-                **run_options,
             )
             output = _build_fs_output(
                 answer=answer,
@@ -861,17 +894,25 @@ async def run_fs_task_result(objective: str) -> SpecialistResult:
                 calls=calls,
             )
     except Exception as exc:
-        _rt(f"[fs_agent] ERROR: {exc}", "red", 1)
+        if _is_tool_loop_guard(exc):
+            _rt(
+                "[fs_agent] stopped after filesystem tool-loop guard: "
+                f"{exc}",
+                "yellow",
+                1,
+            )
+        else:
+            _rt(f"[fs_agent] ERROR: {exc}", "red", 1)
         return _fs_exception_result(objective, exc)
 
     output = _apply_path_recovery_guard(output, path_analysis)
     rag_paths = _rag_paths_for_output(output, path_analysis)
-    previewed_paths = _previewed_paths(calls)
+    candidate_rag_paths = _post_tool_candidate_rag_paths(calls, path_analysis)
     post_rag_paths = _dedupe(
         [
             *(
                 path
-                for path in previewed_paths
+                for path in candidate_rag_paths
                 if path not in preemptive_rag_paths
             ),
             *(

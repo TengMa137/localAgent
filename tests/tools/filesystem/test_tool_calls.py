@@ -2,7 +2,7 @@
 from pydantic_ai.messages import BinaryImage, ToolReturn
 import pytest
 from tools.filesystem.toolset import make_filesystem_toolset
-from tools.filesystem.types import PreviewResult, ReadResult, WriteResult
+from tools.filesystem.types import GrepResult, ReadResult, WriteResult
 from tools.filesystem.types import DEFAULT_MAX_READ_CHARS
 from tools.filesystem.errors import EditError, ValidationError
 
@@ -12,16 +12,11 @@ def test_filesystem_tools_are_registered(filesystem_toolset):
 
     expected = {
         "read_file",
-        "preview_file",
-        "read_image",
         "write_file",
         "read_lines",
-        "stat_path",
         "edit_file",
         "search_and_replace",
         "list_files",
-        "find_paths",
-        "list_directory",
         "make_directory",
         "grep_files",
         "delete_file",
@@ -29,7 +24,7 @@ def test_filesystem_tools_are_registered(filesystem_toolset):
         "copy_file",
     }
 
-    assert expected.issubset(tool_names)
+    assert expected == tool_names
 
 
 @pytest.mark.asyncio
@@ -41,7 +36,7 @@ async def test_filesystem_tool_descriptions_name_actual_roots(tools_in_toolset):
     ]
 
     assert any("/data" in description for description in descriptions)
-    assert any("grep_files searches file contents" in description for description in descriptions)
+    assert any("full_text=true" in description for description in descriptions)
     assert not any("'/mount" in description for description in descriptions)
 
 
@@ -54,27 +49,44 @@ async def test_write_then_read_file(filesystem_toolset, tools_in_toolset, ctx, t
     read_result = await filesystem_toolset.call_tool("read", {"path":"/data/a.txt"}, ctx, tools_in_toolset["read_file"])
 
     assert isinstance(read_result, ReadResult)
+    assert read_result.path == "/data/a.txt"
+    assert read_result.stat.type == "file"
+    assert read_result.stat.size_bytes == 5
     assert read_result.content == "hello"
+    assert read_result.preview == "hello"
     assert read_result.truncated is False
 
 
 @pytest.mark.asyncio
-async def test_read_image_returns_multimodal_content(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
+async def test_read_file_returns_supported_image_as_multimodal_content(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
     png_bytes = b"\x89PNG\r\n\x1a\nfake"
     (tmp_path / "screenshot.png").write_bytes(png_bytes)
 
     result = await filesystem_toolset.call_tool(
-        "read_image",
+        "read_file",
         {"path": "/data/screenshot.png", "detail": "high"},
         ctx,
-        tools_in_toolset["read_image"],
+        tools_in_toolset["read_file"],
     )
 
     assert isinstance(result, ToolReturn)
     assert result.return_value == {
         "path": "/data/screenshot.png",
+        "stat": {
+            "path": "/data/screenshot.png",
+            "exists": True,
+            "type": "file",
+            "size_bytes": len(png_bytes),
+            "modified_time": result.return_value["stat"]["modified_time"],
+            "readable": True,
+            "writable": True,
+        },
         "media_type": "image/png",
-        "size_bytes": len(png_bytes),
         "message": "Image loaded for model inspection: /data/screenshot.png",
     }
     assert isinstance(result.content, list)
@@ -87,18 +99,27 @@ async def test_read_image_returns_multimodal_content(filesystem_toolset, tools_i
 
 
 @pytest.mark.asyncio
-async def test_read_image_rejects_non_image_file(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
-    (tmp_path / "notes.txt").write_text("not an image")
+async def test_read_file_returns_metadata_for_unsupported_binary(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
+    (tmp_path / "archive.bin").write_bytes(b"\xff\xfe\x00")
 
-    with pytest.raises(ValidationError) as exc:
-        await filesystem_toolset.call_tool(
-            "read_image",
-            {"path": "/data/notes.txt"},
-            ctx,
-            tools_in_toolset["read_image"],
-        )
+    result = await filesystem_toolset.call_tool(
+        "read_file",
+        {"path": "/data/archive.bin"},
+        ctx,
+        tools_in_toolset["read_file"],
+    )
 
-    assert "unsupported image media type" in str(exc.value)
+    assert isinstance(result, ReadResult)
+    assert result.stat.type == "file"
+    assert result.content is None
+    assert result.preview is None
+    assert result.media_type == "application/octet-stream"
+    assert "not readable as UTF-8 text" in (result.message or "")
 
 
 @pytest.mark.asyncio
@@ -108,18 +129,27 @@ async def test_read_truncation(filesystem_toolset, tools_in_toolset, ctx, tmp_pa
     result = await filesystem_toolset.call_tool("read", {"path":"/data/big.txt", "max_chars":3}, ctx, tools_in_toolset["read_file"])
 
     assert result.content == "abc"
+    assert result.preview == "abcdef"
     assert result.retrieval_mode == "text"
     assert result.truncated is True
     assert result.total_chars == 6
 
 
 class _FakeFilesystemRagService:
-    def __init__(self):
+    def __init__(self, indexed_docs=None):
+        self.indexed_docs = indexed_docs or {}
         self.ingested_paths = []
         self.answer_calls = []
 
     def get_docs_to_ingest(self, docs):
-        return [], list(docs)
+        matches = []
+        missing = []
+        for doc in docs:
+            if doc in self.indexed_docs:
+                matches.append(self.indexed_docs[doc])
+            else:
+                missing.append(doc)
+        return matches, missing
 
     async def ingest_local(
         self,
@@ -161,12 +191,114 @@ async def test_large_default_read_answers_through_rag(
 
     assert result.retrieval_mode == "rag_answer"
     assert result.content == "The document's conclusion is retrieved through RAG."
+    assert result.preview == "A" * 2400
     assert result.truncated is False
     assert result.total_chars == len(source)
     assert rag_service.ingested_paths == [str(tmp_path / "large.txt")]
     assert rag_service.answer_calls == [
         {"question": "What is the conclusion?", "doc_ids": ["large-doc"]}
     ]
+
+
+@pytest.mark.asyncio
+async def test_default_read_uses_rag_when_file_is_already_indexed(
+    rw_validator,
+    ctx,
+    tmp_path,
+):
+    source = "Small indexed document with local details."
+    local_path = tmp_path / "indexed.txt"
+    local_path.write_text(source)
+    rag_service = _FakeFilesystemRagService(
+        indexed_docs={str(local_path): "indexed-doc"}
+    )
+    toolset = make_filesystem_toolset(
+        filesystem_validator=rw_validator,
+        rag_service=rag_service,
+    )
+    tools = await toolset.get_tools(ctx)
+    ctx.metadata = {"filesystem_question": "What local details are in it?"}
+
+    result = await toolset.call_tool(
+        "read",
+        {"path": "/data/indexed.txt"},
+        ctx,
+        tools["read_file"],
+    )
+
+    assert result.retrieval_mode == "rag_answer"
+    assert result.content == "The document's conclusion is retrieved through RAG."
+    assert result.preview is None
+    assert result.total_chars is None
+    assert rag_service.ingested_paths == []
+    assert rag_service.answer_calls == [
+        {"question": "What local details are in it?", "doc_ids": ["indexed-doc"]}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_default_read_uses_rag_for_indexed_non_text_file(
+    rw_validator,
+    ctx,
+    tmp_path,
+):
+    local_path = tmp_path / "paper.pdf"
+    local_path.write_bytes(b"%PDF-1.4\nfake")
+    rag_service = _FakeFilesystemRagService(
+        indexed_docs={str(local_path): "paper-doc"}
+    )
+    toolset = make_filesystem_toolset(
+        filesystem_validator=rw_validator,
+        rag_service=rag_service,
+    )
+    tools = await toolset.get_tools(ctx)
+    ctx.metadata = {"filesystem_question": "What is the paper about?"}
+
+    result = await toolset.call_tool(
+        "read",
+        {"path": "/data/paper.pdf"},
+        ctx,
+        tools["read_file"],
+    )
+
+    assert result.retrieval_mode == "rag_answer"
+    assert result.content == "The document's conclusion is retrieved through RAG."
+    assert result.media_type == "application/pdf"
+    assert rag_service.ingested_paths == []
+    assert rag_service.answer_calls == [
+        {"question": "What is the paper about?", "doc_ids": ["paper-doc"]}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_chunk_read_bypasses_existing_rag_index(
+    rw_validator,
+    ctx,
+    tmp_path,
+):
+    local_path = tmp_path / "indexed.txt"
+    local_path.write_text("abcdef")
+    rag_service = _FakeFilesystemRagService(
+        indexed_docs={str(local_path): "indexed-doc"}
+    )
+    toolset = make_filesystem_toolset(
+        filesystem_validator=rw_validator,
+        rag_service=rag_service,
+    )
+    tools = await toolset.get_tools(ctx)
+    ctx.metadata = {"filesystem_question": "What is in it?"}
+
+    result = await toolset.call_tool(
+        "read",
+        {"path": "/data/indexed.txt", "max_chars": 3},
+        ctx,
+        tools["read_file"],
+    )
+
+    assert result.retrieval_mode == "text"
+    assert result.content == "abc"
+    assert rag_service.ingested_paths == []
+    assert rag_service.answer_calls == []
 
 
 @pytest.mark.asyncio
@@ -200,7 +332,7 @@ async def test_large_explicit_chunk_read_bypasses_rag(
 
 
 @pytest.mark.asyncio
-async def test_preview_file_returns_only_opening_sentences(
+async def test_read_file_preview_only_returns_opening_sentences(
     filesystem_toolset,
     tools_in_toolset,
     ctx,
@@ -215,25 +347,27 @@ async def test_preview_file_returns_only_opening_sentences(
     (tmp_path / "paper.md").write_text(text)
 
     result = await filesystem_toolset.call_tool(
-        "preview_file",
+        "read_file",
         {
             "path": "/data/paper.md",
-            "max_sentences": 2,
-            "max_chars": 500,
+            "preview_only": True,
+            "max_preview_sentences": 2,
+            "max_preview_chars": 500,
         },
         ctx,
-        tools_in_toolset["preview_file"],
+        tools_in_toolset["read_file"],
     )
 
-    assert isinstance(result, PreviewResult)
-    assert "predictive dynamics" in result.content
-    assert "Later sections" not in result.content
-    assert result.sentences_read == 2
-    assert result.truncated is True
+    assert isinstance(result, ReadResult)
+    assert result.content is None
+    assert "predictive dynamics" in result.preview
+    assert "Later sections" not in result.preview
+    assert result.preview_sentences == 2
+    assert result.preview_truncated is True
 
 
 @pytest.mark.asyncio
-async def test_preview_file_prefers_abstract_over_front_matter(
+async def test_read_file_preview_prefers_abstract_over_front_matter(
     filesystem_toolset,
     tools_in_toolset,
     ctx,
@@ -250,15 +384,20 @@ async def test_preview_file_prefers_abstract_over_front_matter(
     )
 
     result = await filesystem_toolset.call_tool(
-        "preview_file",
-        {"path": "/data/paper.md", "max_sentences": 4, "max_chars": 500},
+        "read_file",
+        {
+            "path": "/data/paper.md",
+            "preview_only": True,
+            "max_preview_sentences": 4,
+            "max_preview_chars": 500,
+        },
         ctx,
-        tools_in_toolset["preview_file"],
+        tools_in_toolset["read_file"],
     )
 
-    assert "latent world model" in result.content
-    assert "Authors and affiliations" not in result.content
-    assert "Introduction" not in result.content
+    assert "latent world model" in result.preview
+    assert "Authors and affiliations" not in result.preview
+    assert "Introduction" not in result.preview
 
 
 @pytest.mark.asyncio
@@ -334,61 +473,78 @@ async def test_edit_fails_if_text_not_found(filesystem_toolset, tools_in_toolset
 
 
 @pytest.mark.asyncio
-async def test_list_files_in_mount(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
+async def test_list_files_returns_recursive_tree(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
     (tmp_path / "a.txt").write_text("a")
-    (tmp_path / "b.md").write_text("b")
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "b.md").write_text("b")
 
     result = await filesystem_toolset.call_tool("list", {"path":"/data"}, ctx, tools_in_toolset["list_files"])
 
-    assert result.count == 2
-    assert "/data/a.txt" in result.files
-    assert "/data/b.md" in result.files
+    assert result.path == "/data"
+    assert result.count == 3
+    assert result.truncated is False
+    assert result.tree.name == "data"
+    assert result.tree.path == "/data"
+    assert [(child.name, child.type) for child in result.tree.children] == [
+        ("a.txt", "file"),
+        ("notes", "directory"),
+    ]
+    assert result.tree.children[1].children[0].path == "/data/notes/b.md"
 
 
 @pytest.mark.asyncio
-async def test_list_files_with_pattern(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
-    (tmp_path / "a.txt").write_text("a")
-    (tmp_path / "b.md").write_text("b")
-
-    result = await filesystem_toolset.call_tool("list", {"path":"/data", "pattern":"*.txt"}, ctx, tools_in_toolset["list_files"])
-
-    assert result.files == ["/data/a.txt"]
-
-
-@pytest.mark.asyncio
-async def test_list_files_can_include_directories_and_depth(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
+async def test_list_files_respects_depth(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "a.txt").write_text("a")
     (tmp_path / "root.txt").write_text("root")
 
     result = await filesystem_toolset.call_tool(
         "list",
-        {"path":"/data", "include_directories":True, "max_depth":1},
+        {"path":"/data", "max_depth":1},
         ctx,
         tools_in_toolset["list_files"],
     )
 
-    assert result.files == ["/data/root.txt", "/data/sub"]
+    assert [child.path for child in result.tree.children] == [
+        "/data/root.txt",
+        "/data/sub",
+    ]
+    assert result.tree.children[1].children == []
 
 
 @pytest.mark.asyncio
-async def test_find_paths_matches_filename_across_readable_root(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
+async def test_grep_files_defaults_to_filename_search(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+    tmp_path,
+):
     (tmp_path / "notes").mkdir()
     (tmp_path / "notes" / "agentsystem.md").write_text("hello")
     (tmp_path / "other.md").write_text("agentsystem.md in content only")
 
     result = await filesystem_toolset.call_tool(
-        "find_paths",
+        "grep_files",
         {"path":"/", "query":"agentsystem.md"},
         ctx,
-        tools_in_toolset["find_paths"],
+        tools_in_toolset["grep_files"],
     )
 
-    assert result.files == ["/data/notes/agentsystem.md"]
+    assert isinstance(result, GrepResult)
+    assert result.search_mode == "name"
+    assert [match.path for match in result.matches] == [
+        "/data/notes/agentsystem.md"
+    ]
+    assert result.matches[0].line is None
 
 
 @pytest.mark.asyncio
-async def test_find_paths_accepts_multiple_literal_terms(
+async def test_grep_files_name_search_accepts_multiple_literal_terms(
     filesystem_toolset,
     tools_in_toolset,
     ctx,
@@ -399,68 +555,71 @@ async def test_find_paths_accepts_multiple_literal_terms(
     (tmp_path / "system-notes.md").write_text("system")
 
     any_result = await filesystem_toolset.call_tool(
-        "find_paths",
+        "grep_files",
         {
             "path": "/data",
             "queries": ["agent", "system"],
             "match_mode": "any",
         },
         ctx,
-        tools_in_toolset["find_paths"],
+        tools_in_toolset["grep_files"],
     )
     all_result = await filesystem_toolset.call_tool(
-        "find_paths",
+        "grep_files",
         {
             "path": "/data",
             "queries": ["agent", "system"],
             "match_mode": "all",
         },
         ctx,
-        tools_in_toolset["find_paths"],
+        tools_in_toolset["grep_files"],
     )
 
-    assert any_result.files == [
+    assert [match.path for match in any_result.matches] == [
         "/data/agent-notes.md",
         "/data/agent-system.md",
         "/data/system-notes.md",
     ]
-    assert all_result.files == ["/data/agent-system.md"]
-
-
-@pytest.mark.asyncio
-async def test_list_directory_returns_immediate_entries(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
-    (tmp_path / "sub").mkdir()
-    (tmp_path / "a.txt").write_text("a")
-
-    result = await filesystem_toolset.call_tool(
-        "list_directory",
-        {"path":"/data"},
-        ctx,
-        tools_in_toolset["list_directory"],
-    )
-
-    assert [(entry.path, entry.type) for entry in result.entries] == [
-        ("/data/a.txt", "file"),
-        ("/data/sub", "directory"),
+    assert [match.path for match in all_result.matches] == [
+        "/data/agent-system.md"
     ]
 
 
 @pytest.mark.asyncio
-async def test_stat_path_reports_permissions(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
+async def test_read_file_returns_metadata_for_missing_path(
+    filesystem_toolset,
+    tools_in_toolset,
+    ctx,
+):
+    result = await filesystem_toolset.call_tool(
+        "read_file",
+        {"path":"/data/missing.txt"},
+        ctx,
+        tools_in_toolset["read_file"],
+    )
+
+    assert result.stat.exists is False
+    assert result.stat.type == "missing"
+    assert result.content is None
+    assert result.preview is None
+
+
+@pytest.mark.asyncio
+async def test_read_file_reports_permissions(filesystem_toolset, tools_in_toolset, ctx, tmp_path):
     (tmp_path / "a.txt").write_text("abc")
 
     result = await filesystem_toolset.call_tool(
-        "stat_path",
+        "read_file",
         {"path":"/data/a.txt"},
         ctx,
-        tools_in_toolset["stat_path"],
+        tools_in_toolset["read_file"],
     )
 
-    assert result.exists is True
-    assert result.type == "file"
-    assert result.size_bytes == 3
-    assert result.readable is True
-    assert result.writable is True
+    assert result.stat.exists is True
+    assert result.stat.type == "file"
+    assert result.stat.size_bytes == 3
+    assert result.stat.readable is True
+    assert result.stat.writable is True
 
 
 @pytest.mark.asyncio
@@ -483,12 +642,18 @@ async def test_grep_files_finds_matching_lines(filesystem_toolset, tools_in_tool
 
     result = await filesystem_toolset.call_tool(
         "grep",
-        {"path":"/data", "query":"hello", "case_sensitive":False},
+        {
+            "path":"/data",
+            "query":"hello",
+            "full_text":True,
+            "case_sensitive":False,
+        },
         ctx,
         tools_in_toolset["grep_files"],
     )
 
     assert result.count == 2
+    assert result.search_mode == "content"
     assert result.truncated is False
     assert [(match.path, match.line, match.column) for match in result.matches] == [
         ("/data/a.txt", 1, 1),
@@ -514,6 +679,7 @@ async def test_grep_files_accepts_multiple_literal_terms(
             "path": "/data",
             "queries": ["orchestrator", "filesystem"],
             "match_mode": "any",
+            "full_text": True,
             "case_sensitive": False,
         },
         ctx,
@@ -525,6 +691,7 @@ async def test_grep_files_accepts_multiple_literal_terms(
             "path": "/data",
             "queries": ["orchestrator", "filesystem"],
             "match_mode": "all",
+            "full_text": True,
             "case_sensitive": False,
         },
         ctx,
@@ -568,7 +735,12 @@ async def test_grep_files_respects_file_pattern(filesystem_toolset, tools_in_too
 
     result = await filesystem_toolset.call_tool(
         "grep",
-        {"path":"/data", "query":"target", "file_pattern":"*.md"},
+        {
+            "path":"/data",
+            "query":"target",
+            "full_text":True,
+            "file_pattern":"*.md",
+        },
         ctx,
         tools_in_toolset["grep_files"],
     )
@@ -582,7 +754,7 @@ async def test_grep_files_truncates_at_max_matches(filesystem_toolset, tools_in_
 
     result = await filesystem_toolset.call_tool(
         "grep",
-        {"path":"/data", "query":"one", "max_matches":1},
+        {"path":"/data", "query":"one", "full_text":True, "max_matches":1},
         ctx,
         tools_in_toolset["grep_files"],
     )
@@ -603,7 +775,7 @@ async def test_grep_files_bounds_long_line_excerpts(
 
     result = await filesystem_toolset.call_tool(
         "grep_files",
-        {"path": "/data", "query": "world model"},
+        {"path": "/data", "query": "world model", "full_text": True},
         ctx,
         tools_in_toolset["grep_files"],
     )
@@ -625,7 +797,7 @@ async def test_grep_files_limits_matches_per_file_for_candidate_diversity(
 
     result = await filesystem_toolset.call_tool(
         "grep_files",
-        {"path": "/data", "query": "world model"},
+        {"path": "/data", "query": "world model", "full_text": True},
         ctx,
         tools_in_toolset["grep_files"],
     )

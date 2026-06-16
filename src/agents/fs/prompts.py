@@ -12,23 +12,24 @@ Execute one local filesystem objective with tools.
 
 Key rules:
 - Use the exact Scope, Search path, and paths returned by tools.
-- topic_discovery: call grep_files first, then preview_file on 1-3 strong
-  candidates, then stop. Do not call find_paths, list_files, list_directory,
-  read_file, or read_lines.
-- path_lookup: call find_paths, then inspect the confirmed path.
-- exact_path: use the resolved path directly.
+- discovery: call grep_files first. Use its default name/path search for a
+  filename and full_text=true for a subject. Inspect strong matches with
+  read_file.
+- exact_path: use the resolved file or directory directly. Read files, grep
+  inside a directory, or list the directory according to the objective.
+- Use list_files only for a directory path supplied by the user or this prompt.
 - create_write: write only to the new write target.
 - Apply the supplied policy before writing under /skills.
 
 Examples:
 Task:
-Mode: topic_discovery
+Mode: discovery
 Search path: /docs/papers/arxiv
 Objective: check papers related to world models
 Calls:
 1. grep_files(path="/docs/papers/arxiv", queries=["world model", "world models"],
-   match_mode="any", case_sensitive=false, max_matches=12)
-2. preview_file(path="<strong match returned by grep_files>")
+   match_mode="any", full_text=true, case_sensitive=false, max_matches=12)
+2. read_file(path="<strong match returned by grep_files>")
 3. Return the candidate assessment. Do not call another discovery tool.
 
 Task:
@@ -61,42 +62,23 @@ class FsPromptContext:
     skills_context: str
     skill_policy: str
     task_roots: list[str]
-    local_discovery_required: bool = False
-    lexical_triage_required: bool = False
-    web_fallback_allowed: bool = False
     explicit_create_write: bool = False
 
     def render(self) -> str:
         task_roots = ", ".join(self.task_roots) or "none"
-        search_scope = (
-            ", ".join(self.analysis.resolved_paths)
-            if self.lexical_triage_required and self.analysis.resolved_paths
-            else task_roots
-        )
         skills_context = (
             f"{self.skills_context}\n\n" if self.skills_context.strip() else ""
         )
-        miss_instruction = (
-            "If nothing relevant is found, say that clearly; web recovery is allowed."
-            if self.web_fallback_allowed
-            else "If nothing relevant is found, report the local miss."
-        )
 
-        if self.lexical_triage_required:
-            mode = "topic_discovery"
-            mode_context = f"Search path: {search_scope}"
-        elif self.analysis.resolved_paths:
+        if self.analysis.resolved_paths:
             mode = "exact_path"
-            mode_context = ""
-        elif self.local_discovery_required:
-            mode = "path_lookup"
             mode_context = ""
         elif self.explicit_create_write and self.analysis.write_targets:
             mode = "create_write"
             mode_context = ""
         else:
-            mode = "path_lookup"
-            mode_context = ""
+            mode = "discovery"
+            mode_context = f"Search path: {task_roots}"
 
         recoverable_invalid_paths = [
             path
@@ -109,10 +91,10 @@ class FsPromptContext:
         if recoverable_invalid_paths:
             recovery = (
                 "Missing-path chain: use one clear replacement candidate for a "
-                "read-only request and disclose it; otherwise find_paths on the "
-                f"task scope ({task_roots}) -> grep_files if content can identify "
-                "the file. Ask for confirmation before edits or when several "
-                "candidates remain."
+                "read-only request and disclose it; otherwise grep_files on the "
+                f"task scope ({task_roots}), with full_text=true if content must "
+                "identify the file. Ask for confirmation before edits or when "
+                "several candidates remain."
             )
         else:
             recovery = ""
@@ -121,7 +103,9 @@ class FsPromptContext:
             f"Mode: {mode}",
             f"Scope: {task_roots}",
             mode_context,
-            miss_instruction if self.local_discovery_required else "",
+            "If nothing relevant is found, report the local miss."
+            if mode == "discovery"
+            else "",
             recovery,
             skills_context.strip(),
             self.skill_policy.strip(),

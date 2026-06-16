@@ -77,9 +77,9 @@ def _decode_result_payload(data: dict) -> dict:
 
 
 async def _ingest(rag: RagServiceProtocol, docs: List[Document]) -> str:
-    """Ingest docs and return a receipt string with titles for the LLM."""
+    """Ingest docs and return a source-aware receipt for the LLM."""
     await rag.ingest_documents(docs)
-    listing = ", ".join(f'"{d.title}"' for d in docs)
+    listing = ", ".join(f'"{d.title}" <{d.source}>' for d in docs)
     return (
         f"Ingested {len(docs)} document(s): {listing}. "
         "Content is indexed for the runtime's retrieval step after you return."
@@ -278,7 +278,7 @@ def make_web_toolset(
     ) -> str:
         """
         Crawls each URL and ingests into rag_service.
-        Returns a receipt with titles. Skips failed or empty pages.
+        Returns a receipt with titles and sources. Skips failed or empty pages.
         """
         return await web_crawl_and_ingest(mcp_url, rag_service, urls)
 

@@ -22,12 +22,16 @@ evidence are never added to orchestrator history.
 
 from contextvars import ContextVar
 from dataclasses import dataclass
+import base64
+import json
 import re
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart
+
+from localagent_settings import get_runtime_settings
 
 from .observability import _rt
 from .fs_agent import run_fs_task_result as _run_fs_task_result
@@ -36,16 +40,14 @@ from .web_agent import run_web_task_result as _run_web_task_result
 from .runtime.context import model, validator
 from .runtime.query_policy import (
     TaskKind,
-    ambiguously_references_local_artifact,
+    explicit_route_trigger,
     explicitly_requests_local_source,
     explicitly_requests_web,
     infer_task_kind,
     requests_collection_plan,
-    requests_file_operation,
-    requests_local_discovery,
-    requests_paper_lookup,
+    strip_route_trigger,
 )
-from .runtime.specialist_result import SpecialistResult
+from .runtime.contracts import SpecialistResult
 from .structured_retry import observable_run_with_manual_validation_retries
 from .fs.path_policy import known_file_references
 
@@ -115,6 +117,20 @@ class OrchestratorRunResult:
         return self.messages
 
 
+PENDING_WEB_PLAN_MARKER_RE = re.compile(
+    r"<!--\s*localagent:pending-web-plan\s+([A-Za-z0-9_-]+={0,2})\s*-->",
+    re.IGNORECASE,
+)
+APPROVE_WEB_PLAN_RE = re.compile(
+    r"^\s*/(?:approve|run)-web-plan\b",
+    re.IGNORECASE,
+)
+DENY_WEB_PLAN_RE = re.compile(
+    r"^\s*/(?:deny|stop|cancel)-web-plan\b",
+    re.IGNORECASE,
+)
+
+
 orchestrator = Agent(
     model=model,
     output_type=OrchestratorChoice,
@@ -138,114 +154,62 @@ def _filesystem_access_contract() -> str:
     )
 
 
+def _use_regex() -> bool:
+    """Return whether deterministic query-policy routing is enabled."""
+    return get_runtime_settings().use_regex
+
+
 def _orchestrator_prompt_body() -> str:
     return f"""
-You are a general-purpose AI assistant and semantic route decider.
-
-You have persistent chat history plus optional long-term user profile memory.
-Use these first.
-Treat user profile memory as background context only: current user messages
-override memory, and you should not mention memory unless relevant or asked.
+You are the route controller for a general-purpose assistant.
+Choose one route for the current request and write the complete answer or
+delegated objective. The route must match the required source of truth, not the
+topic or wording of the request.
 
 {_filesystem_access_contract()}
 
-Your job is to choose exactly one route:
-  - direct
-  - fs
-  - web
-  - plan
+Decision procedure:
+1. Resolve references from visible history first. Use profile memory only as
+   background; the current request always wins.
+   If the current request starts with /fs, /web, /plan, fs:, web:, or plan:,
+   honor that explicit route trigger and remove the trigger from the objective.
+2. Identify the required source of truth:
+   - direct: reasoning, conversation, memory, writing, or stable knowledge.
+   - fs: one local file search/read/change under the validator roots.
+   - web: one URL, external source, current fact, or externally verified lookup.
+   - plan: several independent local/web results must be combined.
+3. Choose the narrowest route that can complete the request. Do not infer a
+   source from topic words alone.
 
-Prefer making progress:
-  - Classify by the information source and missing user intent, not by topic
-    keywords and not by your own ability to execute tools.
-  - Apply this source-ownership test before choosing:
-    direct owns answers already available from reasoning/history/memory; fs owns
-    local artifacts and local changes; web owns external or time-sensitive
-    retrieval; plan owns requests that truly require multiple independent
-    specialist results to be combined.
-  - Choose direct when the request can be answered from reasoning, conversation
-    history, or injected memory. Stable conceptual,
-    explanatory, educational, mathematical, writing, and design questions are
-    direct unless the user asks for current facts, external evidence, local
-    artifacts, or verification.
-  - Choose fs for one narrow filesystem task: read, inspect, summarize, search,
-    validate, edit, or write local files under the validator roots. Prefer fs
-    when one specialist answer should be directly forwardable.
-  - Choose fs first for paper requests unless the user explicitly names web,
-    online, a URL, download/fetch, or another external source. This includes
-    paper discovery by topic, "the paper", bare filenames, paper identifiers,
-    arXiv IDs, and phrases such as "local papers" or "in the same folder".
-    The filesystem specialist searches local names and contents first; Python
-    recovers once to web when no usable local paper is found.
-  - Choose fs when the current message says "the paper", "that file", or a
-    similar follow-up and visible history establishes a local file or paper.
-    Preserve the exact path or identifier from history in the filesystem
-    objective when available.
-  - When a previous assistant message explicitly saved under a /docs path a
-    paper or source relevant to the follow-up, include that exact path in the
-    objective so the filesystem specialist can read it directly.
-  - Choose web for one narrow current/web task: one search, one URL crawl,
-    one dedicated external API lookup, current docs/facts, or external paper lookup.
-    Prefer web when one specialist answer should be directly forwardable.
-    Weather forecasts, stable encyclopedia lookups, recent-news discovery, and
-    similar requests still use one web route; the web specialist chooses its
-    dedicated API/search/crawl method.
-  - Choose web directly for paper discovery only when the user explicitly asks
-    for web/online retrieval, provides a URL, or asks to fetch/download the
-    paper. Otherwise paper lookup is fs-first with Python-owned web recovery.
-  - If the user asks to fetch/download/save the paper locally, choose web.
-  - If the user explicitly asks you to search, browse, look up, check the web,
-    or verify a current external fact, choose web. Live market prices, exchange
-    rates, weather, scores, and similar changing facts are web tasks even when
-    a generic explanatory answer would be possible.
-  - Choose plan when the request needs decomposition, comparison, multiple
-    independent filesystem/web subtasks, cross-source synthesis, audits,
-    investigations, or both local and current evidence.
-  - Choose plan for collection-wide work such as summarizing all/every paper or
-    file, processing a directory of papers, or reading several artifacts in
-    parallel. The plan workflow resolves the collection and batches files
-    across parallel filesystem workers.
-  - Do not choose plan merely because one web lookup may inspect several search
-    previews or one filesystem lookup may inspect nearby files. Those remain a
-    single web or fs specialist task.
-  - There is no clarify route. If a detail is missing but safe/useful progress
-    is still possible, choose the narrowest executable route and let the
-    selected fs/web/plan layer discover,
-    validate, or report the limitation. If the user asks for something that
-    cannot be acted on safely, choose direct and ask one focused question in
-    the reply.
-  - You are selecting a route, not executing the route. Never write a
-    limitation reply because you personally cannot browse, read files, or call
-    tools. If current facts or retrieval are needed, choose fs, web, or plan;
-    if not, choose direct.
+Routing rules:
+- Use direct when no retrieval or local change is required.
+- Use fs when the answer must come from a local path, filename, saved artifact,
+  or local collection. Preserve exact paths from the request or visible history.
+- When retrieval is needed but the source is vague or unstated, prefer fs first.
+  If fs finds nothing useful, Python will ask the user before running any web
+  fallback plan.
+- Use web when the answer must come from current or externally verified
+  information. A URL or bare arXiv identifier is external unless visible
+  history or the current request explicitly identifies a saved local copy.
+- Fetching or downloading an external source, including saving it locally,
+  starts with web.
+- Use plan only when the final answer requires multiple independent specialist
+  results, mixed local and web evidence, a comparison/audit, or processing an
+  entire collection. One specialist inspecting several nearby results is not a
+  plan.
+- Vague references such as "the paper" or "that file" inherit their source from
+  visible history. If history does not establish the source, choose the most
+  plausible narrow route without inventing a path or URL.
+- There is no clarify route. Make safe progress when possible. If execution is
+  genuinely unsafe without missing information, use direct and ask one focused
+  question.
+- You are routing capabilities, not claiming personal limitations. Never say
+  that files or the web are inaccessible when fs, web, or plan can do the work.
 
-For fs and web routes, Python executes exactly one specialist task and forwards
-the specialist answer directly. For plan routes, Python executes the plan
-workflow after your decision and returns the workflow's forwardable answer to
-the user. Base the route on the user's meaning, conversation history, and
-injected user memory; do not perform keyword matching. You are not required to delegate:
-direct is a normal first-class route and is preferred whenever the answer is
-already available from general reasoning, conversation history, injected user
-memory.
-
-Intent classification:
-
-  direct — answer immediately in reply.
-    Use for: greetings, opinions, math, coding help, writing tasks,
-    architecture/design questions, log/tool-behavior explanations, prompt
-    tuning advice, evergreen educational explanations, ordinary questions you
-    can answer confidently, and follow-up questions fully answerable from
-    conversation history or injected user memory.
-
-  fs — use for one local-filesystem task where a filesystem specialist can
-    produce a direct answer or perform one requested change.
-
-  web — use for one current/web task where a web specialist can produce a
-    direct answer from search, a URL, current docs/facts, or external papers.
-
-  plan — use for complex agent work: multiple local/web tasks, comparisons,
-    audits, investigations, mixed filesystem and web evidence, or any task
-    where several specialist answers must be merged.
+Execution:
+- fs and web each run one specialist and forward its answer.
+- plan decomposes work, runs specialists, and combines their evidence.
+- direct is a first-class route, not a fallback.
 
 Output contract:
   Return only route and content.
@@ -356,9 +320,7 @@ def _mentioned_validator_roots(text: str) -> set[str]:
         if not normalized:
             continue
         absolute_pattern = (
-            r"(?<![\w.-])"
-            + re.escape(normalized)
-            + r"(?=$|[/\s.,;:!?)}\]])"
+            r"(?<![\w.-])" + re.escape(normalized) + r"(?=$|[/\s.,;:!?)}\]])"
         )
         alias = normalized.rsplit("/", 1)[-1]
         relative_pattern = rf"(?<![\w./-]){re.escape(alias)}/"
@@ -387,17 +349,108 @@ def _routing_request_text(prompt: str) -> str:
     return request.strip() if separator else text
 
 
-def _has_local_file_intent(text: str) -> bool:
+def _visible_message_text(message: ModelMessage) -> str:
+    """Extract text persisted in visible orchestrator history."""
+    parts: list[str] = []
+    for part in getattr(message, "parts", []):
+        content = getattr(part, "content", None)
+        if isinstance(content, str) and content.strip():
+            parts.append(content.strip())
+    return "\n".join(parts)
+
+
+def _route_trigger_objective(text: str) -> str:
+    """Return objective text with an explicit route trigger removed."""
+    stripped = strip_route_trigger(text)
+    return stripped or text.strip()
+
+
+def _encode_pending_web_plan(payload: dict[str, str]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_pending_web_plan(encoded: str) -> dict[str, str] | None:
+    try:
+        raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    objective = payload.get("objective")
+    if not isinstance(objective, str) or not objective.strip():
+        return None
+    return {str(key): str(value) for key, value in payload.items()}
+
+
+def _latest_pending_web_plan(
+    message_history: Optional[list[ModelMessage]],
+) -> dict[str, str] | None:
+    """Return the most recent pending web fallback plan in visible history."""
+    for message in reversed(message_history or []):
+        if not isinstance(message, ModelResponse):
+            continue
+        text = _visible_message_text(message)
+        for match in reversed(list(PENDING_WEB_PLAN_MARKER_RE.finditer(text))):
+            payload = _decode_pending_web_plan(match.group(1))
+            if payload is not None:
+                return payload
+    return None
+
+
+def _approved_web_plan_decision(
+    routing_request: str,
+    message_history: Optional[list[ModelMessage]],
+) -> OrchestratorDecision | None:
+    if DENY_WEB_PLAN_RE.match(routing_request):
+        return OrchestratorDecision(
+            route="direct",
+            reply="Stopped. No web fallback plan was executed.",
+            effort="none",
+        )
+    if not APPROVE_WEB_PLAN_RE.match(routing_request):
+        return None
+
+    pending = _latest_pending_web_plan(message_history)
+    if pending is None:
+        return OrchestratorDecision(
+            route="direct",
+            reply="There is no pending web fallback plan to approve.",
+            effort="none",
+        )
+    return OrchestratorDecision(
+        route="plan",
+        objective=pending["objective"].strip(),
+        effort="minimal",
+    )
+
+
+def _has_explicit_local_target(text: str) -> bool:
+    """Return true for a validator path, filename, or named local source."""
+    trigger = explicit_route_trigger(text)
+    if trigger == "fs":
+        return True
+    if trigger == "web":
+        return False
     return bool(
-        known_file_references(text)
-        and requests_file_operation(text)
-        and not explicitly_requests_web(text)
+        not explicitly_requests_web(text)
+        and (
+            _mentions_validator_path(text)
+            or known_file_references(text)
+            or explicitly_requests_local_source(text)
+        )
     )
 
 
 def _orchestrator_model_prompt(prompt: str) -> str:
     """Append one compact deterministic source-priority hint."""
+    if not _use_regex():
+        return prompt
     request = _routing_request_text(prompt)
+    trigger = explicit_route_trigger(request)
+    if trigger:
+        return prompt
     if requests_collection_plan(request):
         return (
             f"{prompt}\n\n"
@@ -405,7 +458,7 @@ def _orchestrator_model_prompt(prompt: str) -> str:
             "can be resolved and processed in bounded parallel batches."
         )
     filenames = known_file_references(request)
-    if filenames and _has_local_file_intent(request):
+    if filenames and _has_explicit_local_target(request):
         names = ", ".join(filenames[:3])
         return (
             f"{prompt}\n\n"
@@ -413,22 +466,10 @@ def _orchestrator_model_prompt(prompt: str) -> str:
             "the user explicitly requests web access."
         )
     if explicitly_requests_local_source(request):
-        if requests_paper_lookup(request):
-            return (
-                f"{prompt}\n\n"
-                "Routing hint: this is a paper lookup. Search local files first; "
-                "if no usable local paper is found, recover with web search."
-            )
         return (
             f"{prompt}\n\n"
             "Routing hint: the user explicitly requires local files as the "
             "source. Use fs and do not substitute web evidence."
-        )
-    if requests_local_discovery(request):
-        return (
-            f"{prompt}\n\n"
-            "Routing hint: this refers to a possibly local artifact. Try fs "
-            "discovery first; use web only if local evidence is unusable."
         )
     return prompt
 
@@ -438,8 +479,20 @@ def _guardrail_orchestrator_decision(
     decision: OrchestratorDecision,
 ) -> OrchestratorDecision:
     """Correct single-route decisions that conflict with structural policy signals."""
+    if not _use_regex():
+        return decision
     routing_request = _routing_request_text(prompt)
     objective = (decision.objective or "").strip()
+    trigger = explicit_route_trigger(routing_request)
+    if trigger:
+        corrected_objective = _route_trigger_objective(routing_request)
+        effort: PlanEffort = "standard" if trigger == "plan" else "minimal"
+        return OrchestratorDecision(
+            route=trigger,
+            objective=corrected_objective,
+            effort=effort,
+        )
+
     if requests_collection_plan(routing_request):
         if decision.route != "plan" or objective != routing_request:
             _rt(
@@ -456,10 +509,7 @@ def _guardrail_orchestrator_decision(
     if decision.route == "plan":
         return decision
 
-    local_first = _has_local_file_intent(
-        routing_request
-    ) or requests_local_discovery(routing_request)
-    if local_first:
+    if _has_explicit_local_target(routing_request):
         if decision.route != "fs":
             _rt(
                 "[orchestrator] route guardrail corrected "
@@ -475,9 +525,7 @@ def _guardrail_orchestrator_decision(
             effort="minimal",
         )
 
-    candidate_text = "\n".join(
-        part for part in [routing_request, objective] if part
-    )
+    candidate_text = "\n".join(part for part in [routing_request, objective] if part)
     if decision.route == "fs" and _mentions_validator_path(candidate_text):
         return decision
 
@@ -502,9 +550,33 @@ def _guardrail_orchestrator_decision(
     return decision
 
 
-def _preflight_orchestrator_decision(prompt: str) -> OrchestratorDecision | None:
+def _preflight_orchestrator_decision(
+    prompt: str,
+    *,
+    message_history: Optional[list[ModelMessage]] = None,
+) -> OrchestratorDecision | None:
     """Bypass the route model for narrow deterministic workflow signals."""
+    if not _use_regex():
+        return None
     routing_request = _routing_request_text(prompt)
+    approval_decision = _approved_web_plan_decision(routing_request, message_history)
+    if approval_decision is not None:
+        return approval_decision
+
+    trigger = explicit_route_trigger(routing_request)
+    if trigger:
+        objective = _route_trigger_objective(routing_request)
+        _rt(
+            f"[orchestrator] deterministic preflight route={trigger} "
+            "from explicit trigger",
+            "yellow",
+        )
+        return OrchestratorDecision(
+            route=trigger,
+            objective=objective,
+            effort="standard" if trigger == "plan" else "minimal",
+        )
+
     if requests_collection_plan(routing_request):
         _rt(
             "[orchestrator] deterministic preflight route=plan "
@@ -525,49 +597,71 @@ def _should_recover_fs_result_with_web(
     objective: str,
     fs_result: SpecialistResult,
 ) -> bool:
+    if not _use_regex():
+        return False
     if fs_result.agent != "fs_agent":
         return False
     if fs_result.useful or not fs_result.recoverable_by_web:
         return False
 
     routing_request = _routing_request_text(original_prompt)
-    if _mentions_validator_path(routing_request) or _has_local_file_intent(routing_request):
+    if _has_explicit_local_target(routing_request):
         return False
-    if requests_paper_lookup(routing_request):
-        return True
-    if explicitly_requests_local_source(routing_request):
-        return False
-    if ambiguously_references_local_artifact(routing_request):
-        return True
 
-    external_kinds = {TaskKind.WEB_SEARCH, TaskKind.URL_CRAWL}
-    return any(
-        infer_task_kind(part) in external_kinds
-        for part in [routing_request, objective, fs_result.summary]
-        if part
-    )
+    return True
 
 
-async def _recover_fs_with_web(
+def _web_fallback_plan_objective(
     *,
+    original_prompt: str,
     objective: str,
     fs_result: SpecialistResult,
-) -> SpecialistResult:
-    recovery_objective = "\n".join(
+) -> str:
+    routing_request = _routing_request_text(original_prompt)
+    user_goal = routing_request or objective
+    return "\n".join(
         [
-            objective,
+            "Approved fallback plan after local filesystem lookup found no useful result.",
             "",
-            "Local filesystem lookup failed; recover from web if possible.",
+            "Run exactly one web_search task, then synthesize the answer from web evidence.",
+            f"Original user request: {user_goal}",
+            f"Filesystem objective: {objective}",
             f"Filesystem status: {fs_result.status}",
-            "Filesystem answer:",
-            fs_result.forwardable_answer(),
+            f"Filesystem answer: {fs_result.forwardable_answer()}",
         ]
     )
-    _rt(
-        f"[orchestrator] recovery route=web after fs {fs_result.status}",
-        "yellow",
+
+
+def _format_web_plan_approval_request(
+    *,
+    original_prompt: str,
+    objective: str,
+    fs_result: SpecialistResult,
+) -> str:
+    routing_request = _routing_request_text(original_prompt)
+    user_goal = routing_request or objective
+    plan_objective = _web_fallback_plan_objective(
+        original_prompt=original_prompt,
+        objective=objective,
+        fs_result=fs_result,
     )
-    return await _run_web_task_result(recovery_objective)
+    marker = _encode_pending_web_plan(
+        {
+            "objective": plan_objective,
+            "user_goal": user_goal,
+            "fs_status": fs_result.status,
+        }
+    )
+    return "\n\n".join(
+        [
+            fs_result.forwardable_answer(),
+            "I did not find a useful local filesystem result. Proposed fallback plan:\n"
+            f"1. Run one web search for: {user_goal}\n"
+            "2. Synthesize the answer from the web evidence.",
+            "Reply `/approve-web-plan` to execute it, or `/deny-web-plan` to stop.",
+            f"<!-- localagent:pending-web-plan {marker} -->",
+        ]
+    )
 
 
 async def _response_and_messages(
@@ -595,9 +689,21 @@ async def _response_and_messages(
             objective=objective,
             fs_result=result,
         ):
-            result = await _recover_fs_with_web(
+            _rt(
+                f"[orchestrator] pending web fallback plan after fs {result.status}",
+                "yellow",
+            )
+            reply = _format_web_plan_approval_request(
+                original_prompt=original_prompt,
                 objective=objective,
                 fs_result=result,
+            )
+            return (
+                OrchestratorResponse(
+                    reply=reply,
+                    session_title=decision.session_title,
+                ),
+                message_history,
             )
         return (
             OrchestratorResponse(
@@ -662,7 +768,10 @@ async def run_orchestrator_turn(
     **kwargs: Any,
 ) -> OrchestratorRunResult:
     """Choose one semantic route, execute it in Python, and persist the visible turn."""
-    decision = _preflight_orchestrator_decision(prompt)
+    decision = _preflight_orchestrator_decision(
+        prompt,
+        message_history=message_history,
+    )
     internal_messages = list(message_history or [])
     if decision is None:
         memory_token = _INITIAL_MEMORY_CONTEXT.set(memory_context or "")

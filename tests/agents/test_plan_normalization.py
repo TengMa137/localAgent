@@ -1,4 +1,8 @@
+import re
+
 import pytest
+
+from agents.runtime import query_policy
 
 from agents.plan_agent import (
     MAX_TASKS_PER_PLAN,
@@ -13,27 +17,43 @@ from agents.plan_agent import (
 )
 from agents.runtime.query_policy import (
     TaskKind,
-    ambiguously_references_local_artifact,
+    explicit_route_trigger,
     explicitly_requests_local_source,
     explicitly_requests_web,
     extract_urls,
     infer_task_kind,
     likely_requires_current_info,
     requests_collection_plan,
-    requests_file_operation,
-    requests_local_discovery,
-    requests_topic_file_discovery,
+    strip_route_trigger,
 )
 from agents.worker import TaskSpec
-from agents.runtime.turn_context import EvidenceItem
+from agents.runtime.contracts import EvidenceItem
 
 
 def test_query_policy_extracts_urls():
     assert extract_urls("Read https://example.com/a.") == ["https://example.com/a"]
 
 
+def test_query_policy_keeps_only_structural_regexes():
+    patterns = {
+        name
+        for name, value in vars(query_policy).items()
+        if isinstance(value, re.Pattern)
+    }
+
+    assert patterns == {"ARXIV_RE", "ROUTE_TRIGGER_RE", "URL_RE"}
+
+
 def test_query_policy_has_no_default_retrieval_kind():
     assert infer_task_kind("Explain recursion") is None
+
+
+def test_query_policy_explicit_route_triggers_are_start_anchored():
+    assert explicit_route_trigger("/fs summarize the paper") == "fs"
+    assert explicit_route_trigger("web: recent war updates") == "web"
+    assert explicit_route_trigger("plan: compare local and web evidence") == "plan"
+    assert explicit_route_trigger("run a web app locally") is None
+    assert strip_route_trigger("web: recent war updates") == "recent war updates"
 
 
 @pytest.mark.parametrize(
@@ -86,46 +106,19 @@ def test_query_policy_explicit_web_phrases_name_the_source(text, expected):
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("check agentsystem.md", True),
-        ("summarize AGENT_SYSTEM.md", True),
-        ("based on config.yaml, explain the setup", True),
-        ("mention agentsystem.md in the answer", False),
-    ],
-)
-def test_query_policy_local_file_actions_require_an_operation(text, expected):
-    assert requests_file_operation(text) is expected
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("summarize the paper", True),
-        ("check my recent notes", True),
-        ("inspect the saved document", True),
+        ("check my recent notes", False),
+        ("inspect the saved document", False),
         ("find it in the same folder", True),
         ("what about 2605.00080v1 in the same folder?", True),
-        ("find the latest paper", True),
+        ("check local papers regarding world models", False),
+        ("summarize the paper", False),
+        ("find the latest paper", False),
         ("search the web for the paper", False),
         ("explain how files work in Python", False),
     ],
 )
-def test_query_policy_local_discovery_is_narrow_and_local_first(text, expected):
-    assert requests_local_discovery(text) is expected
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("summarize the authentication documentation", True),
-        ("find files related to world models", True),
-        ("review architecture notes", True),
-        ("edit the authentication documentation", False),
-        ("write a new local note", False),
-        ("explain authentication", False),
-    ],
-)
-def test_query_policy_topic_file_discovery_is_read_only(text, expected):
-    assert requests_topic_file_discovery(text) is expected
+def test_query_policy_local_source_requires_explicit_local_language(text, expected):
+    assert explicitly_requests_local_source(text) is expected
 
 
 @pytest.mark.parametrize(
@@ -147,26 +140,14 @@ def test_query_policy_collection_plan_is_narrow(text, expected):
     assert requests_collection_plan(text) is expected
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "check local papers regarding world models",
-        "search local files for agent routing",
-        "review my architecture notes",
-        "inspect the downloaded document",
-    ],
-)
-def test_query_policy_explicit_local_source_overrides_webish_words(text):
+def test_query_policy_explicit_fs_trigger_overrides_webish_words():
+    text = "/fs search local files for current agent routing"
     assert explicitly_requests_local_source(text)
-    assert requests_local_discovery(text)
-    assert infer_task_kind(text) == TaskKind.LOCAL_RAG
+    assert infer_task_kind(text) == TaskKind.LOCAL_FILES
 
 
-def test_query_policy_referential_artifact_is_ambiguous_not_explicit_local():
-    text = "summarize the paper and explain its architecture"
-
-    assert ambiguously_references_local_artifact(text)
-    assert not explicitly_requests_local_source(text)
+def test_query_policy_leaves_ambiguous_artifacts_to_route_model():
+    assert infer_task_kind("summarize the paper and explain its architecture") is None
 
 
 def test_query_policy_now_does_not_force_web_but_explicit_web_does():
@@ -175,10 +156,7 @@ def test_query_policy_now_does_not_force_web_but_explicit_web_does():
 
 
 def test_query_policy_external_arxiv_lookup_uses_web_search():
-    assert (
-        infer_task_kind("search the web for arXiv 2605.00080")
-        == TaskKind.WEB_SEARCH
-    )
+    assert infer_task_kind("search the web for arXiv 2605.00080") == TaskKind.WEB_SEARCH
 
 
 @pytest.mark.parametrize(
@@ -192,7 +170,6 @@ def test_query_policy_external_arxiv_lookup_uses_web_search():
     ],
 )
 def test_query_policy_online_scholarly_lookup_uses_web_search(text):
-    assert not requests_local_discovery(text)
     assert infer_task_kind(text) == TaskKind.WEB_SEARCH
 
 
@@ -202,14 +179,21 @@ def test_query_policy_resolved_local_files_win_over_external_identifiers():
             "summarize arXiv 2605.00080",
             matched_files=["/docs/papers/2605.00080.md"],
         )
-        == TaskKind.LOCAL_RAG
+        == TaskKind.LOCAL_FILES
     )
 
 
-def test_query_policy_local_reference_wins_over_incidental_recent_word():
-    assert infer_task_kind("check my recent notes") == TaskKind.LOCAL_RAG
-    assert infer_task_kind("summarize the paper") == TaskKind.LOCAL_RAG
-    assert infer_task_kind("find the latest paper") == TaskKind.LOCAL_RAG
+def test_query_policy_natural_local_language_does_not_force_fs():
+    assert infer_task_kind("check my recent notes") is None
+    assert (
+        infer_task_kind("check local papers about recent research")
+        == TaskKind.WEB_SEARCH
+    )
+
+
+def test_query_policy_does_not_force_vague_paper_language():
+    assert infer_task_kind("summarize the paper") is None
+    assert infer_task_kind("find the latest paper") == TaskKind.WEB_SEARCH
 
 
 def test_query_policy_explicit_url_wins_over_referential_artifact():
@@ -273,13 +257,13 @@ def test_normalize_plan_batches_every_collection_file():
     ).normalize(PlanOutput(initial_answer="There is only one paper."))
 
     assert len(normalized.tasks) == 3
-    assert {
-        path
-        for task in normalized.tasks
-        for path in task.relevant_files
-    } == set(files)
-    assert all(task.kind == TaskKind.LOCAL_RAG for task in normalized.tasks)
-    assert all("Do not omit assigned artifacts" in task.objective for task in normalized.tasks)
+    assert {path for task in normalized.tasks for path in task.relevant_files} == set(
+        files
+    )
+    assert all(task.kind == TaskKind.LOCAL_FILES for task in normalized.tasks)
+    assert all(
+        "Do not omit assigned artifacts" in task.objective for task in normalized.tasks
+    )
     assert normalized.initial_answer is None
 
 
@@ -364,7 +348,7 @@ def test_normalize_plan_filters_unresolved_files_and_adds_local_task():
     plan = PlanOutput(
         tasks=[
             TaskSpec(
-                kind=TaskKind.LOCAL_RAG,
+                kind=TaskKind.LOCAL_FILES,
                 objective="Read files",
                 relevant_files=["/docs/ok.md", "/docs/missing.md"],
             )
@@ -378,7 +362,7 @@ def test_normalize_plan_filters_unresolved_files_and_adds_local_task():
         as_of="now",
     )
 
-    assert normalized.tasks[0].kind == TaskKind.LOCAL_RAG
+    assert normalized.tasks[0].kind == TaskKind.LOCAL_FILES
     assert normalized.tasks[0].relevant_files == ["/docs/ok.md"]
     assert normalized.tasks[0].user_prompt == "Summarize my file"
 
@@ -387,7 +371,7 @@ def test_normalize_plan_repairs_relative_path_against_readable_files():
     plan = PlanOutput(
         tasks=[
             TaskSpec(
-                kind=TaskKind.LOCAL_RAG,
+                kind=TaskKind.LOCAL_FILES,
                 objective="Read diet skill",
                 relevant_files=["/fitness/diet.md"],
             )
@@ -412,7 +396,7 @@ def test_plan_file_resolver_does_not_fuzzy_match_query_terms():
     assert resolver.resolve("check out fitness skills", matched_files=[]) == []
 
 
-def test_normalize_plan_does_not_convert_file_keyword_web_task_to_local_rag():
+def test_normalize_plan_does_not_convert_file_keyword_web_task_to_local_files():
     plan = PlanOutput(
         tasks=[
             TaskSpec(
@@ -452,7 +436,7 @@ def test_normalize_plan_adds_required_local_task_for_objective_files():
         as_of="now",
     )
 
-    assert normalized.tasks[0].kind == TaskKind.LOCAL_RAG
+    assert normalized.tasks[0].kind == TaskKind.LOCAL_FILES
     assert "/skills/fitness/diet.md" in normalized.tasks[0].relevant_files
     assert "/skills/fitness/workout.md" in normalized.tasks[0].relevant_files
     assert normalized.tasks[1].kind == TaskKind.WEB_SEARCH
@@ -476,7 +460,7 @@ def test_normalize_plan_adds_required_local_task_for_matched_files():
         as_of="now",
     )
 
-    assert normalized.tasks[0].kind == TaskKind.LOCAL_RAG
+    assert normalized.tasks[0].kind == TaskKind.LOCAL_FILES
     assert normalized.tasks[0].relevant_files == ["/skills/fitness/diet.md"]
     assert normalized.tasks[1].kind == TaskKind.WEB_SEARCH
 
@@ -499,7 +483,7 @@ def test_normalize_plan_extracts_file_path_from_task_objective():
         as_of="now",
     )
 
-    assert normalized.tasks[0].kind == TaskKind.LOCAL_RAG
+    assert normalized.tasks[0].kind == TaskKind.LOCAL_FILES
     assert normalized.tasks[0].relevant_files == ["/skills/fitness/diet.md"]
 
 
@@ -661,7 +645,7 @@ def test_plan_handoff_keeps_compact_task_ledger():
         state=state,
         planned_tasks=[
             TaskSpec(
-                kind=TaskKind.LOCAL_RAG,
+                kind=TaskKind.LOCAL_FILES,
                 objective="Read local docs",
                 relevant_files=["/docs/local.md"],
             ),
@@ -822,7 +806,7 @@ async def test_research_loop_skips_unhelpful_worker_results(monkeypatch):
         state=state,
         tasks=[
             TaskSpec(kind=TaskKind.WEB_SEARCH, objective="Read current docs"),
-            TaskSpec(kind=TaskKind.LOCAL_RAG, objective="Read missing local file"),
+            TaskSpec(kind=TaskKind.LOCAL_FILES, objective="Read missing local file"),
         ],
     )
 

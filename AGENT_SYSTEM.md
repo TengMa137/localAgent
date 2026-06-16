@@ -48,32 +48,52 @@ Internal specialist prompts, tool traces, and worker transcripts are not
 replayed as orchestrator history.
 
 The orchestrator performs semantic routing only. It does not inspect validator
-roots, list files, or grep file contents. Ambiguous local filenames, paper
-references, and identifiers are delegated to the filesystem specialist. Python
-adds one short routing hint when the current request names a known file suffix;
-explicit web intent still takes precedence.
+roots, list files, or grep file contents. Python adds narrow routing hints for
+explicit local filenames and collection work; explicit route triggers bypass
+the route model. Vague references such as "the paper" remain model-owned unless
+visible history identifies a local artifact.
+
+Start-anchored route triggers are deterministic:
+
+- `/fs ...` or `fs: ...` runs one filesystem route.
+- `/web ...` or `web: ...` runs one web route.
+- `/plan ...` or `plan: ...` runs the planning workflow.
+
+The trigger is stripped from the delegated objective before execution.
 
 Deterministic route corrections are deliberately conservative:
 
-1. Keep a model-selected `plan` route.
-2. Force collection-wide requests such as "summarize all papers" or "read
+1. Honor explicit route triggers before the model can drift.
+2. Keep a model-selected `plan` route.
+3. Force collection-wide requests such as "summarize all papers" or "read
    these files in parallel" to `plan`, even if a small model returns `direct`.
-3. Treat explicit local-source phrases such as "local papers", "my notes", and
-   "same folder" as filesystem evidence, even when incidental time words appear.
-4. Treat a known-suffix filename plus a local file action as filesystem evidence.
-5. Treat URLs and explicit phrases such as "search the web" as web evidence.
-6. Correct to web only for contextual changing-fact signals such as latest
+4. Treat validator paths, known-suffix filenames, `/fs`, and same/current
+   folder references as filesystem evidence.
+5. Treat URLs, bare arXiv identifiers, `/web`, and explicit phrases such as
+   "search the web" as web evidence.
+6. Correct to web only for explicit changing-fact signals such as latest
    research, today's weather, "check the exchange rate", or "current president".
 
 Standalone `now`, `current`, `check`, and `search` are not sufficient web
 signals. Neither are software uses of words such as "rate", "pricing", "live",
-"score", or "schedule". The phrase lists and precedence live in
+"score", or "schedule". The structural checks and precedence live in
 `agents/runtime/query_policy.py`; known file suffixes live in
 `agents/fs/path_policy.py`.
 
-Paper requests are local-first unless the user explicitly names an external
-source. If local discovery returns no usable paper, Python performs one web
-recovery. Exact local paths and known filenames remain local-only on a miss.
+`LOCALAGENT_USE_REGEX=false` disables the query-policy routing layer for an A/B
+test. In that mode the orchestrator prompt owns source and intent judgment:
+Python does not append routing hints, bypass the route model, correct its route,
+or create approval-gated web fallback plans after filesystem misses. Validator
+boundaries and plan-task normalization remain deterministic.
+
+Paper requests with a path, filename, `/fs`, or visible local history use the
+filesystem and remain local-only on a concrete local-target miss. URLs, bare
+arXiv identifiers, `/web`, and explicit web/fetch language use the web.
+Ambiguous paper references are left to the route model and visible conversation
+history. If a vague filesystem lookup produces no useful result, Python returns
+a pending web fallback plan instead of silently substituting internet evidence.
+The user must reply `/approve-web-plan` to execute it or `/deny-web-plan` to
+stop.
 
 Structured output uses at most three total calls: one initial call and two
 retries. A failed completion is omitted from retry history, and the repair
@@ -93,14 +113,16 @@ route: direct | fs | web | plan
 content: direct answer or complete delegated objective
 ```
 
+Planned task kinds are `local_files`, `web_search`, and `url_crawl`.
+
 Python deterministically maps `content` to `reply` or `objective` and assigns
 `none`, `minimal`, or `standard` effort from the selected route.
 
 Routes:
 
 - `direct`: answer from reasoning, visible history, or memory.
-- `fs`: scope one filesystem task, use deterministic local retrieval for
-  explicit directories or large inputs, and forward its text answer.
+- `fs`: scope one filesystem task, use deterministic local retrieval for PDFs,
+  oversized text, or assigned file batches, and forward its text answer.
 - `web`: run one focused web/current/URL/external-paper specialist task and forward its
   answer.
 - `plan`: decompose complex work into typed tasks, run workers, and synthesize
@@ -133,39 +155,39 @@ orchestrator decision
 ```
 
 No planner, worker pool, or synthesis call runs for these single-specialist
-routes.
+routes unless a filesystem miss creates a pending web fallback plan and the
+user later approves it with `/approve-web-plan`.
 
 The filesystem route does not expose every mount by default. Ordinary local
 document tasks receive `/docs`; explicit skill tasks receive `/skills`.
-Python selects explicit directories and oversized files for local RAG before
-the model tool loop. Ambiguous references remain in the filesystem tool loop,
-which owns `find_paths`, `list_files`, and `grep_files`. The filesystem model
+Python selects PDFs, oversized files, and assigned multi-file batches for local
+RAG. Ambiguous references remain in the filesystem tool loop, which owns
+`grep_files`, `read_file`, `read_lines`, and `list_files`. The filesystem model
 returns plain text, while Python derives paths and changes from validated
 preflight state and successful tool calls.
 
 The filesystem system prompt contains only model-owned instructions. Each task
-adds one scoped tool chain and non-empty path facts; validator checks, duplicate
-call rules, write approval, and the full preflight file index stay in Python
-instead of being repeated to the model.
+adds its scope and non-empty path facts; validator checks, duplicate-call rules,
+write approval, and the full preflight file index stay in Python instead of
+being repeated to the model.
 
-Topic-based local discovery follows a staged retrieval policy:
+Unknown-path local discovery follows a simple model-owned flow:
 
-1. `grep_files` performs lexical content search inside the scoped local root.
-2. `preview_file` returns only bounded opening sentences from the strongest
-   candidates for abstract/introduction-style relevance triage.
-3. Python sends every previewed candidate through deterministic RAG and the
-   RAG answer model writes the substantive answer.
+1. Call `grep_files`, using default name/path matching for filenames or
+   `full_text=true` for subjects.
+2. Inspect strong candidates with `read_file`.
+3. Answer from the read result. Python can send selected candidates through
+   deterministic RAG when deeper retrieval is needed.
 
-In this mode, the first model step is given only `grep_files`; after a
-successful grep, later steps are given only `preview_file`, with at most three
-previews. Python inserts the single validated search path when omitted. Grep
-returns at most 12 bounded excerpts, at most two per file, so one-line Markdown
-documents cannot fill the context window. A unique same-name directory
-candidate such as `/docs/papers/arxiv` for `docs/arxiv` is resolved before the
-model runs.
+All simplified read tools remain available during the run. Python inserts the
+single validated grep root when omitted, rejects out-of-scope paths and
+duplicate reads, and permits only one `list_files` call per directory path.
+The prompt reserves listing for a directory supplied by the user or system. A
+unique same-name directory candidate such as `/docs/papers/arxiv` for
+`docs/arxiv` is resolved before the model runs.
 
-Exact-path requests keep the normal direct-read policy for small text files,
-while PDFs, directories, and oversized files always use RAG.
+Exact-path requests keep the normal direct-read policy for text files and use
+the recursive tree tool for directories. PDFs and oversized text files use RAG.
 
 PDFs are always handed to RAG rather than text tools. `rag_lib` extracts PDF
 pages with `pypdf`; web uploads classify PDFs as documents and explicitly
